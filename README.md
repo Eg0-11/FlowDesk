@@ -205,6 +205,20 @@ $env:DEEPSEEK_API_KEY = 'sk-...'
 > 不要写成 `-pl flowdesk-bootstrap -am spring-boot:run`：`-am` 会让 `spring-boot:run`
 > 这个 goal 同时在上游库模块上执行，而那些模块没有可运行的主类，必然失败。
 
+**PowerShell 下 `-D` 参数的写法**：`-D` 参数的**值**里只要含有点号或等号，就必须用引号包住，
+否则 PowerShell 会把它拆开，Maven 会报 `Unknown lifecycle phase`：
+
+```powershell
+# 正确
+.\mvnw.cmd -pl flowdesk-bootstrap spring-boot:run "-Dspring-boot.run.profiles=deepseek"
+
+# 错误（已实测）：被拆成 .run.profiles=deepseek
+.\mvnw.cmd -pl flowdesk-bootstrap spring-boot:run -Dspring-boot.run.profiles=deepseek
+```
+
+`-DskipTests` 这类不含点号与等号的参数，加不加引号都可以（`-DskipTests` 与 `"-DskipTests"` 均已实测通过）。
+本仓库所有示例与 `.env.example` 遵循同一条规则。
+
 环境变量：
 
 | 变量 | 必填 | 默认值 | 说明 |

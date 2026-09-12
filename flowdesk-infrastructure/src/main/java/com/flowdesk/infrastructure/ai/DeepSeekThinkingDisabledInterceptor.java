@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.io.IOException;
 import java.net.URI;
+import java.util.Locale;
 import java.util.Objects;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpRequest;
@@ -38,8 +39,13 @@ import org.springframework.web.util.DefaultUriBuilderFactory;
  * <p><b>作用域</b>：只修改同时满足下列全部条件的请求，任何一条不满足都按原始字节透传：</p>
  * <ol>
  *   <li>HTTP 方法为 {@code POST}；</li>
- *   <li>{@code Content-Type} 的类型为 {@code application} 且子类型为 {@code json}
- *       或 {@code *+json}（因此 {@code text/vendor+json} 不会被接受）；</li>
+ *   <li>{@code Content-Type} 的类型**严格等于** {@code application}（忽略大小写），
+ *       且子类型**严格等于** {@code json}（忽略大小写）或以 {@code +json} 结尾（忽略大小写）。
+ *       使用 {@link Locale#ROOT} 做大小写标准化。因此 {@code application/json}、
+ *       {@code application/problem+json}、{@code application/vnd.api+json} 会被接受，
+ *       而 {@code application/*}、{@code application/xml}、{@code text/vendor+json} 不会。
+ *       <b>刻意不使用 {@code MediaType.APPLICATION_JSON.isCompatibleWith(...)}</b>：
+ *       它会把 {@code application/*} 判为兼容（见对应测试），从而放进通配符媒体类型；</li>
  *   <li>scheme、host 与有效端口与解析出的目标 URI 一致；</li>
  *   <li>path 与解析出的目标 URI 完全一致。</li>
  * </ol>
@@ -113,15 +119,21 @@ class DeepSeekThinkingDisabledInterceptor implements ClientHttpRequestIntercepto
 
     private boolean isJsonRequest(HttpRequest request) {
         MediaType contentType = request.getHeaders().getContentType();
-        if (contentType == null || !APPLICATION_TYPE.equalsIgnoreCase(contentType.getType())) {
+        if (contentType == null) {
             return false;
         }
-        if (MediaType.APPLICATION_JSON.isCompatibleWith(contentType)) {
-            return true;
+        String type = contentType.getType();
+        if (type == null || !APPLICATION_TYPE.equals(type.toLowerCase(Locale.ROOT))) {
+            return false;
         }
         String subtype = contentType.getSubtype();
-        return subtype != null
-                && (JSON_SUBTYPE.equalsIgnoreCase(subtype) || subtype.toLowerCase().endsWith(JSON_SUBTYPE_SUFFIX));
+        if (subtype == null) {
+            return false;
+        }
+        // 刻意不使用 MediaType.APPLICATION_JSON.isCompatibleWith(...)：
+        // 它会把 application/* 判为兼容，从而让通配符媒体类型也被注入。
+        String normalizedSubtype = subtype.toLowerCase(Locale.ROOT);
+        return JSON_SUBTYPE.equals(normalizedSubtype) || normalizedSubtype.endsWith(JSON_SUBTYPE_SUFFIX);
     }
 
     private boolean isThinkingAlreadyDisabled(byte[] body) throws IOException {

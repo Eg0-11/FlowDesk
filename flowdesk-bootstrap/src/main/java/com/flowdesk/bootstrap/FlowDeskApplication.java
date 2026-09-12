@@ -11,11 +11,20 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
  * 它们的 {@code com.flowdesk.mcp.asset}、{@code com.flowdesk.mcp.monitoring} 包
  * 刻意不在主服务的扫描范围内。</p>
  *
- * <p>当前装配会激活三部分组件：{@code com.flowdesk.agent.ai} 中的 AI 用例实现与本地只读工具、
- * {@code com.flowdesk.infrastructure.ai} 中的 DeepSeek 传输适配与命名 ChatClient
- * {@code deepSeekChatClient}、以及 {@code com.flowdesk.bootstrap.ai} 中的 AI HTTP 接口与异常映射。
- * 它们都受 {@code flowdesk.ai.enabled} 控制：默认 profile 下不会创建任何模型相关 Bean，
- * 因此没有 API Key 也能启动。</p>
+ * <p><b>受 {@code flowdesk.ai.enabled} 控制的组件</b>（默认 profile 下该属性为 {@code false}，
+ * 下列 Bean 一个都不会创建）：</p>
+ * <ul>
+ *   <li>{@code com.flowdesk.agent.ai}：AI 用例实现 {@code ChatClientAiService}
+ *       与本地只读工具 {@code SupportPolicyTools}；</li>
+ *   <li>{@code com.flowdesk.infrastructure.ai}：DeepSeek 配置装配、命名 ChatClient
+ *       {@code deepSeekChatClient} 与传输层拦截器；</li>
+ *   <li>{@code com.flowdesk.bootstrap.ai}：{@code AiController}，即两个 AI HTTP 端点。</li>
+ * </ul>
+ *
+ * <p><b>始终注册、不受 {@code flowdesk.ai.enabled} 影响的组件</b>：
+ * {@code AiExceptionHandler} 是全局 {@code @RestControllerAdvice}，条件开关不会作用于它。
+ * 它只负责把非法请求映射为 400、把上游失败映射为 502，本身不创建任何模型 Bean，
+ * 也不会发起任何出网请求 —— 因此默认 profile 下没有 API Key 也能安全启动。</p>
  */
 @SpringBootApplication(scanBasePackages = {
         "com.flowdesk.bootstrap",

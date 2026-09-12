@@ -116,6 +116,21 @@ class DeepSeekThinkingDisabledInterceptorTests {
     }
 
     @Test
+    void injectsForApplicationVendorJson() throws Exception {
+        byte[] sent = send(ENDPOINT, HttpMethod.POST, MediaType.parseMediaType("application/vnd.api+json"),
+                REQUEST_BODY);
+
+        assertThat(MAPPER.readTree(sent).path("thinking").path("type").asText()).isEqualTo("disabled");
+    }
+
+    @Test
+    void injectsForUpperCaseJsonMediaType() throws Exception {
+        byte[] sent = send(ENDPOINT, HttpMethod.POST, MediaType.parseMediaType("APPLICATION/JSON"), REQUEST_BODY);
+
+        assertThat(MAPPER.readTree(sent).path("thinking").path("type").asText()).isEqualTo("disabled");
+    }
+
+    @Test
     void overridesAConflictingThinkingBlock() throws Exception {
         byte[] sent = send(ENDPOINT, HttpMethod.POST, MediaType.APPLICATION_JSON,
                 "{\"thinking\":{\"type\":\"enabled\"}}");
@@ -124,6 +139,34 @@ class DeepSeekThinkingDisabledInterceptorTests {
     }
 
     // ---------- 非目标请求：原始字节透传 ----------
+
+    /**
+     * 记录 Spring 自身的行为，说明为什么本类不能用
+     * {@code MediaType.APPLICATION_JSON.isCompatibleWith(...)} 来判断：
+     * 该方法把通配符媒体类型也视为兼容。
+     */
+    @Test
+    void documentsThatIsCompatibleWithTreatsWildcardsAsCompatible() {
+        assertThat(MediaType.APPLICATION_JSON.isCompatibleWith(MediaType.parseMediaType("application/*")))
+                .as("isCompatibleWith 会把 application/* 判为兼容，因此不能用于本拦截器")
+                .isTrue();
+    }
+
+    @Test
+    void doesNotTouchApplicationWildcard() throws Exception {
+        // 通配符媒体类型无法经 setContentType 写入（Spring 会拒绝），因此用原始头设置，
+        // 以真实覆盖「收到 application/* 请求」这一情形
+        byte[] sent = sendWithRawContentType(ENDPOINT, "application/*", REQUEST_BODY);
+
+        assertThat(text(sent)).isEqualTo(REQUEST_BODY);
+    }
+
+    @Test
+    void doesNotTouchApplicationXml() throws Exception {
+        byte[] sent = send(ENDPOINT, HttpMethod.POST, MediaType.parseMediaType("application/xml"), REQUEST_BODY);
+
+        assertThat(text(sent)).isEqualTo(REQUEST_BODY);
+    }
 
     @Test
     void doesNotTouchTextVendorJson() throws Exception {
@@ -206,6 +249,18 @@ class DeepSeekThinkingDisabledInterceptorTests {
         if (contentType != null) {
             request.getHeaders().setContentType(contentType);
         }
+        byte[][] captured = new byte[1][];
+        this.interceptor.intercept(request, bytes(body), capturing(captured));
+        return captured[0];
+    }
+
+    /**
+     * 用原始头写入 Content-Type，用于 {@code application/*} 这类无法经
+     * {@code setContentType} 设置的媒体类型。
+     */
+    private byte[] sendWithRawContentType(String url, String rawContentType, String body) throws Exception {
+        MockClientHttpRequest request = new MockClientHttpRequest(HttpMethod.POST, URI.create(url));
+        request.getHeaders().set("Content-Type", rawContentType);
         byte[][] captured = new byte[1][];
         this.interceptor.intercept(request, bytes(body), capturing(captured));
         return captured[0];
