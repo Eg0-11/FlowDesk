@@ -1,0 +1,160 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!-- 版本基线：Spring Boot 3.5.8 作为父 POM，统一管理 Spring 生态与构建插件版本。 -->
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.5.8</version>
+    <relativePath/>
+  </parent>
+
+  <groupId>com.flowdesk</groupId>
+  <artifactId>flowdesk</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <packaging>pom</packaging>
+
+  <name>flowdesk</name>
+  <description>FlowDesk 企业智能工单与知识运营平台（当前阶段：项目骨架）</description>
+
+  <modules>
+    <module>flowdesk-shared</module>
+    <module>flowdesk-domain</module>
+    <module>flowdesk-application</module>
+    <module>flowdesk-agent</module>
+    <module>flowdesk-infrastructure</module>
+    <module>flowdesk-bootstrap</module>
+    <module>flowdesk-mcp-asset</module>
+    <module>flowdesk-mcp-monitoring</module>
+  </modules>
+
+  <properties>
+    <!-- Java 基线：Release 固定为 17 -->
+    <java.version>17</java.version>
+    <maven.compiler.release>17</maven.compiler.release>
+
+    <!-- 统一 UTF-8 -->
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
+    <!-- 外部基线版本（仅导入 BOM，当前不接入模型） -->
+    <spring-ai.version>1.1.2</spring-ai.version>
+    <spring-ai-alibaba.version>1.1.2.2</spring-ai-alibaba.version>
+
+    <!-- 构建插件版本（BOM 未管理者显式锁定，避免依赖漂移） -->
+    <maven-enforcer-plugin.version>3.5.0</maven-enforcer-plugin.version>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <!-- ============ FlowDesk 内部模块：子模块引用时不写 version ============ -->
+      <dependency>
+        <groupId>com.flowdesk</groupId>
+        <artifactId>flowdesk-shared</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.flowdesk</groupId>
+        <artifactId>flowdesk-domain</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.flowdesk</groupId>
+        <artifactId>flowdesk-application</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.flowdesk</groupId>
+        <artifactId>flowdesk-agent</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.flowdesk</groupId>
+        <artifactId>flowdesk-infrastructure</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.flowdesk</groupId>
+        <artifactId>flowdesk-bootstrap</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.flowdesk</groupId>
+        <artifactId>flowdesk-mcp-asset</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.flowdesk</groupId>
+        <artifactId>flowdesk-mcp-monitoring</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+
+      <!-- ============ 外部 BOM：Spring AI Alibaba 优先声明，保证其管理版本胜出 ============ -->
+      <dependency>
+        <groupId>com.alibaba.cloud.ai</groupId>
+        <artifactId>spring-ai-alibaba-bom</artifactId>
+        <version>${spring-ai-alibaba.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.springframework.ai</groupId>
+        <artifactId>spring-ai-bom</artifactId>
+        <version>${spring-ai.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>com.alibaba.cloud.ai</groupId>
+        <artifactId>spring-ai-alibaba-extensions-bom</artifactId>
+        <version>${spring-ai-alibaba.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <!-- 仅在三个可执行模块中启用，此处只锁定版本 -->
+        <plugin>
+          <groupId>org.springframework.boot</groupId>
+          <artifactId>spring-boot-maven-plugin</artifactId>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+
+    <plugins>
+      <!-- 构建环境校验：JDK 17 与 Maven 3.9+ -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-enforcer-plugin</artifactId>
+        <version>${maven-enforcer-plugin.version}</version>
+        <executions>
+          <execution>
+            <id>enforce-build-environment</id>
+            <goals>
+              <goal>enforce</goal>
+            </goals>
+            <configuration>
+              <rules>
+                <requireJavaVersion>
+                  <version>[17,18)</version>
+                  <message>FlowDesk 基线要求 JDK 17（java.version=${java.version}，支持范围 [17,18)）</message>
+                </requireJavaVersion>
+                <requireMavenVersion>
+                  <version>[3.9,)</version>
+                  <message>FlowDesk 基线要求 Maven 3.9 及以上</message>
+                </requireMavenVersion>
+              </rules>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

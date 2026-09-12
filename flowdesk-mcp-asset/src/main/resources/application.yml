@@ -1,0 +1,12 @@
+spring:
+  application:
+    name: flowdesk-mcp-asset
+
+server:
+  port: 8091
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
