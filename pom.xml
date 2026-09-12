@@ -40,7 +40,7 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
 
-    <!-- 外部基线版本（仅导入 BOM，当前不接入模型） -->
+    <!-- 外部基线版本（由 BOM 统一管理；当前使用 Spring AI 的 ChatClient 与 OpenAI 兼容适配器访问 DeepSeek） -->
     <spring-ai.version>1.1.2</spring-ai.version>
     <spring-ai-alibaba.version>1.1.2.2</spring-ai-alibaba.version>
 

@@ -100,11 +100,53 @@ thinking 的场景。若不做处理，本 ADR 想要规避的 `reasoning_conten
 
 **绕行方案**：`flowdesk-infrastructure` 中的 `DeepSeekThinkingDisabledInterceptor`
 挂在 Spring Boot 自动配置的 `RestClient.Builder` 上（Spring AI 的 OpenAI 适配器正是用它构造
-`OpenAiApi`），在 `/chat/completions` 请求发出前把 `thinking.type=disabled` 补回请求体。
+`OpenAiApi`），在请求发出前把 `thinking.type=disabled` 补回请求体。
 这样仍然使用自动配置出来的 `ChatModel`，只在 HTTP 层修正请求体。
 
-该行为由 `ToolCallingLoopTests::sendsThinkingDisabledAndConfiguredModelOnTheWire` 断言：
-它用一个合成 OpenAI 兼容端点抓取真实请求体，确认携带工具时该字段依然在线。
+### 拦截器作用域
+
+拦截器只修改**同时满足**以下全部条件的请求，任何一条不满足都按原始字节透传：
+
+1. **方法为 `POST`**；
+2. **`Content-Type` 的类型为 `application`**，且子类型为 `json` 或 `*+json`
+   （因此 `application/json;charset=UTF-8`、`application/problem+json` 会被接受，
+   而 `text/vendor+json` 不会被接受）；
+3. **origin 一致**：scheme 与 host 与配置的 DeepSeek 端点一致；
+4. **有效端口一致**：端口缺省时按 scheme 推导（`https` → 443、`http` → 80），
+   因此 `https://host` 与 `https://host:443` 视为同一端点；
+5. **path 精确相等**：与解析出的目标 URI 的 path 完全一致（不是后缀匹配）。
+
+**目标端点的解析方式**：不自行拼接路径。`OpenAiApi` 实际执行的是
+`restClientBuilder.clone().baseUrl(baseUrl)` 再 `.post().uri(completionsPath)`，
+而 `RestClient.Builder.baseUrl(String)` 内部就是一个 `DefaultUriBuilderFactory`，
+因此拦截器用同一个工厂解析：
+
+```java
+URI endpoint = new DefaultUriBuilderFactory(baseUrl).expand(completionsPath);
+```
+
+两者等价性由 `DeepSeekEndpointResolutionTests` 用 `MockRestServiceServer` 捕获 RestClient
+真实请求的 URI 逐例比对（含 base-url 带/不带尾斜杠、completions-path 带/不带前导斜杠等组合）。
+
+**特别提醒**：不要自行给缺前导斜杠的 `completions-path` 补斜杠。
+当 base-url 自带路径时，Spring 是直接拼接的：
+
+```
+base=https://gw.example.com/openai/v1 + path=chat/completions
+  Spring/RestClient 实际 → https://gw.example.com/openai/v1chat/completions
+  自行补斜杠（错误）      → https://gw.example.com/openai/v1/chat/completions
+```
+
+该差异由 `DeepSeekThinkingDisabledInterceptorTests#injectsOnlyAtTheUriSpringActuallyResolves`
+断言：只有 Spring 实际解析出的 URI 会被修改，人工补斜杠后的 URI 保持不变。
+
+### 覆盖该行为的测试
+
+| 测试 | 覆盖内容 |
+| --- | --- |
+| `DeepSeekEndpointResolutionTests` | `DefaultUriBuilderFactory` 与 RestClient 实际 URI 的等价性 |
+| `DeepSeekThinkingDisabledInterceptorTests` | 作用域正反例（方法、Content-Type、origin、端口、精确 path） |
+| `ToolCallingLoopTests` | 生产链路下三轮请求（普通聊天 + 工具两轮）均携带 `thinking.type=disabled` |
 
 **清理条件**：Spring AI 修复上述合并缺陷后，删除 `DeepSeekTransportConfiguration`
 与 `DeepSeekThinkingDisabledInterceptor` 即可，其余代码无需改动。

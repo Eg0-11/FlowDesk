@@ -18,8 +18,8 @@ import org.springframework.mock.http.client.MockClientHttpResponse;
 /**
  * 拦截器作用域测试：只有真正发往配置的 DeepSeek Chat Completions 端点的请求才允许被修改。
  *
- * <p>配置取 {@code base-url=https://api.deepseek.com} 与
- * {@code completions-path=/chat/completions}，与 deepseek profile 一致。</p>
+ * <p>目标端点按 Spring 的解析规则得出（见 {@link DeepSeekEndpointResolutionTests}），
+ * 本测试不自行拼接路径。</p>
  */
 class DeepSeekThinkingDisabledInterceptorTests {
 
@@ -36,14 +36,59 @@ class DeepSeekThinkingDisabledInterceptorTests {
     private final DeepSeekThinkingDisabledInterceptor interceptor =
             new DeepSeekThinkingDisabledInterceptor(MAPPER, BASE_URL, COMPLETIONS_PATH);
 
+    // ---------- 正确端点：注入 ----------
+
     @Test
-    void injectsThinkingDisabledOnTheConfiguredDeepSeekEndpoint() throws Exception {
+    void injectsForTheDefaultBaseUrlWithLeadingSlashPath() throws Exception {
         byte[] sent = send(ENDPOINT, HttpMethod.POST, MediaType.APPLICATION_JSON, REQUEST_BODY);
 
         JsonNode body = MAPPER.readTree(sent);
         assertThat(body.path("thinking").path("type").asText()).isEqualTo("disabled");
         assertThat(body.path("model").asText()).isEqualTo("deepseek-flash");
         assertThat(body.has("tools")).isTrue();
+    }
+
+    @Test
+    void injectsForAPathPrefixedBaseUrlWithLeadingSlashPath() throws Exception {
+        DeepSeekThinkingDisabledInterceptor prefixed =
+                new DeepSeekThinkingDisabledInterceptor(MAPPER, "https://gateway.example.com/openai/v1",
+                        COMPLETIONS_PATH);
+
+        byte[] injected = capture(prefixed, "https://gateway.example.com/openai/v1/chat/completions");
+        byte[] withoutPrefix = capture(prefixed, "https://gateway.example.com/chat/completions");
+
+        assertThat(MAPPER.readTree(injected).path("thinking").path("type").asText()).isEqualTo("disabled");
+        assertThat(text(withoutPrefix))
+                .as("缺少 base-url 路径前缀的 URI 不是目标端点")
+                .isEqualTo(REQUEST_BODY);
+    }
+
+    @Test
+    void injectsWhenTheCompletionsPathHasNoLeadingSlash() throws Exception {
+        DeepSeekThinkingDisabledInterceptor relativePath =
+                new DeepSeekThinkingDisabledInterceptor(MAPPER, BASE_URL, "chat/completions");
+
+        byte[] sent = capture(relativePath, ENDPOINT);
+
+        assertThat(MAPPER.readTree(sent).path("thinking").path("type").asText()).isEqualTo("disabled");
+    }
+
+    @Test
+    void injectsOnlyAtTheUriSpringActuallyResolves() throws Exception {
+        // base 自带路径 + 无前导斜杠的 completions-path：Spring 直接拼接，不插入分隔符
+        DeepSeekThinkingDisabledInterceptor concatenating =
+                new DeepSeekThinkingDisabledInterceptor(MAPPER, "https://gateway.example.com/openai/v1",
+                        "chat/completions");
+
+        byte[] springUri = capture(concatenating, "https://gateway.example.com/openai/v1chat/completions");
+        byte[] handPaddedUri = capture(concatenating, "https://gateway.example.com/openai/v1/chat/completions");
+
+        assertThat(MAPPER.readTree(springUri).path("thinking").path("type").asText())
+                .as("Spring 实际解析出的 URI 必须被修改")
+                .isEqualTo("disabled");
+        assertThat(text(handPaddedUri))
+                .as("人工补斜杠后的错误 URI 不得被修改")
+                .isEqualTo(REQUEST_BODY);
     }
 
     @Test
@@ -56,11 +101,35 @@ class DeepSeekThinkingDisabledInterceptorTests {
 
     @Test
     void injectsWhenContentTypeCarriesCharset() throws Exception {
-        MediaType jsonWithCharset = new MediaType("application", "json", Map.of("charset", "UTF-8"));
-
-        byte[] sent = send(ENDPOINT, HttpMethod.POST, jsonWithCharset, REQUEST_BODY);
+        byte[] sent = send(ENDPOINT, HttpMethod.POST,
+                new MediaType("application", "json", Map.of("charset", "UTF-8")), REQUEST_BODY);
 
         assertThat(MAPPER.readTree(sent).path("thinking").path("type").asText()).isEqualTo("disabled");
+    }
+
+    @Test
+    void injectsForApplicationProblemJson() throws Exception {
+        byte[] sent = send(ENDPOINT, HttpMethod.POST, MediaType.parseMediaType("application/problem+json"),
+                REQUEST_BODY);
+
+        assertThat(MAPPER.readTree(sent).path("thinking").path("type").asText()).isEqualTo("disabled");
+    }
+
+    @Test
+    void overridesAConflictingThinkingBlock() throws Exception {
+        byte[] sent = send(ENDPOINT, HttpMethod.POST, MediaType.APPLICATION_JSON,
+                "{\"thinking\":{\"type\":\"enabled\"}}");
+
+        assertThat(MAPPER.readTree(sent).path("thinking").path("type").asText()).isEqualTo("disabled");
+    }
+
+    // ---------- 非目标请求：原始字节透传 ----------
+
+    @Test
+    void doesNotTouchTextVendorJson() throws Exception {
+        byte[] sent = send(ENDPOINT, HttpMethod.POST, MediaType.parseMediaType("text/vendor+json"), REQUEST_BODY);
+
+        assertThat(text(sent)).isEqualTo(REQUEST_BODY);
     }
 
     @Test
@@ -130,27 +199,6 @@ class DeepSeekThinkingDisabledInterceptorTests {
         byte[] sent = send(ENDPOINT, HttpMethod.POST, MediaType.APPLICATION_JSON, original);
 
         assertThat(text(sent)).isEqualTo(original);
-    }
-
-    @Test
-    void overridesAConflictingThinkingBlock() throws Exception {
-        byte[] sent = send(ENDPOINT, HttpMethod.POST, MediaType.APPLICATION_JSON,
-                "{\"thinking\":{\"type\":\"enabled\"}}");
-
-        assertThat(MAPPER.readTree(sent).path("thinking").path("type").asText()).isEqualTo("disabled");
-    }
-
-    @Test
-    void honoursABaseUrlThatCarriesItsOwnPathPrefix() throws Exception {
-        DeepSeekThinkingDisabledInterceptor prefixed =
-                new DeepSeekThinkingDisabledInterceptor(MAPPER, "https://gateway.example.com/openai/v1",
-                        COMPLETIONS_PATH);
-
-        byte[] matching = capture(prefixed, "https://gateway.example.com/openai/v1/chat/completions");
-        byte[] withoutPrefix = capture(prefixed, "https://gateway.example.com/chat/completions");
-
-        assertThat(MAPPER.readTree(matching).path("thinking").path("type").asText()).isEqualTo("disabled");
-        assertThat(text(withoutPrefix)).isEqualTo(REQUEST_BODY);
     }
 
     private byte[] send(String url, HttpMethod method, MediaType contentType, String body) throws Exception {

@@ -11,8 +11,11 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
  * 它们的 {@code com.flowdesk.mcp.asset}、{@code com.flowdesk.mcp.monitoring} 包
  * 刻意不在主服务的扫描范围内。</p>
  *
- * <p>当前阶段（FD-0001-R1）只负责启动 Spring 上下文并启用 Actuator 健康检查，
- * 不注册任何业务组件。</p>
+ * <p>当前装配会激活三部分组件：{@code com.flowdesk.agent.ai} 中的 AI 用例实现与本地只读工具、
+ * {@code com.flowdesk.infrastructure.ai} 中的 DeepSeek 传输适配与命名 ChatClient
+ * {@code deepSeekChatClient}、以及 {@code com.flowdesk.bootstrap.ai} 中的 AI HTTP 接口与异常映射。
+ * 它们都受 {@code flowdesk.ai.enabled} 控制：默认 profile 下不会创建任何模型相关 Bean，
+ * 因此没有 API Key 也能启动。</p>
  */
 @SpringBootApplication(scanBasePackages = {
         "com.flowdesk.bootstrap",

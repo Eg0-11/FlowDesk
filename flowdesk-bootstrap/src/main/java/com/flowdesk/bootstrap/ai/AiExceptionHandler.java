@@ -39,7 +39,10 @@ public class AiExceptionHandler {
     }
 
     /**
-     * Bean Validation 失败（如 message 为空或超长）。
+     * Bean Validation 失败（例如 {@code message} 缺失或为纯空白）。
+     *
+     * <p>消息长度不在这里判断：规范化规则是「先 strip、再判空、最后判长度」，
+     * 由应用层统一执行，详见 {@code ChatClientAiService}。</p>
      */
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ProblemDetail handleValidationException(MethodArgumentNotValidException ex) {
