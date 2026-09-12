@@ -2,39 +2,34 @@ package com.flowdesk.bootstrap.ai;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.flowdesk.agent.ai.SupportPolicyTools;
-import com.flowdesk.agent.ai.ToolInvocation;
 import com.flowdesk.agent.ai.ToolInvocationRecorder;
-import com.sun.net.httpserver.HttpExchange;
-import com.sun.net.httpserver.HttpServer;
+import com.flowdesk.application.ai.AiChatUseCase;
+import com.flowdesk.application.ai.AiToolSmokeUseCase;
+import com.flowdesk.application.ai.ChatCommand;
+import com.flowdesk.application.ai.ChatResult;
+import com.flowdesk.application.ai.ToolCallOutcome;
+import com.flowdesk.application.ai.ToolSmokeCommand;
+import com.flowdesk.application.ai.ToolSmokeResult;
 import java.io.IOException;
-import java.io.OutputStream;
-import java.net.InetSocketAddress;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
 /**
- * 工具调用闭环测试。
+ * 生产链路集成测试。
  *
- * <p>本测试把 {@code spring.ai.openai.base-url} 指向一个在测试内启动的合成
- * OpenAI 兼容端点，其余部分（真实 profile 配置、真实 OpenAiChatModel、真实 ChatClient、
- * 真实工具执行与记录器）全部走生产代码路径。合成端点第一轮返回 tool_calls，
- * 第二轮返回最终回答，因此它验证的是完整闭环：模型要求调用工具 → 真实 Java 工具执行
- * → 工具结果回传 → 模型再次生成最终回答。</p>
+ * <p>本测试<b>只通过 application 层的用例接口驱动</b>（{@link AiChatUseCase}、
+ * {@link AiToolSmokeUseCase}），不注入 {@code ChatClient} 或 {@code SupportPolicyTools}，
+ * 因此经过的是完整生产链路：Controller 层所依赖的用例 → {@code ChatClientAiService} 编排
+ * → Spring AI {@code ChatClient} → 真实工具执行 → 请求级记录器。</p>
  *
- * <p>它同时把真实发出的请求体抓下来，用于断言 {@code thinking.type=disabled} 确实上了线。</p>
+ * <p>模型侧由 {@link SyntheticOpenAiEndpoint} 承担（本地回环，不是 DeepSeek），
+ * 它同时记录每一轮真实发出的请求体，使本测试能够断言“模型究竟收到了什么”。</p>
  */
 @SpringBootTest(properties = {
         "spring.profiles.active=deepseek",
@@ -42,151 +37,96 @@ import org.springframework.test.context.DynamicPropertySource;
 })
 class ToolCallingLoopTests {
 
-    private static final List<String> REQUEST_BODIES = Collections.synchronizedList(new ArrayList<>());
-
-    private static final String FINAL_ANSWER = "该工单按 P1 转派网络与接入组，首个动作是采集 VPN 客户端日志。";
-
-    private static HttpServer stubServer;
+    private static SyntheticOpenAiEndpoint endpoint;
 
     @Autowired
-    @Qualifier("deepSeekChatClient")
-    private ChatClient deepSeekChatClient;
+    private AiChatUseCase aiChatUseCase;
 
     @Autowired
-    private SupportPolicyTools supportPolicyTools;
+    private AiToolSmokeUseCase aiToolSmokeUseCase;
 
     @DynamicPropertySource
     static void pointAtSyntheticEndpoint(DynamicPropertyRegistry registry) throws IOException {
-        stubServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        stubServer.createContext("/chat/completions", ToolCallingLoopTests::handle);
-        stubServer.start();
-        registry.add("spring.ai.openai.base-url", () -> "http://127.0.0.1:" + stubServer.getAddress().getPort());
+        if (endpoint == null) {
+            endpoint = SyntheticOpenAiEndpoint.start(SyntheticOpenAiEndpoint.Behaviour.TOOL_CALL_THEN_ANSWER);
+        }
+        registry.add("spring.ai.openai.base-url", endpoint::baseUrl);
     }
 
     @AfterAll
-    static void stopStubServer() {
-        if (stubServer != null) {
-            stubServer.stop(0);
+    static void stopEndpoint() {
+        if (endpoint != null) {
+            endpoint.stop();
         }
     }
 
     @BeforeEach
-    void clearCapturedRequests() {
-        REQUEST_BODIES.clear();
+    void resetEndpoint() {
+        endpoint.clearRequests();
     }
 
     @Test
-    void completesToolCallingLoopAndReturnsFinalAnswer() {
-        ToolInvocationRecorder recorder = new ToolInvocationRecorder();
+    void plainChatSendsNoToolsAtAll() {
+        ChatResult result = this.aiChatUseCase.chat(new ChatCommand("请用一句话介绍 FlowDesk"));
 
-        String answer = callWithTool(recorder, "loop-test-request-id");
+        assertThat(result.requestId()).isNotBlank();
+        assertThat(result.answer()).isEqualTo(SyntheticOpenAiEndpoint.PLAIN_ANSWER);
 
-        assertThat(answer).isEqualTo(FINAL_ANSWER);
-        assertThat(recorder.invocations())
-                .containsExactly(new ToolInvocation(SupportPolicyTools.TOOL_NAME, true));
-        assertThat(recorder.anySucceeded()).isTrue();
-        // 两轮请求：第一轮要求调用工具，第二轮携带工具结果并要求最终回答
-        assertThat(REQUEST_BODIES).hasSize(2);
+        List<SyntheticOpenAiEndpoint.CapturedRequest> requests = endpoint.requests();
+        assertThat(requests).hasSize(1);
+        SyntheticOpenAiEndpoint.CapturedRequest request = requests.get(0);
+        assertThat(request.method()).isEqualTo("POST");
+        assertThat(request.model()).isEqualTo("deepseek-flash");
+        assertThat(request.hasTools()).as("普通聊天绝不能把工具发给模型").isFalse();
+        assertThat(request.hasToolResult()).isFalse();
+        assertThat(request.thinkingType()).isEqualTo("disabled");
     }
 
     @Test
-    void sendsThinkingDisabledAndConfiguredModelOnTheWire() {
-        ToolInvocationRecorder recorder = new ToolInvocationRecorder();
+    void toolSmokeRunsTheWholeLoopThroughTheUseCaseInterface() {
+        ToolSmokeResult result = this.aiToolSmokeUseCase.toolSmoke(new ToolSmokeCommand("VPN_FAILURE"));
 
-        callWithTool(recorder, "wire-test-request-id");
+        // 7) 最终结果的工具调用摘要正确
+        assertThat(result.requestId()).isNotBlank();
+        assertThat(result.toolCalled()).isTrue();
+        assertThat(result.toolCalls())
+                .containsExactly(new ToolCallOutcome("lookup_support_policy", true));
+        // 4) 最终回答来自第二轮
+        assertThat(result.answer()).isEqualTo(SyntheticOpenAiEndpoint.FINAL_ANSWER);
 
-        String firstRound = REQUEST_BODIES.get(0);
-        assertThat(firstRound).contains("\"model\":\"deepseek-flash\"");
-        assertThat(firstRound).contains("\"thinking\":{\"type\":\"disabled\"}");
-        assertThat(firstRound).contains("\"temperature\":0.2");
-        assertThat(firstRound).contains("lookup_support_policy");
+        List<SyntheticOpenAiEndpoint.CapturedRequest> requests = endpoint.requests();
+        assertThat(requests).hasSize(2);
 
-        String secondRound = REQUEST_BODIES.get(1);
-        // 第二轮必须把真实工具执行结果回传给模型
-        assertThat(secondRound).contains("lookup_support_policy");
-        assertThat(secondRound).contains("VPN_FAILURE");
-        assertThat(secondRound).contains("P1");
+        SyntheticOpenAiEndpoint.CapturedRequest first = requests.get(0);
+        SyntheticOpenAiEndpoint.CapturedRequest second = requests.get(1);
+
+        // 2) 第一轮确实把工具提供给了模型
+        assertThat(first.hasTools()).isTrue();
+        assertThat(first.containsText("lookup_support_policy")).isTrue();
+        assertThat(first.hasToolResult()).isFalse();
+
+        // 3) 工具被真实执行，且结果在第二轮回传（P1 / 网络与接入组来自真实工具返回值）
+        assertThat(second.hasToolResult()).isTrue();
+        assertThat(second.containsText("VPN_FAILURE")).isTrue();
+        assertThat(second.containsText("P1")).isTrue();
+        assertThat(second.containsText("网络与接入组")).isTrue();
+
+        // 5) 两轮都必须关闭 thinking
+        assertThat(first.thinkingType()).isEqualTo("disabled");
+        assertThat(second.thinkingType()).isEqualTo("disabled");
     }
 
     @Test
-    void doesNotExposeToolContextToTheModel() {
-        ToolInvocationRecorder recorder = new ToolInvocationRecorder();
+    void neverLeaksToolContextOrRequestIdIntoModelRequests() {
+        ToolSmokeResult result = this.aiToolSmokeUseCase.toolSmoke(new ToolSmokeCommand("ACCOUNT_LOCK"));
 
-        callWithTool(recorder, "context-isolation-request-id");
-
-        assertThat(REQUEST_BODIES.get(0)).doesNotContain(ToolInvocationRecorder.CONTEXT_KEY);
-    }
-
-    private String callWithTool(ToolInvocationRecorder recorder, String requestId) {
-        return deepSeekChatClient.prompt()
-                .user("工单类型：VPN_FAILURE，请先查询支持策略再给出处置建议。")
-                .tools(supportPolicyTools)
-                .toolContext(Map.of(
-                        ToolInvocationRecorder.CONTEXT_KEY, recorder,
-                        ToolInvocationRecorder.REQUEST_ID_KEY, requestId))
-                .call()
-                .content();
-    }
-
-    private static void handle(HttpExchange exchange) throws IOException {
-        String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-        REQUEST_BODIES.add(body);
-
-        boolean secondRound = body.contains("\"role\":\"tool\"");
-        byte[] payload = (secondRound ? finalResponse() : toolCallResponse()).getBytes(StandardCharsets.UTF_8);
-
-        exchange.getResponseHeaders().add("Content-Type", "application/json;charset=UTF-8");
-        exchange.sendResponseHeaders(200, payload.length);
-        try (OutputStream out = exchange.getResponseBody()) {
-            out.write(payload);
-        }
-    }
-
-    private static String toolCallResponse() {
-        return """
-                {
-                  "id": "chatcmpl-stub-1",
-                  "object": "chat.completion",
-                  "created": 1700000000,
-                  "model": "deepseek-flash",
-                  "choices": [{
-                    "index": 0,
-                    "message": {
-                      "role": "assistant",
-                      "content": "",
-                      "tool_calls": [{
-                        "id": "call_stub_1",
-                        "type": "function",
-                        "function": {
-                          "name": "lookup_support_policy",
-                          "arguments": "{\\"issueType\\":\\"VPN_FAILURE\\"}"
-                        }
-                      }]
-                    },
-                    "finish_reason": "tool_calls"
-                  }],
-                  "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-                }
-                """;
-    }
-
-    private static String finalResponse() {
-        return """
-                {
-                  "id": "chatcmpl-stub-2",
-                  "object": "chat.completion",
-                  "created": 1700000001,
-                  "model": "deepseek-flash",
-                  "choices": [{
-                    "index": 0,
-                    "message": {
-                      "role": "assistant",
-                      "content": "%s"
-                    },
-                    "finish_reason": "stop"
-                  }],
-                  "usage": {"prompt_tokens": 20, "completion_tokens": 9, "total_tokens": 29}
-                }
-                """.formatted(FINAL_ANSWER);
+        assertThat(endpoint.requests()).isNotEmpty();
+        assertThat(endpoint.requests()).allSatisfy(request -> {
+            assertThat(request.containsText(ToolInvocationRecorder.CONTEXT_KEY))
+                    .as("调用记录器不得进入模型请求体").isFalse();
+            assertThat(request.containsText(ToolInvocationRecorder.REQUEST_ID_KEY)).isFalse();
+            assertThat(request.containsText(result.requestId()))
+                    .as("requestId 不得进入模型请求体").isFalse();
+        });
     }
 }

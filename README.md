@@ -1,15 +1,18 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：项目骨架（FD-0001）**
-> 本阶段只建立可编译、可测试的 Maven 多模块结构并锁定版本基线。
-> 尚未实现任何业务功能，未接入数据库、Redis、MQ、RAG、MCP 与 DeepSeek 模型。
+> **当前阶段：FD-0002 —— DeepSeek 接入与本地 Tool Calling 冒烟闭环（已完成）**
+> 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 的 OpenAI 兼容传输适配、
+> 普通聊天接口、单次本地只读工具调用闭环、配置隔离、异常映射与自动化测试。
+> 尚未实现：工单业务、RAG、MCP 能力、Agent Graph、数据库/Redis/MQ、会话记忆、流式输出、鉴权与前端。
 
 ## 一、项目简介
 
 FlowDesk 面向企业 IT 服务与运营场景，规划能力包括：智能化工单流转、知识库运营、RAG 检索增强、
 Tool 调用、MCP 资产/监控服务以及基于 Agent Graph 的自动化编排。
 
-当前仓库提供的是这一切能力的地基：清晰的模块边界、单向依赖方向、统一的版本与编码基线。
+当前仓库已经打通第一条 AI 垂直链路：**HTTP → 用例 → Agent 编排 → Spring AI ChatClient →
+DeepSeek（OpenAI 兼容传输）→ 本地只读工具 → 模型汇总 → HTTP 响应**，
+并保留了清晰的模块边界、单向依赖方向与统一的版本基线。
 
 ## 二、模块职责
 
@@ -17,7 +20,7 @@ Tool 调用、MCP 资产/监控服务以及基于 Agent Graph 的自动化编排
 | --- | --- | --- |
 | `flowdesk-shared` | 通用异常、基础类型、工具类 | 仅模块与 `package-info.java` |
 | `flowdesk-domain` | 领域实体、值对象、领域规则（**不依赖 Spring**） | 仅模块与 `package-info.java` |
-| `flowdesk-application` | 用例服务、输入输出端口 | 仅模块与 `package-info.java` |
+| `flowdesk-application` | 用例服务、输入输出端口 | 已定义 AI 用例接口与命令/结果对象（`com.flowdesk.application.ai`，框架无关） |
 | `flowdesk-agent` | AI 编排：实现 application 的 AI 用例，用 ChatClient 编排提示词与本地工具 | 已实现普通聊天与工具冒烟 |
 | `flowdesk-infrastructure` | 数据库、Redis、向量库、模型等适配器 | 已提供 DeepSeek 的 OpenAI 兼容传输适配 |
 | `flowdesk-bootstrap` | FlowDesk 主服务启动模块（Web + Validation + Actuator + AI 接口） | 可启动，端口 8080 |
@@ -55,9 +58,10 @@ flowdesk-mcp-monitoring     ← 只依赖 flowdesk-shared
 | JDK | 17（Release 固定 17，Enforcer 校验 `[17,18)`） |
 | Maven | 3.9+（Enforcer 校验 `[3.9,)`） |
 | Spring Boot | 3.5.8（父 POM + BOM） |
-| Spring AI | 1.1.2（仅导入 BOM） |
-| Spring AI Alibaba | 1.1.2.2（仅导入 BOM） |
-| Spring AI Alibaba Extensions | 1.1.2.2（仅导入 BOM） |
+| Spring AI | 1.1.2（BOM 管理；实际使用 `spring-ai-client-chat` 与 `spring-ai-starter-model-openai`） |
+| Spring AI Alibaba | 1.1.2.2（**仅导入 BOM**，其 Agent Framework 留待后续阶段） |
+| Spring AI Alibaba Extensions | 1.1.2.2（**仅导入 BOM**） |
+| DeepSeek 传输 | OpenAI 兼容 Chat Completions（`spring-ai-starter-model-openai`，见 [ADR 0001](docs/adr/0001-deepseek-openai-compatible-transport.md)） |
 | JUnit | JUnit 5（由 `spring-boot-starter-test` 统一提供） |
 | 编码 | UTF-8（源码与报告输出） |
 
@@ -97,18 +101,11 @@ java -jar flowdesk-mcp-monitoring/target/flowdesk-mcp-monitoring-0.1.0-SNAPSHOT.
 ```
 
 配置约定：三个 `application.yml` 只声明应用名、端口，并只暴露 `health`、`info` 两个 Actuator 端点；
-不写入任何密码、Token、API Key，也不包含 DeepSeek 与数据库配置。
+不写入任何密码、Token 或 API Key 字面量。DeepSeek 相关配置集中在
+`flowdesk-bootstrap/src/main/resources/application-deepseek.yml`，其中的 Key 只引用环境变量
+`${DEEPSEEK_API_KEY}`，默认 profile 下完全不会被激活。
 
-## 七、后续阶段简述
-
-1. **工单业务**：领域模型、用例服务、持久化适配器与工单接口。
-2. **DeepSeek 接入**：模型客户端与配置装配，接入 Spring AI。
-3. **RAG**：知识库文档解析、切分、向量化与检索增强。
-4. **Tool**：面向工单与知识的工具定义与注册。
-5. **MCP**：资产 MCP 服务与监控 MCP 服务的能力实现。
-6. **Agent Graph**：基于 Spring AI Alibaba 的多节点编排与自动化流转。
-
-## 八、AI 链路（FD-0002）
+## 七、AI 链路（FD-0002）
 
 本阶段打通了 FlowDesk 的第一条 AI 垂直链路：
 
@@ -118,14 +115,14 @@ HTTP → Bootstrap Controller → Application 用例接口 → Agent 编排 → 
      → DeepSeek 汇总工具结果 → HTTP 响应
 ```
 
-### 8.1 模型接入方式
+### 7.1 模型接入方式
 
 DeepSeek 通过 **OpenAI 兼容的 Chat Completions 接口**访问，使用
 `spring-ai-starter-model-openai` 而非原生 DeepSeek 适配器。
 决策背景、理由与重新评估条件见
 [`docs/adr/0001-deepseek-openai-compatible-transport.md`](docs/adr/0001-deepseek-openai-compatible-transport.md)。
 
-### 8.2 HTTP 接口
+### 7.2 HTTP 接口
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -151,7 +148,7 @@ curl -X POST http://localhost:8080/api/v1/ai/tool-smoke \
 
 响应中不会出现供应商原始报文、堆栈或配置。
 
-### 8.3 配置与启用方式
+### 7.3 配置与启用方式
 
 默认 profile **不装配任何模型适配器**，因此没有 API Key 也能启动与运行测试，
 并且不存在任何出网可能：
@@ -177,17 +174,36 @@ flowdesk:
 > 否则默认 profile 会启动失败。
 
 真实调用 DeepSeek 时启用 `deepseek` profile（配置见
-`flowdesk-bootstrap/src/main/resources/application-deepseek.yml`）：
+`flowdesk-bootstrap/src/main/resources/application-deepseek.yml`）。
+
+**推荐方式：先打包，再直接运行 jar。** 这是唯一不依赖「兄弟模块已 install」的方式，
+干净仓库里也能直接跑通：
 
 ```bash
-# macOS / Linux
-export DEEPSEEK_API_KEY=sk-...
-./mvnw -pl flowdesk-bootstrap spring-boot:run -Dspring-boot.run.profiles=deepseek
-
 # Windows PowerShell
 $env:DEEPSEEK_API_KEY = 'sk-...'
+.\mvnw.cmd clean package
+java -jar flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar --spring.profiles.active=deepseek
+
+# macOS / Linux
+export DEEPSEEK_API_KEY=sk-...
+./mvnw clean package
+java -jar flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar --spring.profiles.active=deepseek
+```
+
+**备选方式：先 install 再 `spring-boot:run`。** 注意必须先 `install` 把兄弟模块装进本地仓库，
+否则单独运行 `-pl flowdesk-bootstrap` 时 `flowdesk-agent` / `flowdesk-infrastructure`
+尚未解析得到，构建会失败：
+
+```bash
+# Windows PowerShell
+$env:DEEPSEEK_API_KEY = 'sk-...'
+.\mvnw.cmd -DskipTests clean install
 .\mvnw.cmd -pl flowdesk-bootstrap spring-boot:run "-Dspring-boot.run.profiles=deepseek"
 ```
+
+> 不要写成 `-pl flowdesk-bootstrap -am spring-boot:run`：`-am` 会让 `spring-boot:run`
+> 这个 goal 同时在上游库模块上执行，而那些模块没有可运行的主类，必然失败。
 
 环境变量：
 
@@ -215,7 +231,7 @@ spring:
 > 必须由 Shell、IDE 运行配置或容器编排显式注入。
 > 严禁把真实 API Key 提交进仓库或在日志/响应中输出。
 
-### 8.4 已知的 Spring AI 1.1.2 传输层缺陷与绕行
+### 7.4 已知的 Spring AI 1.1.2 传输层缺陷与绕行
 
 `OpenAiChatModel.createRequest` 在**注册了工具**时会执行第二次 `ModelOptionsUtils.merge`
 （把 `tools` 数组并进请求体），而这次合并会把 `extraBody` 清空：
@@ -227,10 +243,24 @@ spring:
 
 也就是说配置里的 `extra-body` 在普通聊天路径有效，一旦携带工具就失效，
 而携带工具恰恰是必须关闭 thinking 的场景。FlowDesk 因此在传输层加入了
-`DeepSeekThinkingDisabledInterceptor`：在 `/chat/completions` 请求真正发出前补齐该字段。
-该拦截器由 `ToolCallingLoopTests` 断言其真实生效；Spring AI 修复该缺陷后可整体删除。
+`DeepSeekThinkingDisabledInterceptor`：在请求真正发出前补齐该字段。
 
-### 8.5 上游故障的失败时效
+**该拦截器的作用域是严格限定的**，只有同时满足以下全部条件的请求才会被修改：
+
+1. HTTP 方法为 `POST`；
+2. `Content-Type` 为 JSON（`application/json` 或 `application/*+json`）；
+3. scheme、host 与有效端口和配置的 DeepSeek `base-url` 完全一致；
+4. path 与「`base-url` 的 path + 配置的 `completions-path`」完全一致。
+
+不使用 `endsWith("/chat/completions")` 这类宽松判断 —— 同一个 JVM 里的其它客户端
+（向量库、其它 OpenAI 兼容提供方、本地回环服务）都可能命中同名路径。
+请求体已声明 `thinking.type=disabled` 时按原始字节透传，不重复写入也不破坏报文。
+
+作用域由 `DeepSeekThinkingDisabledInterceptorTests` 覆盖（正确端点注入、
+异 host 同 path 不注入、同 host 错 path 不注入、非 POST/非 JSON 不注入、重复不破坏），
+真实链路由 `ToolCallingLoopTests` 断言。Spring AI 修复该缺陷后，拦截器可整体删除。
+
+### 7.5 上游故障的失败时效
 
 Spring AI 默认重试为 `max-attempts=10`、`multiplier=5`、初始退避 2000ms，
 累计退避约 4 分钟。这意味着上游故障时客户端等到的不是 502 而是自己的超时 ——
@@ -250,10 +280,25 @@ spring:
 典型故障（连接被拒）下约 1.5 秒即返回 502。该时效由
 `ProviderFailureBoundedTests` 锁死。
 
-## 九、代码约束
+## 八、代码约束
 
 - 不使用 Lombok。
 - 不创建空的 Controller、Service、Repository、Entity 占位类。
-- 不提前实现业务功能，不引入数据库、Redis、MQ、RAG、MCP、DeepSeek 依赖。
+- 不提前实现业务功能；当前阶段不引入数据库、Redis、MQ、RAG、MCP 能力的依赖。
 - 不使用通配符版本；子模块不重复声明受 BOM 管理的版本。
 - 不隐藏编译警告，不跳过测试；全部文件使用 UTF-8。
+
+## 九、后续阶段简述
+
+| 阶段 | 内容 | 状态 |
+| --- | --- | --- |
+| FD-0001 | Maven 多模块骨架与版本基线 | ✅ 已完成 |
+| FD-0002 | DeepSeek 接入与本地 Tool Calling 冒烟闭环 | ✅ 已完成 |
+| 后续 | 工单业务（领域模型、用例、持久化、接口） | 未开始 |
+| 后续 | RAG：文档解析、切分、向量化、检索增强 | 未开始 |
+| 后续 | Tool 体系扩展：面向工单与知识的工具注册 | 未开始 |
+| 后续 | MCP：资产 MCP 服务与监控 MCP 服务的能力实现 | 未开始 |
+| 后续 | Agent Graph：基于 Spring AI Alibaba Agent Framework 的多节点编排 | 未开始 |
+
+> Spring AI Alibaba 的 BOM 已在根 pom 中导入并锁定版本，但其 Agent Framework 制品尚未使用；
+> 后续阶段接入时直接复用现有 BOM，不需要改动版本基线。

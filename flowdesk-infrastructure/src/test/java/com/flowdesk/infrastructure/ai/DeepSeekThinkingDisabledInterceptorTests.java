@@ -6,26 +6,39 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.client.ClientHttpRequestExecution;
 import org.springframework.mock.http.client.MockClientHttpRequest;
 import org.springframework.mock.http.client.MockClientHttpResponse;
 
 /**
- * 传输层 thinking 关闭拦截器的行为测试。
+ * 拦截器作用域测试：只有真正发往配置的 DeepSeek Chat Completions 端点的请求才允许被修改。
+ *
+ * <p>配置取 {@code base-url=https://api.deepseek.com} 与
+ * {@code completions-path=/chat/completions}，与 deepseek profile 一致。</p>
  */
 class DeepSeekThinkingDisabledInterceptorTests {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    private final DeepSeekThinkingDisabledInterceptor interceptor = new DeepSeekThinkingDisabledInterceptor(MAPPER);
+    private static final String BASE_URL = "https://api.deepseek.com";
+
+    private static final String COMPLETIONS_PATH = "/chat/completions";
+
+    private static final String ENDPOINT = "https://api.deepseek.com/chat/completions";
+
+    private static final String REQUEST_BODY = "{\"model\":\"deepseek-flash\",\"messages\":[],\"tools\":[]}";
+
+    private final DeepSeekThinkingDisabledInterceptor interceptor =
+            new DeepSeekThinkingDisabledInterceptor(MAPPER, BASE_URL, COMPLETIONS_PATH);
 
     @Test
-    void addsThinkingDisabledToChatCompletionsRequest() throws Exception {
-        byte[] sent = capture("https://api.deepseek.com/chat/completions",
-                "{\"model\":\"deepseek-flash\",\"messages\":[],\"tools\":[]}");
+    void injectsThinkingDisabledOnTheConfiguredDeepSeekEndpoint() throws Exception {
+        byte[] sent = send(ENDPOINT, HttpMethod.POST, MediaType.APPLICATION_JSON, REQUEST_BODY);
 
         JsonNode body = MAPPER.readTree(sent);
         assertThat(body.path("thinking").path("type").asText()).isEqualTo("disabled");
@@ -34,48 +47,142 @@ class DeepSeekThinkingDisabledInterceptorTests {
     }
 
     @Test
-    void keepsOtherPathsUntouched() throws Exception {
-        String original = "{\"model\":\"text-embedding-3-small\",\"input\":\"hello\"}";
+    void injectsWhenTheDefaultPortIsSpelledOutExplicitly() throws Exception {
+        byte[] sent = send("https://api.deepseek.com:443/chat/completions", HttpMethod.POST,
+                MediaType.APPLICATION_JSON, REQUEST_BODY);
 
-        byte[] sent = capture("https://api.deepseek.com/embeddings", original);
-
-        assertThat(new String(sent, StandardCharsets.UTF_8)).isEqualTo(original);
+        assertThat(MAPPER.readTree(sent).path("thinking").path("type").asText()).isEqualTo("disabled");
     }
 
     @Test
-    void keepsEmptyBodyUntouched() throws Exception {
-        byte[] sent = capture("https://api.deepseek.com/chat/completions", "");
+    void injectsWhenContentTypeCarriesCharset() throws Exception {
+        MediaType jsonWithCharset = new MediaType("application", "json", Map.of("charset", "UTF-8"));
+
+        byte[] sent = send(ENDPOINT, HttpMethod.POST, jsonWithCharset, REQUEST_BODY);
+
+        assertThat(MAPPER.readTree(sent).path("thinking").path("type").asText()).isEqualTo("disabled");
+    }
+
+    @Test
+    void doesNotTouchADifferentHostWithTheSamePath() throws Exception {
+        byte[] sent = send("http://127.0.0.1:19099/chat/completions", HttpMethod.POST, MediaType.APPLICATION_JSON,
+                REQUEST_BODY);
+
+        assertThat(text(sent)).isEqualTo(REQUEST_BODY);
+    }
+
+    @Test
+    void doesNotTouchADifferentPortOnTheSameHost() throws Exception {
+        byte[] sent = send("https://api.deepseek.com:8443/chat/completions", HttpMethod.POST,
+                MediaType.APPLICATION_JSON, REQUEST_BODY);
+
+        assertThat(text(sent)).isEqualTo(REQUEST_BODY);
+    }
+
+    @Test
+    void doesNotTouchADifferentSchemeOnTheSameHost() throws Exception {
+        byte[] sent = send("http://api.deepseek.com/chat/completions", HttpMethod.POST, MediaType.APPLICATION_JSON,
+                REQUEST_BODY);
+
+        assertThat(text(sent)).isEqualTo(REQUEST_BODY);
+    }
+
+    @Test
+    void doesNotTouchAWrongPathOnTheSameHost() throws Exception {
+        byte[] sent = send("https://api.deepseek.com/v1/chat/completions", HttpMethod.POST,
+                MediaType.APPLICATION_JSON, REQUEST_BODY);
+
+        assertThat(text(sent)).isEqualTo(REQUEST_BODY);
+    }
+
+    @Test
+    void doesNotTouchANonPostMethod() throws Exception {
+        byte[] sent = send(ENDPOINT, HttpMethod.GET, MediaType.APPLICATION_JSON, REQUEST_BODY);
+
+        assertThat(text(sent)).isEqualTo(REQUEST_BODY);
+    }
+
+    @Test
+    void doesNotTouchANonJsonContentType() throws Exception {
+        byte[] sent = send(ENDPOINT, HttpMethod.POST, MediaType.TEXT_PLAIN, REQUEST_BODY);
+
+        assertThat(text(sent)).isEqualTo(REQUEST_BODY);
+    }
+
+    @Test
+    void doesNotTouchARequestWithoutContentType() throws Exception {
+        byte[] sent = send(ENDPOINT, HttpMethod.POST, null, REQUEST_BODY);
+
+        assertThat(text(sent)).isEqualTo(REQUEST_BODY);
+    }
+
+    @Test
+    void doesNotTouchAnEmptyBody() throws Exception {
+        byte[] sent = send(ENDPOINT, HttpMethod.POST, MediaType.APPLICATION_JSON, "");
 
         assertThat(sent).isEmpty();
     }
 
     @Test
-    void doesNotRewriteWhenThinkingIsAlreadyDisabled() throws Exception {
+    void leavesAnAlreadyDisabledRequestByteIdentical() throws Exception {
         String original = "{\"model\":\"deepseek-flash\",\"thinking\":{\"type\":\"disabled\"}}";
 
-        byte[] sent = capture("https://api.deepseek.com/chat/completions", original);
+        byte[] sent = send(ENDPOINT, HttpMethod.POST, MediaType.APPLICATION_JSON, original);
 
-        assertThat(new String(sent, StandardCharsets.UTF_8)).isEqualTo(original);
+        assertThat(text(sent)).isEqualTo(original);
     }
 
     @Test
     void overridesAConflictingThinkingBlock() throws Exception {
-        byte[] sent = capture("https://api.deepseek.com/chat/completions",
+        byte[] sent = send(ENDPOINT, HttpMethod.POST, MediaType.APPLICATION_JSON,
                 "{\"thinking\":{\"type\":\"enabled\"}}");
 
-        JsonNode body = MAPPER.readTree(sent);
-        assertThat(body.path("thinking").path("type").asText()).isEqualTo("disabled");
+        assertThat(MAPPER.readTree(sent).path("thinking").path("type").asText()).isEqualTo("disabled");
     }
 
-    private byte[] capture(String url, String body) throws Exception {
-        MockClientHttpRequest request = new MockClientHttpRequest(HttpMethod.POST, URI.create(url));
+    @Test
+    void honoursABaseUrlThatCarriesItsOwnPathPrefix() throws Exception {
+        DeepSeekThinkingDisabledInterceptor prefixed =
+                new DeepSeekThinkingDisabledInterceptor(MAPPER, "https://gateway.example.com/openai/v1",
+                        COMPLETIONS_PATH);
+
+        byte[] matching = capture(prefixed, "https://gateway.example.com/openai/v1/chat/completions");
+        byte[] withoutPrefix = capture(prefixed, "https://gateway.example.com/chat/completions");
+
+        assertThat(MAPPER.readTree(matching).path("thinking").path("type").asText()).isEqualTo("disabled");
+        assertThat(text(withoutPrefix)).isEqualTo(REQUEST_BODY);
+    }
+
+    private byte[] send(String url, HttpMethod method, MediaType contentType, String body) throws Exception {
+        MockClientHttpRequest request = new MockClientHttpRequest(method, URI.create(url));
+        if (contentType != null) {
+            request.getHeaders().setContentType(contentType);
+        }
         byte[][] captured = new byte[1][];
-        ClientHttpRequestExecution execution = (req, sentBody) -> {
-            captured[0] = sentBody;
+        this.interceptor.intercept(request, bytes(body), capturing(captured));
+        return captured[0];
+    }
+
+    private static byte[] capture(DeepSeekThinkingDisabledInterceptor target, String url) throws Exception {
+        MockClientHttpRequest request = new MockClientHttpRequest(HttpMethod.POST, URI.create(url));
+        request.getHeaders().setContentType(MediaType.APPLICATION_JSON);
+        byte[][] captured = new byte[1][];
+        target.intercept(request, bytes(REQUEST_BODY), capturing(captured));
+        return captured[0];
+    }
+
+    private static ClientHttpRequestExecution capturing(byte[][] captured) {
+        return (request, body) -> {
+            captured[0] = body;
             return new MockClientHttpResponse(new byte[0], HttpStatus.OK);
         };
+    }
 
-        interceptor.intercept(request, body.getBytes(StandardCharsets.UTF_8), execution);
-        return captured[0];
+    private static byte[] bytes(String value) {
+        return value.getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static String text(byte[] value) {
+        return new String(value, StandardCharsets.UTF_8);
     }
 }

@@ -27,12 +27,17 @@ import org.springframework.ai.chat.client.ChatClient;
  *       传入 requestId 与请求级记录器，验证“模型调用工具 → 工具执行 → 模型汇总”的完整闭环。</li>
  * </ul>
  *
- * <p>{@code toolCalled} 完全来自 {@link ToolInvocationRecorder} 中真实的 Java 工具执行记录，
- * 不根据模型回答的文字推断，也没有任何硬编码。</p>
+ * <p>{@code toolCalled} 完全来自 {@link ToolInvocationRecorder} 中真实的 Java 工具执行记录；
+ * 若模型绕过工具直接作答，本实现拒绝返回成功结果（见 {@link #toolSmoke(ToolSmokeCommand)}）。</p>
  */
 public class ChatClientAiService implements AiChatUseCase, AiToolSmokeUseCase {
 
     private static final Logger log = LoggerFactory.getLogger(ChatClientAiService.class);
+
+    /** 普通聊天不注册任何工具，日志中统一标记为 none。 */
+    private static final String NO_TOOL = "none";
+
+    private static final String MESSAGE_BLANK = "message 不能为空";
 
     private static final String TOOL_SMOKE_PROMPT_TEMPLATE = """
             工单类型：%s。
@@ -65,16 +70,25 @@ public class ChatClientAiService implements AiChatUseCase, AiToolSmokeUseCase {
                     .call()
                     .content(), requestId);
         } catch (AiProviderException ex) {
-            logFailure("ai.chat", requestId, startedAt);
+            logFailure("ai.chat", NO_TOOL, requestId, startedAt);
             throw ex;
         } catch (RuntimeException ex) {
-            logFailure("ai.chat", requestId, startedAt);
+            logFailure("ai.chat", NO_TOOL, requestId, startedAt);
             throw new AiProviderException(requestId, ex);
         }
-        log.info("ai.chat completed requestId={} tool=none success=true durationMs={}", requestId, elapsedMillis(startedAt));
+        log.info("ai.chat completed requestId={} tool={} success=true durationMs={}",
+                requestId, NO_TOOL, elapsedMillis(startedAt));
         return new ChatResult(requestId, answer);
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p><b>成功的前提是本次请求至少发生过一次成功的真实工具调用。</b>
+     * 模型若绕过 {@code lookup_support_policy} 直接作答，即使回答文本看起来合理，
+     * 也会被判定为链路失败并抛出 {@link AiProviderException}（HTTP 502），
+     * 而不是返回 {@code 200 + toolCalled=false} 的假成功。</p>
+     */
     @Override
     public ToolSmokeResult toolSmoke(ToolSmokeCommand command) {
         IssueType issueType = IssueType.require(command == null ? null : command.issueType());
@@ -92,39 +106,51 @@ public class ChatClientAiService implements AiChatUseCase, AiToolSmokeUseCase {
                     .call()
                     .content(), requestId);
         } catch (AiProviderException ex) {
-            logFailure("ai.tool-smoke", requestId, startedAt);
+            logFailure("ai.tool-smoke", SupportPolicyTools.TOOL_NAME, requestId, startedAt);
             throw ex;
         } catch (RuntimeException ex) {
-            logFailure("ai.tool-smoke", requestId, startedAt);
+            logFailure("ai.tool-smoke", SupportPolicyTools.TOOL_NAME, requestId, startedAt);
             throw new AiProviderException(requestId, ex);
+        }
+
+        boolean toolCalled = recorder.anySucceeded();
+        if (!toolCalled) {
+            // 模型跳过了工具：这不是成功，也不能退化成 toolCalled=false 的 200 响应
+            logFailure("ai.tool-smoke", SupportPolicyTools.TOOL_NAME, requestId, startedAt);
+            throw new AiProviderException(requestId, null);
         }
 
         List<ToolCallOutcome> toolCalls = recorder.invocations().stream()
                 .map(invocation -> new ToolCallOutcome(invocation.name(), invocation.success()))
                 .toList();
-        boolean toolCalled = recorder.anySucceeded();
         log.info("ai.tool-smoke completed requestId={} tool={} success=true toolCalled={} durationMs={}",
                 requestId, SupportPolicyTools.TOOL_NAME, toolCalled, elapsedMillis(startedAt));
         return new ToolSmokeResult(requestId, answer, toolCalled, toolCalls);
     }
 
     /**
-     * 校验并规范化用户消息；失败时抛出 {@link AiRequestException}（HTTP 400），
-     * 该异常在进入模型调用前就抛出，因此不会被包装成上游错误。
+     * 校验并规范化用户消息。
+     *
+     * <p>语义与 HTTP 入口完全一致：先用 {@link String#strip()} 去掉首尾空白（含 Unicode 空白），
+     * 再判断是否为空，最后判断长度是否超过 {@link ChatCommand#MAX_MESSAGE_LENGTH}。
+     * 因此“4000 个有效字符 + 首尾空白”是合法输入，而“strip 后 4001 个字符”被拒绝。</p>
+     *
+     * <p>失败时抛出 {@link AiRequestException}（HTTP 400）。该异常在进入模型调用前抛出，
+     * 不会被包装成上游错误。</p>
      */
     private String requireValidMessage(ChatCommand command) {
         String raw = command == null ? null : command.message();
         if (raw == null) {
-            throw new AiRequestException("message 不能为空");
+            throw new AiRequestException(MESSAGE_BLANK);
         }
-        String trimmed = raw.trim();
-        if (trimmed.isEmpty()) {
-            throw new AiRequestException("message 不能为空");
+        String normalized = raw.strip();
+        if (normalized.isEmpty()) {
+            throw new AiRequestException(MESSAGE_BLANK);
         }
-        if (trimmed.length() > ChatCommand.MAX_MESSAGE_LENGTH) {
+        if (normalized.length() > ChatCommand.MAX_MESSAGE_LENGTH) {
             throw new AiRequestException("message 长度不能超过 " + ChatCommand.MAX_MESSAGE_LENGTH + " 个字符");
         }
-        return trimmed;
+        return normalized;
     }
 
     /**
@@ -139,10 +165,12 @@ public class ChatClientAiService implements AiChatUseCase, AiToolSmokeUseCase {
 
     /**
      * 只记录 requestId、工具名、结果状态与耗时，不记录提示词、工具参数、工具结果与模型思维内容。
+     *
+     * @param toolName 普通聊天固定为 {@value #NO_TOOL}；工具冒烟固定为工具名
      */
-    private void logFailure(String operation, String requestId, long startedAt) {
+    private void logFailure(String operation, String toolName, String requestId, long startedAt) {
         log.warn("{} failed requestId={} tool={} success=false durationMs={}",
-                operation, requestId, SupportPolicyTools.TOOL_NAME, elapsedMillis(startedAt));
+                operation, requestId, toolName, elapsedMillis(startedAt));
     }
 
     private long elapsedMillis(long startedAt) {

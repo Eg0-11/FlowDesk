@@ -100,16 +100,9 @@ class AiControllerWebTests {
                 .andExpect(jsonPath("$.code").value(AiExceptionHandler.CODE_INVALID_REQUEST));
     }
 
-    @Test
-    void rejectsTooLongMessage() throws Exception {
-        String tooLong = "a".repeat(4001);
-
-        mockMvc.perform(post("/api/v1/ai/chat")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"message\":\"" + tooLong + "\"}"))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.code").value(AiExceptionHandler.CODE_INVALID_REQUEST));
-    }
+    // 说明：消息长度不在这一层校验。规范化规则是「先 strip、再判空、最后判长度」，
+    // 只有应用层能按这个顺序判断；若在此层加 @Size，会与直接调用 use case 的语义分叉。
+    // 长度边界的 HTTP/use case 一致性由 MessageNormalizationConsistencyTests 覆盖。
 
     @Test
     void rejectsBlankIssueType() throws Exception {

@@ -15,6 +15,15 @@
   <description>FlowDesk 主服务启动模块：装配 agent 与 infrastructure，暴露 HTTP 接口</description>
 
   <dependencies>
+    <!--
+      Controller 直接依赖 com.flowdesk.application.ai 下的用例接口与命令/结果对象，
+      因此这里必须显式声明 application 模块，不能靠 agent 的传递依赖。
+      版本由根 pom 的 dependencyManagement 管理。
+    -->
+    <dependency>
+      <groupId>com.flowdesk</groupId>
+      <artifactId>flowdesk-application</artifactId>
+    </dependency>
     <dependency>
       <groupId>com.flowdesk</groupId>
       <artifactId>flowdesk-agent</artifactId>
