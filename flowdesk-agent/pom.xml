@@ -12,12 +12,36 @@
 
   <artifactId>flowdesk-agent</artifactId>
   <name>flowdesk-agent</name>
-  <description>后续存放 Graph、ReactAgent、RAG 编排与工具注册；当前不含任何 Agent 实现</description>
+  <description>AI 编排层：实现 application 的 AI 用例，使用 ChatClient 编排提示词与本地工具</description>
 
   <dependencies>
     <dependency>
       <groupId>com.flowdesk</groupId>
       <artifactId>flowdesk-application</artifactId>
+    </dependency>
+
+    <!-- ChatClient 与 @Tool / ToolContext 所在制品；版本由 spring-ai-bom 管理 -->
+    <dependency>
+      <groupId>org.springframework.ai</groupId>
+      <artifactId>spring-ai-client-chat</artifactId>
+    </dependency>
+
+    <!-- 仅用于 @ConditionalOnProperty / @Configuration，使 AI 服务受 flowdesk.ai.enabled 控制 -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-autoconfigure</artifactId>
+    </dependency>
+
+    <!-- 日志门面：工具与编排需要记录 requestId/工具名/结果/耗时（版本由 spring-boot-dependencies 管理） -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
     </dependency>
   </dependencies>
 </project>

@@ -1,0 +1,39 @@
+# DeepSeek profile：通过 OpenAI 兼容的 Chat Completions 接口访问 DeepSeek。
+# 使用方式：--spring.profiles.active=deepseek，并注入 DEEPSEEK_API_KEY。
+# 传输适配器选择理由见 docs/adr/0001-deepseek-openai-compatible-transport.md。
+spring:
+  config:
+    activate:
+      on-profile: deepseek
+  ai:
+    model:
+      chat: openai
+    openai:
+      base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com}
+      api-key: ${DEEPSEEK_API_KEY}
+      chat:
+        completions-path: /chat/completions
+        options:
+          model: ${DEEPSEEK_MODEL:deepseek-flash}
+          temperature: 0.2
+          max-tokens: 512
+          # DeepSeek 默认开启 thinking，而带工具的续轮必须完整回传 reasoning_content；
+          # 本阶段显式关闭 thinking，走确定性的单工具闭环。
+          # 注意：Spring AI 1.1.2 在注册了工具时会把这个 extraBody 清空，
+          # 传输层由 DeepSeekThinkingDisabledInterceptor 兜底，详见 ADR 0001。
+          extra-body:
+            thinking:
+              type: disabled
+    # Spring AI 默认重试为 max-attempts=10、multiplier=5、初始 2000ms，累计退避约 4 分钟，
+    # 会让上游故障迟迟无法以 502 返回（客户端先超时）。这里收窄为有界重试：
+    # 最坏情况 2 次退避共约 1.5 秒，随后立即映射为 AI_PROVIDER_ERROR / 502。
+    retry:
+      max-attempts: 3
+      backoff:
+        initial-interval: 500ms
+        multiplier: 2
+        max-interval: 2000ms
+
+flowdesk:
+  ai:
+    enabled: true

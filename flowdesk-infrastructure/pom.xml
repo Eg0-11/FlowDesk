@@ -12,12 +12,28 @@
 
   <artifactId>flowdesk-infrastructure</artifactId>
   <name>flowdesk-infrastructure</name>
-  <description>后续存放数据库、Redis、向量库、DeepSeek 等适配器；当前不含任何适配器实现</description>
+  <description>基础设施层：数据库、Redis、向量库、模型等适配器；当前只提供 DeepSeek 的 OpenAI 兼容传输适配</description>
 
   <dependencies>
     <dependency>
       <groupId>com.flowdesk</groupId>
       <artifactId>flowdesk-application</artifactId>
+    </dependency>
+
+    <!--
+      DeepSeek 走 OpenAI 兼容的 Chat Completions 传输，因此使用 OpenAI 适配器而非原生 DeepSeek 适配器。
+      决策与理由见 docs/adr/0001-deepseek-openai-compatible-transport.md。
+      版本由 spring-ai-bom 管理，此处不写版本。
+    -->
+    <dependency>
+      <groupId>org.springframework.ai</groupId>
+      <artifactId>spring-ai-starter-model-openai</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
     </dependency>
   </dependencies>
 </project>

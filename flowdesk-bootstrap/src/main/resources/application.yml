@@ -2,6 +2,21 @@ spring:
   application:
     name: flowdesk
 
+  # 默认不装配任何模型适配器：没有 API Key 也能启动与测试，且不存在出网可能。
+  #
+  # OpenAI starter 在类路径上时，除 chat 之外还会自动装配 embedding / image /
+  # audio(speech, transcription) / moderation，它们同样要求 API Key，
+  # 因此这里必须一并关闭，否则默认 profile 会启动失败。
+  ai:
+    model:
+      chat: none
+      embedding: none
+      image: none
+      moderation: none
+      audio:
+        speech: none
+        transcription: none
+
 server:
   port: 8080
 
@@ -10,3 +25,7 @@ management:
     web:
       exposure:
         include: health,info
+
+flowdesk:
+  ai:
+    enabled: false
