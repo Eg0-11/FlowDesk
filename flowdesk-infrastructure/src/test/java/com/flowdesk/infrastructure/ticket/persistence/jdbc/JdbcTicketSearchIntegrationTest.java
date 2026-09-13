@@ -80,8 +80,8 @@ class JdbcTicketSearchIntegrationTest {
 
         DataSource shared = counting(dataSource);
         jdbcClient = JdbcClient.create(shared);
-        repository = new JdbcTicketRepository(jdbcClient,
-                new TransactionTemplate(new DataSourceTransactionManager(shared)));
+        repository = new JdbcTicketRepository(jdbcClient, TicketTransactionTemplates.write(shared),
+                TicketTransactionTemplates.readOnly(shared));
     }
 
     /**

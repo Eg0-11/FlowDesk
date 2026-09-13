@@ -49,6 +49,12 @@ import org.springframework.transaction.support.TransactionOperations;
  * <p>行锁 + 条件更新共同保证：读取后到写入前发生并发写入时，只有一个调用能成功，
  * 另一个必然拿到 {@code TICKET_VERSION_CONFLICT}，且不会产生部分写入（事务回滚）。</p>
  *
+ * <h2>列表查询（{@link #search(TicketSearchCriteria)}）</h2>
+ * <p>与写路径使用<b>不同的</b>事务模板：列表查询跑在一个只读、
+ * {@code REPEATABLE_READ} 的事务里，保证 COUNT 与分页查询看到同一个快照。
+ * 写路径的事务定义与乐观锁语义完全不变。见
+ * {@code docs/adr/0004-ticket-search-pagination.md}。</p>
+ *
  * <p>本类不记录日志，因此不会把标题、描述、处理结论或数据库连接信息写入日志。</p>
  */
 public final class JdbcTicketRepository implements TicketRepository {
@@ -57,13 +63,21 @@ public final class JdbcTicketRepository implements TicketRepository {
 
     private final TransactionOperations transactions;
 
+    private final TransactionOperations readOnlyTransactions;
+
     /**
-     * @param jdbcClient   Spring JDBC 客户端
-     * @param transactions 事务操作模板；compare-and-set 的三个步骤必须处于同一事务
+     * @param jdbcClient           Spring JDBC 客户端
+     * @param transactions         写事务模板；compare-and-set 的三个步骤必须处于同一事务
+     * @param readOnlyTransactions 列表查询专用的<b>只读</b>事务模板，
+     *                             隔离级别为 {@code REPEATABLE_READ}：COUNT 与分页查询必须看到同一个快照
      */
-    public JdbcTicketRepository(JdbcClient jdbcClient, TransactionOperations transactions) {
+    public JdbcTicketRepository(JdbcClient jdbcClient, TransactionOperations transactions,
+            TransactionOperations readOnlyTransactions) {
+
         this.jdbcClient = Objects.requireNonNull(jdbcClient, "jdbcClient 不能为 null");
         this.transactions = Objects.requireNonNull(transactions, "transactions 不能为 null");
+        this.readOnlyTransactions = Objects.requireNonNull(readOnlyTransactions,
+                "readOnlyTransactions 不能为 null");
     }
 
     @Override
@@ -167,11 +181,21 @@ public final class JdbcTicketRepository implements TicketRepository {
     }
 
     /**
-     * 分页 / 条件搜索：一条 COUNT + 一条分页查询，绝不按行再查（无 N+1）。
+     * 分页 / 条件搜索：一条 COUNT + 最多一条分页查询，绝不按行再查（无 N+1）。
      *
      * <p>SQL 由 {@link TicketSearchSql} 从<b>程序常量</b>拼装：筛选值是 {@code ?} 占位符，
      * 排序来自枚举白名单，因此调用方文本无法进入语句结构。
      * {@code LIMIT}/{@code OFFSET} 同样绑定，偏移量用 {@code long} 计算。</p>
+     *
+     * <h2>为什么必须放进一个只读的可重复读事务</h2>
+     * <p>「总数」与「当前页数据」是两条独立的 SELECT。若各自运行在自己的事务（或默认的
+     * {@code READ_COMMITTED}）里，两条语句之间提交的写入就会让它们来自不同快照：
+     * 可能出现 {@code totalElements = 5} 而 {@code items} 有 6 行（或只有 4 行），
+     * 调用方据此算出的页数、{@code hasNext} 全是错的。</p>
+     * <p>因此本方法把两条查询放进同一个事务，并提升到 {@code REPEATABLE_READ}：
+     * 两条语句看到同一个已提交快照。只读 + 不使用行锁，也不会阻塞并发写入。
+     * 事务模板由装配层注入（见 {@code TicketPersistenceConfiguration}），
+     * 写路径的事务与乐观锁语义<b>不受影响</b>。</p>
      *
      * <p>总数为 0 时直接返回空页，不再发起第二次查询（此时分页查询必然返回空，
      * 白白多一次数据库往返）。</p>
@@ -183,6 +207,13 @@ public final class JdbcTicketRepository implements TicketRepository {
     public TicketSearchResult search(TicketSearchCriteria criteria) {
         Objects.requireNonNull(criteria, "criteria 不能为 null");
 
+        return this.readOnlyTransactions.execute(status -> searchInSnapshot(criteria));
+    }
+
+    /**
+     * 同一事务内的两次读取：先取总数，再取当前页。
+     */
+    private TicketSearchResult searchInSnapshot(TicketSearchCriteria criteria) {
         List<Object> filterParameters = TicketSearchSql.filterParameters(criteria);
 
         Long totalElements = this.jdbcClient.sql(TicketSearchSql.countSql(criteria))

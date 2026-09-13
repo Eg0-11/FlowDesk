@@ -24,6 +24,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
  *   <caption>映射矩阵</caption>
  *   <tr><th>场景</th><th>HTTP</th><th>code</th></tr>
  *   <tr><td>应用层命令不合法</td><td>400</td><td>{@code INVALID_COMMAND}</td></tr>
+ *   <tr><td>列表查询条件不合法</td><td>400</td><td>{@code INVALID_REQUEST}</td></tr>
  *   <tr><td>工单不存在</td><td>404</td><td>{@code TICKET_NOT_FOUND}</td></tr>
  *   <tr><td>工单标识已存在</td><td>409</td><td>{@code TICKET_ALREADY_EXISTS}</td></tr>
  *   <tr><td>版本冲突</td><td>412</td><td>{@code TICKET_VERSION_CONFLICT}</td></tr>
@@ -72,6 +73,8 @@ public class TicketExceptionHandler {
         return switch (ex.errorCode()) {
             case INVALID_COMMAND -> problem(HttpStatus.BAD_REQUEST, FlowDeskProblems.CODE_INVALID_COMMAND,
                     "请求不合法", "命令不合法", request);
+            case INVALID_QUERY -> problem(HttpStatus.BAD_REQUEST, FlowDeskProblems.CODE_INVALID_REQUEST,
+                    "查询条件不合法", "列表查询参数不合法", request);
             case TICKET_NOT_FOUND -> problem(HttpStatus.NOT_FOUND, FlowDeskProblems.CODE_TICKET_NOT_FOUND,
                     "工单不存在", "指定工单不存在", request);
             case TICKET_ALREADY_EXISTS -> problem(HttpStatus.CONFLICT,

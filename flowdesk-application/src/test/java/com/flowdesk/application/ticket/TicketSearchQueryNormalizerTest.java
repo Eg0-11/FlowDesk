@@ -57,21 +57,21 @@ class TicketSearchQueryNormalizerTest {
     @Test
     void rejectsNegativePage() {
         assertApplicationError(() -> TicketSearchQueryNormalizer.normalize(
-                SearchTicketsQuery.ofPage(-1, 20)), TicketApplicationErrorCode.INVALID_COMMAND);
+                SearchTicketsQuery.ofPage(-1, 20)), TicketApplicationErrorCode.INVALID_QUERY);
     }
 
     @Test
     void rejectsSizeBelowOne() {
         assertApplicationError(() -> TicketSearchQueryNormalizer.normalize(
-                SearchTicketsQuery.ofPage(0, 0)), TicketApplicationErrorCode.INVALID_COMMAND);
+                SearchTicketsQuery.ofPage(0, 0)), TicketApplicationErrorCode.INVALID_QUERY);
         assertApplicationError(() -> TicketSearchQueryNormalizer.normalize(
-                SearchTicketsQuery.ofPage(0, -5)), TicketApplicationErrorCode.INVALID_COMMAND);
+                SearchTicketsQuery.ofPage(0, -5)), TicketApplicationErrorCode.INVALID_QUERY);
     }
 
     @Test
     void rejectsSizeAboveOneHundred() {
         assertApplicationError(() -> TicketSearchQueryNormalizer.normalize(
-                SearchTicketsQuery.ofPage(0, 101)), TicketApplicationErrorCode.INVALID_COMMAND);
+                SearchTicketsQuery.ofPage(0, 101)), TicketApplicationErrorCode.INVALID_QUERY);
     }
 
     // ---------- 非法枚举 ----------
@@ -79,23 +79,23 @@ class TicketSearchQueryNormalizerTest {
     @Test
     void rejectsUnknownEnumsForStatusCategoryAndPriority() {
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, "PENDING", null, null, null,
-                null, null, null, null)), TicketApplicationErrorCode.INVALID_COMMAND);
+                null, null, null, null)), TicketApplicationErrorCode.INVALID_QUERY);
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, null, "BILLING", null, null,
-                null, null, null, null)), TicketApplicationErrorCode.INVALID_COMMAND);
+                null, null, null, null)), TicketApplicationErrorCode.INVALID_QUERY);
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, null, null, "P5", null,
-                null, null, null, null)), TicketApplicationErrorCode.INVALID_COMMAND);
+                null, null, null, null)), TicketApplicationErrorCode.INVALID_QUERY);
     }
 
     @Test
     void enumParsingIsCaseSensitiveAndDoesNotStrip() {
         // 小写枚举名不接受：接口契约要求与领域枚举名完全一致
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, "new", null, null, null, null,
-                null, null, null)), TicketApplicationErrorCode.INVALID_COMMAND);
+                null, null, null)), TicketApplicationErrorCode.INVALID_QUERY);
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, null, null, "p1", null, null,
-                null, null, null)), TicketApplicationErrorCode.INVALID_COMMAND);
+                null, null, null)), TicketApplicationErrorCode.INVALID_QUERY);
         // 枚举值两侧的空格也不接受
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, " NEW", null, null, null, null,
-                null, null, null)), TicketApplicationErrorCode.INVALID_COMMAND);
+                null, null, null)), TicketApplicationErrorCode.INVALID_QUERY);
     }
 
     @Test
@@ -136,19 +136,19 @@ class TicketSearchQueryNormalizerTest {
     @Test
     void rejectsBlankRequesterOrAssigneeWhenProvided() {
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, null, null, null, "",
-                null, null, null, null)), TicketApplicationErrorCode.INVALID_COMMAND);
+                null, null, null, null)), TicketApplicationErrorCode.INVALID_QUERY);
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, null, null, null, "   ",
-                null, null, null, null)), TicketApplicationErrorCode.INVALID_COMMAND);
+                null, null, null, null)), TicketApplicationErrorCode.INVALID_QUERY);
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, null, null, null, null,
-                "\u3000\u3000", null, null, null)), TicketApplicationErrorCode.INVALID_COMMAND);
+                "\u3000\u3000", null, null, null)), TicketApplicationErrorCode.INVALID_QUERY);
     }
 
     @Test
     void rejectsOverlongRequesterOrAssignee() {
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, null, null, null,
-                "u".repeat(65), null, null, null, null)), TicketApplicationErrorCode.INVALID_COMMAND);
+                "u".repeat(65), null, null, null, null)), TicketApplicationErrorCode.INVALID_QUERY);
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, null, null, null, null,
-                "u".repeat(65), null, null, null)), TicketApplicationErrorCode.INVALID_COMMAND);
+                "u".repeat(65), null, null, null)), TicketApplicationErrorCode.INVALID_QUERY);
     }
 
     @Test
@@ -171,11 +171,11 @@ class TicketSearchQueryNormalizerTest {
     @Test
     void rejectsBlankKeywordWhenProvided() {
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, null, null, null, null, null,
-                "", null, null)), TicketApplicationErrorCode.INVALID_COMMAND);
+                "", null, null)), TicketApplicationErrorCode.INVALID_QUERY);
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, null, null, null, null, null,
-                "   ", null, null)), TicketApplicationErrorCode.INVALID_COMMAND);
+                "   ", null, null)), TicketApplicationErrorCode.INVALID_QUERY);
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, null, null, null, null, null,
-                "\u3000", null, null)), TicketApplicationErrorCode.INVALID_COMMAND);
+                "\u3000", null, null)), TicketApplicationErrorCode.INVALID_QUERY);
     }
 
     @Test
@@ -189,10 +189,10 @@ class TicketSearchQueryNormalizerTest {
     @Test
     void rejectsOverlongKeyword() {
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, null, null, null, null, null,
-                "k".repeat(201), null, null)), TicketApplicationErrorCode.INVALID_COMMAND);
+                "k".repeat(201), null, null)), TicketApplicationErrorCode.INVALID_QUERY);
         // 长度在 strip 之后判定
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, null, null, null, null, null,
-                "  " + "k".repeat(201) + "  ", null, null)), TicketApplicationErrorCode.INVALID_COMMAND);
+                "  " + "k".repeat(201) + "  ", null, null)), TicketApplicationErrorCode.INVALID_QUERY);
     }
 
     @Test
@@ -221,13 +221,13 @@ class TicketSearchQueryNormalizerTest {
     @Test
     void rejectsUnknownSortFieldAndDirection() {
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, null, null, null, null, null,
-                null, "id", null)), TicketApplicationErrorCode.INVALID_COMMAND);
+                null, "id", null)), TicketApplicationErrorCode.INVALID_QUERY);
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, null, null, null, null, null,
-                null, "updated_at", null)), TicketApplicationErrorCode.INVALID_COMMAND);
+                null, "updated_at", null)), TicketApplicationErrorCode.INVALID_QUERY);
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, null, null, null, null, null,
-                null, null, "ASC")), TicketApplicationErrorCode.INVALID_COMMAND);
+                null, null, "ASC")), TicketApplicationErrorCode.INVALID_QUERY);
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, null, null, null, null, null,
-                null, null, "descending")), TicketApplicationErrorCode.INVALID_COMMAND);
+                null, null, "descending")), TicketApplicationErrorCode.INVALID_QUERY);
     }
 
     @Test
@@ -235,15 +235,15 @@ class TicketSearchQueryNormalizerTest {
         // 排序取值只能来自白名单：任何想混进 SQL 的文本都只会得到一个校验错误
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, null, null, null, null, null,
                 null, "updated_at DESC; DROP TABLE tickets--", null)),
-                TicketApplicationErrorCode.INVALID_COMMAND);
+                TicketApplicationErrorCode.INVALID_QUERY);
         assertApplicationError(() -> normalize(new SearchTicketsQuery(null, null, null, null, null, null, null,
-                null, null, "asc, (SELECT 1)")), TicketApplicationErrorCode.INVALID_COMMAND);
+                null, null, "asc, (SELECT 1)")), TicketApplicationErrorCode.INVALID_QUERY);
     }
 
     @Test
     void rejectsNullQuery() {
         assertApplicationError(() -> TicketSearchQueryNormalizer.normalize(null),
-                TicketApplicationErrorCode.INVALID_COMMAND);
+                TicketApplicationErrorCode.INVALID_QUERY);
     }
 
     @Test

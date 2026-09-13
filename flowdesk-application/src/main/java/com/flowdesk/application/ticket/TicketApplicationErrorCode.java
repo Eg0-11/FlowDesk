@@ -15,6 +15,15 @@ public enum TicketApplicationErrorCode {
     /** 命令或查询本身不合法：命令为空、工单标识为空、预期版本为负数。 */
     INVALID_COMMAND,
 
+    /**
+     * 列表查询条件不合法：页码、页大小、枚举取值、排序白名单、字符串参数格式。
+     *
+     * <p>与 {@link #INVALID_COMMAND} 分开是为了让输入适配器能够<b>精确</b>识别
+     * 「这一条失败来自查询条件校验」，从而映射成列表接口约定的 400 错误码，
+     * 而不会误伤其它以 {@code INVALID_COMMAND} 表达的失败。</p>
+     */
+    INVALID_QUERY,
+
     /** 目标工单不存在（或在本用例读取前已被删除）。 */
     TICKET_NOT_FOUND,
 

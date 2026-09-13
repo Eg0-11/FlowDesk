@@ -87,9 +87,9 @@ class JdbcTicketRepositoryIntegrationTest {
         // 「SELECT FOR UPDATE 与条件 UPDATE 处于同一事务」。生产装配中两者也共用同一个 DataSource。
         DataSource sharedDataSource = counting(dataSource);
         jdbcClient = JdbcClient.create(sharedDataSource);
-        TransactionTemplate transactions =
-                new TransactionTemplate(new DataSourceTransactionManager(sharedDataSource));
-        repository = new JdbcTicketRepository(jdbcClient, transactions);
+        repository = new JdbcTicketRepository(jdbcClient,
+                TicketTransactionTemplates.write(sharedDataSource),
+                TicketTransactionTemplates.readOnly(sharedDataSource));
     }
 
     @BeforeEach

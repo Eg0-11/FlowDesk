@@ -57,17 +57,20 @@ import java.util.Objects;
  *   <li>用存储返回的新版本生成视图。</li>
  * </ol>
  *
- * <p>查询流程只读取一次存储，不读时间、不写存储、不推进版本、不生成标识。</p>
+ * <p><b>单条查询</b>只读取一次存储（一次 {@code findById}），不读时间、不写存储、不推进版本、不生成标识。</p>
  *
  * <h2>列表 / 搜索流程</h2>
  * <ol>
  *   <li>校验查询非 {@code null}；</li>
  *   <li>{@link TicketSearchQueryNormalizer#normalize} 套用默认值、strip 字符串、
- *       解析枚举与排序白名单 —— 不合法即抛 {@code INVALID_COMMAND}，此时<b>不触碰存储</b>；</li>
- *   <li>调用 {@link TicketRepository#search} 一次取回「当前页 + 总数」；</li>
+ *       解析枚举与排序白名单，并构造出满足自身不变量的
+ *       {@link TicketSearchCriteria} —— 不合法即抛 {@code INVALID_QUERY}，此时<b>不触碰存储</b>；</li>
+ *   <li>调用 {@link TicketRepository#search}，由适配器在<b>一个只读事务</b>内取回
+ *       「当前页 + 总数」（有结果时两条语句：一条 COUNT、一条分页查询）；</li>
  *   <li>把 {@link VersionedTicket} 映射成 {@link TicketView} 并推导分页元数据。</li>
  * </ol>
- * <p>全程不生成标识、不读取时间、不写存储、不推进版本，因此列表查询永远是无副作用的。</p>
+ * <p>列表查询同样不生成标识、不读取时间、不写存储、不推进版本，因此永远是无副作用的；
+ * 「两条语句」的一致性由存储适配器的事务边界保证（见 ADR 0004），应用层不做假设。</p>
  *
  * <p>错误码语义见 {@link TicketApplicationErrorCode}；领域层抛出的
  * {@code TicketDomainException} 不被包装，保持原始领域错误码向上传递。</p>

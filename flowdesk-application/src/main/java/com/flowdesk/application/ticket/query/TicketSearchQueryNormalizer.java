@@ -18,17 +18,23 @@ import java.util.stream.Stream;
  *
  * <h2>规则</h2>
  * <ul>
- *   <li>{@code page}：默认 {@value #DEFAULT_PAGE}，不得为负数；</li>
- *   <li>{@code size}：默认 {@value #DEFAULT_SIZE}，必须在 {@value #MIN_SIZE}～{@value #MAX_SIZE} 之间；</li>
+ *   <li>{@code page}：默认 {@value #DEFAULT_PAGE}，不得小于
+ *       {@link TicketSearchCriteria#MIN_PAGE}；</li>
+ *   <li>{@code size}：默认 {@value #DEFAULT_SIZE}，必须在
+ *       {@link TicketSearchCriteria#MIN_SIZE}～{@link TicketSearchCriteria#MAX_SIZE} 之间；</li>
  *   <li>{@code status}/{@code category}/{@code priority}：按领域枚举名<b>精确匹配</b>（区分大小写），
  *       不接受首尾空白（客户端不应给枚举值加空格）；</li>
  *   <li>{@code requesterId}/{@code assigneeId}：先 {@link String#strip()}，再判空白与长度上限
- *       {@value #MAX_USER_ID_LENGTH}；</li>
- *   <li>{@code keyword}：先 {@link String#strip()}，再判空白与长度上限 {@value #MAX_KEYWORD_LENGTH}；</li>
+ *       {@link TicketSearchCriteria#MAX_USER_ID_LENGTH}；</li>
+ *   <li>{@code keyword}：先 {@link String#strip()}，再判空白与长度上限
+ *       {@link TicketSearchCriteria#MAX_KEYWORD_LENGTH}；</li>
  *   <li>{@code sortBy}/{@code direction}：按白名单解析，无法解析即报错。</li>
  * </ul>
  *
- * <p>所有失败都抛 {@link TicketApplicationErrorCode#INVALID_COMMAND}，且<b>文案固定</b>：
+ * <p><b>数值只有一个权威来源</b>：分页上下限与两个长度上限都定义在
+ * {@link TicketSearchCriteria} 上，本类只引用它们，不重复写数字。</p>
+ *
+ * <p>所有失败都抛 {@link TicketApplicationErrorCode#INVALID_QUERY}，且<b>文案固定</b>：
  * 不回显客户端传入的原始值（错误信息里只说「哪个参数不合法、允许什么」）。</p>
  */
 public final class TicketSearchQueryNormalizer {
@@ -39,23 +45,14 @@ public final class TicketSearchQueryNormalizer {
     /** 默认每页条数。 */
     public static final int DEFAULT_SIZE = 20;
 
-    /** 每页条数下限。 */
-    public static final int MIN_SIZE = 1;
-
-    /** 每页条数上限。 */
-    public static final int MAX_SIZE = 100;
-
-    /** 关键字最大长度。 */
-    public static final int MAX_KEYWORD_LENGTH = 200;
-
-    /** 用户标识最大长度。 */
-    public static final int MAX_USER_ID_LENGTH = 64;
-
     private TicketSearchQueryNormalizer() {
     }
 
     /**
      * 规范化并校验查询。
+     *
+     * <p>产出的 {@link TicketSearchCriteria} 会再次校验自身不变量（那一层不静默 strip），
+     * 因此本方法对字符串的 strip 是<b>唯一</b>的规范化动作，且发生在构造之前。</p>
      *
      * @param query 原始查询；不得为 {@code null}
      * @return 规范化后的存储查询条件
@@ -83,8 +80,8 @@ public final class TicketSearchQueryNormalizer {
         if (page == null) {
             return DEFAULT_PAGE;
         }
-        if (page < 0) {
-            throw invalid("page 不能为负数");
+        if (page < TicketSearchCriteria.MIN_PAGE) {
+            throw invalid("page 不能小于 " + TicketSearchCriteria.MIN_PAGE);
         }
         return page;
     }
@@ -93,8 +90,9 @@ public final class TicketSearchQueryNormalizer {
         if (size == null) {
             return DEFAULT_SIZE;
         }
-        if (size < MIN_SIZE || size > MAX_SIZE) {
-            throw invalid("size 必须在 " + MIN_SIZE + " 到 " + MAX_SIZE + " 之间");
+        if (size < TicketSearchCriteria.MIN_SIZE || size > TicketSearchCriteria.MAX_SIZE) {
+            throw invalid("size 必须在 " + TicketSearchCriteria.MIN_SIZE + " 到 "
+                    + TicketSearchCriteria.MAX_SIZE + " 之间");
         }
         return size;
     }
@@ -122,8 +120,8 @@ public final class TicketSearchQueryNormalizer {
         if (stripped.isEmpty()) {
             throw invalid(fieldName + " 不能为空白");
         }
-        if (stripped.length() > MAX_USER_ID_LENGTH) {
-            throw invalid(fieldName + " 长度不能超过 " + MAX_USER_ID_LENGTH + " 个字符");
+        if (stripped.length() > TicketSearchCriteria.MAX_USER_ID_LENGTH) {
+            throw invalid(fieldName + " 长度不能超过 " + TicketSearchCriteria.MAX_USER_ID_LENGTH + " 个字符");
         }
         return stripped;
     }
@@ -136,8 +134,8 @@ public final class TicketSearchQueryNormalizer {
         if (stripped.isEmpty()) {
             throw invalid("keyword 不能为空白");
         }
-        if (stripped.length() > MAX_KEYWORD_LENGTH) {
-            throw invalid("keyword 长度不能超过 " + MAX_KEYWORD_LENGTH + " 个字符");
+        if (stripped.length() > TicketSearchCriteria.MAX_KEYWORD_LENGTH) {
+            throw invalid("keyword 长度不能超过 " + TicketSearchCriteria.MAX_KEYWORD_LENGTH + " 个字符");
         }
         return stripped;
     }
@@ -164,6 +162,6 @@ public final class TicketSearchQueryNormalizer {
     }
 
     private static TicketApplicationException invalid(String detail) {
-        return new TicketApplicationException(TicketApplicationErrorCode.INVALID_COMMAND, detail);
+        return new TicketApplicationException(TicketApplicationErrorCode.INVALID_QUERY, detail);
     }
 }

@@ -119,14 +119,17 @@ class TicketApplicationServiceSearchTest {
 
     @Test
     void rejectsInvalidQueriesBeforeTouchingTheRepository() {
+        // null 查询属于「命令不合法」，与「查询条件不合法」是两个不同错误码
         assertApplicationError(() -> this.service.search(null),
                 TicketApplicationErrorCode.INVALID_COMMAND);
         assertApplicationError(() -> this.service.search(SearchTicketsQuery.ofPage(-1, 20)),
-                TicketApplicationErrorCode.INVALID_COMMAND);
+                TicketApplicationErrorCode.INVALID_QUERY);
         assertApplicationError(() -> this.service.search(SearchTicketsQuery.ofPage(0, 0)),
-                TicketApplicationErrorCode.INVALID_COMMAND);
+                TicketApplicationErrorCode.INVALID_QUERY);
+        assertApplicationError(() -> this.service.search(SearchTicketsQuery.ofPage(0, 101)),
+                TicketApplicationErrorCode.INVALID_QUERY);
         assertApplicationError(() -> this.service.search(new SearchTicketsQuery(null, null, "NOPE", null, null,
-                null, null, null, null, null)), TicketApplicationErrorCode.INVALID_COMMAND);
+                null, null, null, null, null)), TicketApplicationErrorCode.INVALID_QUERY);
 
         assertThat(this.repository.searchCalls()).as("校验失败不得触碰存储").isZero();
     }
@@ -157,7 +160,7 @@ class TicketApplicationServiceSearchTest {
         int updateCallsBefore = this.repository.updateCalls();
 
         assertApplicationError(() -> this.service.search(SearchTicketsQuery.ofPage(0, 101)),
-                TicketApplicationErrorCode.INVALID_COMMAND);
+                TicketApplicationErrorCode.INVALID_QUERY);
 
         assertThat(this.repository.searchCalls()).isEqualTo(searchCallsBefore);
         assertThat(this.repository.updateCalls()).isEqualTo(updateCallsBefore);

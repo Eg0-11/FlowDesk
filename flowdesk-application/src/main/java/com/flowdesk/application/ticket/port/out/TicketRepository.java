@@ -76,22 +76,29 @@ public interface TicketRepository {
     /**
      * 分页查询 / 条件搜索工单。
      *
+     * <h2>快照一致性</h2>
+     * <p>返回的「总数」与「当前页数据」必须来自<b>同一个数据库快照</b>：适配器必须把
+     * 两条查询放在同一个只读事务里，并把隔离级别提到可重复读（{@code REPEATABLE_READ}）。
+     * 仅依赖默认的 {@code READ_COMMITTED} 是不够的 —— 在那之下同一条 COUNT 与分页查询
+     * 可能看到不同快照，从而出现「总数 5 却返回 6 行」或「总数 5 却只返回 4 行」。</p>
+     *
      * <h2>实现约束</h2>
      * <ul>
-     *   <li>只做<b>两次</b>数据访问：一次取满足条件的总数，一次取当前页的数据，
-     *       不允许对每一行再发起查询（N+1）；</li>
+     *   <li>数据访问<b>最多两次</b>：一次取满足条件的总数，一次取当前页的数据；
+     *       总数为 0 时允许只执行 COUNT。任何情况下都不允许对每一行再发起查询（N+1）；</li>
      *   <li>全部筛选值必须参数绑定；筛选条件的组合只能由<b>程序控制的固定片段</b>拼装，
      *       绝不允许把调用方文本拼进 SQL；</li>
      *   <li>排序必须按 {@link com.flowdesk.application.ticket.query.TicketSortField} 与
      *       {@link com.flowdesk.application.ticket.query.TicketSortDirection} 的白名单映射成固定列名，
      *       并追加 {@code id} 升序作为稳定兜底键；</li>
      *   <li>关键字搜索中 {@code %}、{@code _} 与转义符本身必须按普通字符处理；</li>
-     *   <li>返回的每一行都必须经 {@code Ticket#restore} 恢复成独立聚合（与 {@link #findById} 同等隔离性）。</li>
+     *   <li>返回的每一行都必须经 {@code Ticket#restore} 恢复成独立聚合（与 {@link #findById} 同等隔离性）；</li>
+     *   <li>查询<b>不得</b>写入任何数据，也不得推进版本。</li>
      * </ul>
      *
      * <p>越界页返回<b>空列表</b>，不是错误；{@code totalElements} 仍是满足条件的总数。</p>
      *
-     * @param criteria 已规范化的查询条件
+     * @param criteria 已规范化的查询条件（其构造器已保证自身合法）
      * @return 当前页数据与总数，均不为 {@code null}
      */
     TicketSearchResult search(TicketSearchCriteria criteria);

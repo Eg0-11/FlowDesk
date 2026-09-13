@@ -80,8 +80,11 @@ class TicketApplicationExceptionTest {
 
     @Test
     void applicationErrorCodesRemainStable() {
+        // FD-0007-R1 起新增 INVALID_QUERY：列表查询条件的校验失败与 INVALID_COMMAND 区分开，
+        // 以便输入适配器精确映射（不误伤其它以 INVALID_COMMAND 表达的失败）
         assertThat(TicketApplicationErrorCode.values()).containsExactly(
                 TicketApplicationErrorCode.INVALID_COMMAND,
+                TicketApplicationErrorCode.INVALID_QUERY,
                 TicketApplicationErrorCode.TICKET_NOT_FOUND,
                 TicketApplicationErrorCode.TICKET_ALREADY_EXISTS,
                 TicketApplicationErrorCode.TICKET_VERSION_CONFLICT);

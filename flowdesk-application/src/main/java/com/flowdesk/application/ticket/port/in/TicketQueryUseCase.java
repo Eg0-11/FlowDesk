@@ -25,8 +25,12 @@ public interface TicketQueryUseCase {
      * 分页查询 / 条件搜索工单。
      *
      * <p>与 {@link #get(GetTicketQuery)} 一样是纯读操作；查询条件不合法时抛
-     * {@link com.flowdesk.application.ticket.TicketApplicationException}（{@code INVALID_COMMAND}），
-     * 越界页则返回空 {@code items} 的正常结果。</p>
+     * {@link com.flowdesk.application.ticket.TicketApplicationException}
+     * （{@code INVALID_QUERY}，与其他用例的 {@code INVALID_COMMAND} 区分开，
+     * 便于输入适配器精确映射），越界页则返回空 {@code items} 的正常结果。</p>
+     *
+     * <p><b>规范化与校验只在本用例内部发生一次</b>：调用方（包括 HTTP 适配器）
+     * 不应在调用前自己再校验一遍。</p>
      *
      * @param query 原始查询条件；由应用层负责规范化与校验
      * @return 分页视图

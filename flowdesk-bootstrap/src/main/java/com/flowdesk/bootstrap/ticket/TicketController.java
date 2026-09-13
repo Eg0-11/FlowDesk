@@ -1,5 +1,6 @@
 package com.flowdesk.bootstrap.ticket;
 
+import com.flowdesk.application.ticket.TicketApplicationErrorCode;
 import com.flowdesk.application.ticket.TicketApplicationException;
 import com.flowdesk.application.ticket.command.AssignTicketCommand;
 import com.flowdesk.application.ticket.command.CloseTicketCommand;
@@ -11,7 +12,7 @@ import com.flowdesk.application.ticket.port.in.TicketCommandUseCase;
 import com.flowdesk.application.ticket.port.in.TicketQueryUseCase;
 import com.flowdesk.application.ticket.query.GetTicketQuery;
 import com.flowdesk.application.ticket.query.SearchTicketsQuery;
-import com.flowdesk.application.ticket.query.TicketSearchQueryNormalizer;
+import com.flowdesk.application.ticket.view.TicketPageView;
 import com.flowdesk.application.ticket.view.TicketView;
 import com.flowdesk.bootstrap.web.InvalidRequestException;
 import com.flowdesk.domain.ticket.TicketDomainException;
@@ -83,8 +84,10 @@ public class TicketController {
      * 所有筛选条件以 <b>AND</b> 组合。越界页返回 200 与空 {@code items}，不是 404。</p>
      *
      * <p><b>错误约定</b>：非整数格式（如 {@code page=abc}）属于线格式问题，在本层直接拒绝；
-     * 取值范围、枚举取值、字符串规范化规则由应用层校验器
-     * （{@code TicketSearchQueryNormalizer}）裁决。两类失败在响应上完全一致：
+     * 取值范围、枚举取值、字符串规范化规则全部由<b>应用用例</b>裁决 ——
+     * 本层只把用例抛出的 {@code INVALID_QUERY} 翻译成 HTTP 契约要求的
+     * 400 {@code INVALID_REQUEST}，<b>不重复执行</b>应用层校验
+     * （见 {@link #searchOrTranslate}）。两类失败在响应上完全一致：
      * 400 + {@code code=INVALID_REQUEST} + {@code application/problem+json}，
      * 且文案固定、不回显客户端原始输入。</p>
      *
@@ -127,8 +130,31 @@ public class TicketController {
                 sortBy,
                 direction);
 
-        requireValidSearchQuery(query);
-        return ResponseEntity.ok(TicketPageResponse.from(this.ticketQueryUseCase.search(query)));
+        return ResponseEntity.ok(TicketPageResponse.from(searchOrTranslate(query)));
+    }
+
+    /**
+     * 调用查询输入端口，并把「查询条件不合法」精确翻译成 HTTP 契约。
+     *
+     * <p><b>校验只做一次</b>：规范化与校验是应用用例的职责，HTTP 层不再自己跑一遍，
+     * 否则规则会出现两份实现、也容易出现「接口拒绝但用例接受」这类分歧；
+     * 这里只做<b>异常语义的翻译</b>（应用层的 {@code INVALID_QUERY} →
+     * 列表接口对外承诺的 {@code INVALID_REQUEST}），并且只翻译这一个错误码，
+     * 其余应用层错误原样向上抛，交给 {@code TicketExceptionHandler} 的既有映射。</p>
+     *
+     * @param query 原始查询条件
+     * @return 分页视图
+     * @throws InvalidRequestException 查询条件不合法（400 {@code INVALID_REQUEST}）
+     */
+    private TicketPageView searchOrTranslate(SearchTicketsQuery query) {
+        try {
+            return this.ticketQueryUseCase.search(query);
+        } catch (TicketApplicationException ex) {
+            if (ex.errorCode() == TicketApplicationErrorCode.INVALID_QUERY) {
+                throw new InvalidRequestException(ex.getMessage());
+            }
+            throw ex;
+        }
     }
 
     /**
@@ -258,21 +284,6 @@ public class TicketController {
             return Integer.valueOf(rawValue.strip());
         } catch (NumberFormatException ex) {
             throw new InvalidRequestException(parameterName + " 必须是整数");
-        }
-    }
-
-    /**
-     * 提前跑一遍应用层校验，把「查询条件不合法」翻译成 HTTP 契约里的 400 {@code INVALID_REQUEST}。
-     *
-     * <p>应用层校验器抛的是 {@code INVALID_COMMAND}（那是应用层的语义），
-     * 而列表接口对外承诺的错误码是 {@code INVALID_REQUEST}。翻译放在 HTTP 边界，
-     * 规则本身仍只有一份实现。用例内部还会再校验一次：绕过 HTTP 的调用方同样拿不到非法查询。</p>
-     */
-    private static void requireValidSearchQuery(SearchTicketsQuery query) {
-        try {
-            TicketSearchQueryNormalizer.normalize(query);
-        } catch (TicketApplicationException ex) {
-            throw new InvalidRequestException(ex.getMessage());
         }
     }
 
