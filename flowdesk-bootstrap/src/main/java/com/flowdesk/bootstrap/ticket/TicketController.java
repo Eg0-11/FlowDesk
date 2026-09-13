@@ -17,7 +17,9 @@ import com.flowdesk.domain.ticket.UserId;
 import jakarta.validation.Valid;
 import java.net.URI;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -42,9 +44,16 @@ import org.springframework.web.bind.annotation.RestController;
  *   <li>创建、查询与每次成功变更都返回 {@code ETag: "&lt;当前版本&gt;"}，
  *       且响应体中的 {@code version} 与该 ETag 一致。</li>
  * </ul>
+ *
+ * <h2>内容协商</h2>
+ * <p>本接口<b>只</b>产出 {@code application/json}，该约束声明在类级 {@code produces} 上，
+ * 因此由 {@code RequestMappingHandlerMapping} 在进入任何 Controller 方法<b>之前</b>求值：
+ * 无法接受的 {@code Accept} 会直接抛出 {@link HttpMediaTypeNotAcceptableException}，
+ * 既不会执行用例，也不会残留 {@code ETag}、{@code Location} 等成功响应头。
+ * 该异常由 {@code FrameworkExceptionHandler} 统一映射为 406 {@code NOT_ACCEPTABLE}。</p>
  */
 @RestController
-@RequestMapping(TicketController.BASE_PATH)
+@RequestMapping(path = TicketController.BASE_PATH, produces = MediaType.APPLICATION_JSON_VALUE)
 public class TicketController {
 
     /** 统一前缀。 */

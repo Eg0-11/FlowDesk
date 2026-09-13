@@ -467,7 +467,8 @@ java -jar flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar --spri
 
 ### 11.1 接口表
 
-统一前缀 `/api/v1/tickets`。
+统一前缀 `/api/v1/tickets`，成功响应统一 `Content-Type: application/json`
+（类级 `produces`，见 11.3 的 406 说明）。
 
 | 方法 | 路径 | 请求体 | 成功响应 |
 | --- | --- | --- | --- |
@@ -542,12 +543,19 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | 持久化快照不自洽 | 500 | `INVALID_PERSISTED_TICKET` |
 | 路径不存在 | 404 | `ENDPOINT_NOT_FOUND` |
 | 路径存在但方法不支持 | 405 | `METHOD_NOT_ALLOWED`（保留标准 `Allow` 头） |
+| `Accept` 无法被满足 | 406 | `NOT_ACCEPTABLE` |
 | `Content-Type` 不受支持 | 415 | `UNSUPPORTED_MEDIA_TYPE` |
 | 未预期异常 | 500 | `INTERNAL_SERVER_ERROR` |
 
 上表覆盖 FlowDesk 自行处理（以及兜底处理）的全部错误来源：工单业务错误、应用层错误、
-请求解析与 Bean Validation 失败，以及四类框架错误（404 / 405 / 415 / 500）。
+请求解析与 Bean Validation 失败，以及五类框架错误（404 / 405 / 406 / 415 / 500）。
 除 405 按 RFC 9110 保留 `Allow` 头外，所有错误响应体形状一致。
+
+**406 与 415 方向相反**：415 是「你发来的请求体我读不懂」（`Content-Type`），
+406 是「你要的响应表示我给不了」（`Accept`）。工单接口在类级声明
+`produces = application/json`，因此内容协商由 `RequestMappingHandlerMapping` 在
+**进入 Controller 之前**完成：不可接受的 `Accept` 直接得到 406，
+既不执行用例，也不会残留 `ETag`、`Location` 等成功响应头（有集成测试断言表行数与版本不变）。
 
 错误响应不包含异常类名、堆栈、SQL、表结构、数据库驱动信息，也不回显请求中的标题、描述或处理结论原文；
 500 兜底响应的 `detail` 是固定文案「服务暂时不可用，请稍后重试」，异常信息只进服务端日志。

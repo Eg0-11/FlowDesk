@@ -29,7 +29,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * 四类框架错误的统一响应测试，以及「兜底不截获既有映射」的回归测试。
+ * 五类框架错误（404 / 405 / 406 / 415 / 500）的统一响应测试，以及「兜底不截获既有映射」的回归测试。
  */
 @SpringBootTest(properties = {
         "spring.datasource.url=jdbc:h2:mem:flowdesk_http_it"
@@ -181,7 +181,169 @@ class TicketFrameworkErrorTests {
                 .andExpect(jsonPath("$.code").value("TICKET_VERSION_CONFLICT"));
     }
 
+    // ---------- 406：Accept 不可接受 ----------
+
+    /**
+     * GET 已存在工单 + {@code Accept: application/xml} → 406，且不得残留 ETag。
+     */
+    @Test
+    void unacceptableAcceptOnGetReturns406WithoutEtag() throws Exception {
+        String ticketId = createTicket();
+
+        MvcResult result = this.mockMvc.perform(get(BASE_PATH + "/{id}", ticketId)
+                        .accept(MediaType.APPLICATION_XML))
+                .andExpect(status().isNotAcceptable())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.type").value("urn:flowdesk:problem:not-acceptable"))
+                .andExpect(jsonPath("$.code").value("NOT_ACCEPTABLE"))
+                .andExpect(jsonPath("$.status").value(406))
+                .andExpect(jsonPath("$.title").isNotEmpty())
+                .andExpect(jsonPath("$.detail").value("该接口只返回 application/json，请求的 Accept 无法被满足"))
+                .andExpect(jsonPath("$.instance").value(BASE_PATH + "/" + ticketId))
+                .andExpect(header().doesNotExist(HttpHeaders.ETAG))
+                .andExpect(header().doesNotExist(HttpHeaders.LOCATION))
+                .andReturn();
+
+        // detail 是固定文案：不回显客户端的 Accept，也不含异常类名或堆栈
+        String body = body(result);
+        assertThat(body).doesNotContain("application/xml");
+        assertThat(body).doesNotContain("HttpMediaTypeNotAcceptableException");
+        assertThat(body).doesNotContain("java.");
+        assertThat(body).doesNotContain("at ");
+    }
+
+    /**
+     * POST 创建 + {@code Accept: application/xml} → 406，无 ETag/Location，且用例未执行（表行数不变）。
+     */
+    @Test
+    void unacceptableAcceptOnCreateReturns406WithoutSideEffects() throws Exception {
+        long rowsBefore = countTickets();
+
+        MvcResult result = this.mockMvc.perform(post(BASE_PATH)
+                        .accept(MediaType.APPLICATION_XML)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"title":"标题","description":"描述","category":"OTHER","priority":"P3",
+                                 "requesterId":"alice"}
+                                """))
+                .andExpect(status().isNotAcceptable())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.code").value("NOT_ACCEPTABLE"))
+                .andExpect(jsonPath("$.type").value("urn:flowdesk:problem:not-acceptable"))
+                .andExpect(header().doesNotExist(HttpHeaders.ETAG))
+                .andExpect(header().doesNotExist(HttpHeaders.LOCATION))
+                .andReturn();
+
+        // 用例必须没有被执行：行数不变，响应体也不是工单表示
+        assertThat(countTickets()).isEqualTo(rowsBefore);
+        assertThat(body(result)).doesNotContain("\"id\"");
+    }
+
+    /**
+     * 状态变更 + {@code Accept: application/xml} → 406，状态与 version 均不变。
+     */
+    @Test
+    void unacceptableAcceptOnStateChangeReturns406WithoutSideEffects() throws Exception {
+        String ticketId = createTicket();
+
+        String statusBefore = statusOf(ticketId);
+        long versionBefore = versionOf(ticketId);
+
+        this.mockMvc.perform(post(BASE_PATH + "/{id}/assign", ticketId)
+                        .accept(MediaType.APPLICATION_XML)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"assigneeId\":\"bob\"}")
+                        .header(HttpHeaders.IF_MATCH, "\"" + versionBefore + "\""))
+                .andExpect(status().isNotAcceptable())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.code").value("NOT_ACCEPTABLE"))
+                .andExpect(header().doesNotExist(HttpHeaders.ETAG));
+
+        assertThat(statusOf(ticketId)).isEqualTo(statusBefore).isEqualTo("NEW");
+        assertThat(versionOf(ticketId)).isEqualTo(versionBefore).isEqualTo(0L);
+        assertThat(assigneeOf(ticketId)).isNull();
+    }
+
+    /**
+     * 可接受的 {@code Accept} 变体（application/json、*&#47;*）继续走原成功流程。
+     */
+    @Test
+    void acceptableAcceptVariantsStillSucceed() throws Exception {
+        MvcResult jsonAccepted = this.mockMvc.perform(post(BASE_PATH)
+                        .accept(MediaType.APPLICATION_JSON)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"title":"标题","description":"描述","category":"OTHER","priority":"P3",
+                                 "requesterId":"alice"}
+                                """))
+                .andExpect(status().isCreated())
+                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
+                .andExpect(header().exists(HttpHeaders.ETAG))
+                .andExpect(header().string(HttpHeaders.ETAG, "\"0\""))
+                .andReturn();
+
+        MvcResult wildcardAccepted = this.mockMvc.perform(post(BASE_PATH)
+                        .accept(MediaType.ALL)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"title":"标题","description":"描述","category":"OTHER","priority":"P3",
+                                 "requesterId":"alice"}
+                                """))
+                .andExpect(status().isCreated())
+                .andExpect(header().string(HttpHeaders.ETAG, "\"0\""))
+                .andReturn();
+
+        String jsonTicketId = ticketIdOf(jsonAccepted);
+
+        // GET 与状态变更在 application/json 下照常工作
+        this.mockMvc.perform(get(BASE_PATH + "/{id}", jsonTicketId).accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(header().string(HttpHeaders.ETAG, "\"0\""));
+
+        this.mockMvc.perform(post(BASE_PATH + "/{id}/assign", jsonTicketId)
+                        .accept(MediaType.APPLICATION_JSON)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"assigneeId\":\"bob\"}")
+                        .header(HttpHeaders.IF_MATCH, "\"0\""))
+                .andExpect(status().isOk())
+                .andExpect(header().string(HttpHeaders.ETAG, "\"1\""))
+                .andExpect(jsonPath("$.status").value("ASSIGNED"))
+                .andExpect(jsonPath("$.assigneeId").value("bob"));
+
+        assertThat(jsonTicketId).isNotEqualTo(ticketIdOf(wildcardAccepted));
+    }
+
     // ---------- 辅助 ----------
+
+    private long countTickets() {
+        Long count = this.jdbcClient.sql("SELECT COUNT(*) FROM tickets").query(Long.class).single();
+        return count == null ? -1L : count;
+    }
+
+    private String statusOf(String ticketId) {
+        return this.jdbcClient.sql("SELECT status FROM tickets WHERE id = ?")
+                .param(1, UUID.fromString(ticketId))
+                .query(String.class)
+                .single();
+    }
+
+    private long versionOf(String ticketId) {
+        Long version = this.jdbcClient.sql("SELECT version FROM tickets WHERE id = ?")
+                .param(1, UUID.fromString(ticketId))
+                .query(Long.class)
+                .single();
+        return version == null ? -1L : version;
+    }
+
+    private String assigneeOf(String ticketId) {
+        // 用 list() 而不是 single()：assignee_id 在 NEW 状态下就是 NULL，
+        // 单值查询遇到 NULL 列的行为在不同 API 上不一致，这里显式取第一行。
+        var values = this.jdbcClient.sql("SELECT assignee_id FROM tickets WHERE id = ?")
+                .param(1, UUID.fromString(ticketId))
+                .query((rs, rowNum) -> rs.getString("assignee_id"))
+                .list();
+        return values.isEmpty() ? "<no-row>" : values.get(0);
+    }
 
     private String createTicket() throws Exception {
         MvcResult result = this.mockMvc.perform(post(BASE_PATH)
@@ -198,5 +360,9 @@ class TicketFrameworkErrorTests {
 
     private static String body(MvcResult result) throws Exception {
         return result.getResponse().getContentAsString(StandardCharsets.UTF_8);
+    }
+
+    private String ticketIdOf(MvcResult result) throws Exception {
+        return this.objectMapper.readTree(body(result)).path("id").asText();
     }
 }

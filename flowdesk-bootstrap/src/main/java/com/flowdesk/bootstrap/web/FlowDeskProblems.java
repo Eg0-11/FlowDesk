@@ -18,8 +18,8 @@ import org.springframework.http.ProblemDetail;
  * </ul>
  *
  * <p><b>覆盖范围</b>（与 README「错误契约」表逐行对应）：工单业务错误、AI 业务错误、
- * 请求解析与 Bean Validation 失败，以及四类框架错误 —— 端点不存在、方法不被支持、
- * 媒体类型不受支持、未预期异常。</p>
+ * 请求解析与 Bean Validation 失败，以及五类框架错误 —— 端点不存在、方法不被支持、
+ * 媒体类型不可接受（{@code Accept}）、媒体类型不受支持（{@code Content-Type}）、未预期异常。</p>
  *
  * <p>本类刻意不提供任何把异常信息、SQL、堆栈或请求原文拼进 detail 的能力：
  * detail 一律由调用方传入固定文案。</p>
@@ -69,6 +69,14 @@ public final class FlowDeskProblems {
 
     /** 请求的 {@code Content-Type} 不受支持。 */
     public static final String CODE_UNSUPPORTED_MEDIA_TYPE = "UNSUPPORTED_MEDIA_TYPE";
+
+    /**
+     * 请求的 {@code Accept} 无法被满足：服务端没有任何可产出的表示能满足它。
+     *
+     * <p>与 {@link #CODE_UNSUPPORTED_MEDIA_TYPE} 方向相反：415 是「你发来的我读不懂」，
+     * 406 是「你要的我给不了」。两者都不代表请求本身有业务问题。</p>
+     */
+    public static final String CODE_NOT_ACCEPTABLE = "NOT_ACCEPTABLE";
 
     /** 未预期异常，兜底为服务端错误。 */
     public static final String CODE_INTERNAL_SERVER_ERROR = "INTERNAL_SERVER_ERROR";
