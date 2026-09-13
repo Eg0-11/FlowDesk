@@ -313,14 +313,18 @@ NEW --assign--> ASSIGNED --start--> IN_PROGRESS --resolve--> RESOLVED --close-->
 
 **聚合不变量**：
 
-- `createdAt <= updatedAt`；
-- `resolvedAt` 存在时不早于 `createdAt`；`closedAt` 存在时不早于 `resolvedAt`；
+- 时间线为单链：`createdAt <= resolvedAt <= closedAt <= updatedAt`；
+  `resolvedAt`、`closedAt` 不存在时跳过对应比较（`updatedAt` 始终存在，是链条末端）；
 - 状态与可选字段严格共存：`NEW` 无处理人/结论/时间戳；`ASSIGNED`、`IN_PROGRESS` 有处理人、
   无结论与时间戳；`RESOLVED` 有处理人、结论与 `resolvedAt`、无 `closedAt`；`CLOSED` 全部齐备。
 
+> `resolvedAt <= updatedAt` 与 `closedAt <= updatedAt` 这两条不可省：若只校验下界，
+> 一个 `resolvedAt` 晚于 `updatedAt` 的 `RESOLVED` 快照就能被恢复，随后 `close(updatedAt)`
+> 会把 `closedAt` 写到 `resolvedAt` 之前，让时间倒流。
+
 **两种构造入口**：`Ticket.create(...)` 用于新工单（产出 `NEW` 状态）；
-`Ticket.restore(...)` 用于数据库适配器恢复快照，会完整校验字段规则、状态一致性与时间线，
-任何不自洽都抛 `INVALID_RESTORED_STATE`。
+`Ticket.restore(...)` 用于数据库适配器恢复快照，会完整校验字段规则、状态一致性
+与上述完整时间链，任何不自洽都抛 `INVALID_RESTORED_STATE`。
 
 **错误契约**：所有失败都抛 `TicketDomainException` 并携带 `TicketErrorCode`，
 上层据此做稳定映射，不必解析异常文案；异常信息不回显调用方传入的原始非法值。

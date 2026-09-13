@@ -30,9 +30,8 @@ import java.util.Optional;
  *
  * <h2>聚合不变量</h2>
  * <ul>
- *   <li>{@code createdAt <= updatedAt}；</li>
- *   <li>{@code resolvedAt} 存在时不早于 {@code createdAt}；</li>
- *   <li>{@code closedAt} 存在时不早于 {@code resolvedAt}；</li>
+ *   <li>时间线为单链：{@code createdAt <= resolvedAt <= closedAt <= updatedAt}，
+ *       其中 {@code resolvedAt} 与 {@code closedAt} 不存在时直接跳过对应比较；</li>
  *   <li>状态与可选字段共存：{@code NEW} 无处理人/结论/时间戳；{@code ASSIGNED}、{@code IN_PROGRESS}
  *       有处理人、无结论与时间戳；{@code RESOLVED} 有处理人与结论及 {@code resolvedAt}、无 {@code closedAt}；
  *       {@code CLOSED} 全部齐备。</li>
@@ -129,7 +128,8 @@ public class Ticket {
      * 从持久化快照恢复工单，供数据库适配器使用。
      *
      * <p>恢复时完整校验：字段必填与字符串长度规则（与创建一致，不会被绕过）、状态与可选字段的共存关系、
-     * 以及全部时间先后关系。任何不自洽的快照都抛出
+     * 以及完整时间线 {@code createdAt <= resolvedAt <= closedAt <= updatedAt}（不存在的字段跳过）。
+     * 任何不自洽的快照都抛出
      * {@link TicketErrorCode#INVALID_RESTORED_STATE}；字符串字段自身违规仍使用字段级错误码。</p>
      *
      * @param id          工单标识
@@ -433,18 +433,39 @@ public class Ticket {
         return occurredAt;
     }
 
+    /**
+     * 校验时间线：非空时间必须满足
+     * {@code createdAt <= resolvedAt <= closedAt <= updatedAt}，不存在的字段直接跳过。
+     *
+     * <p>{@code resolvedAt <= updatedAt} 与 {@code closedAt <= updatedAt} 这两条不能省：
+     * 否则一个 {@code resolvedAt} 晚于 {@code updatedAt} 的 {@code RESOLVED} 快照可以被恢复，
+     * 随后调用 {@code close(updatedAt)} 就会把 {@code closedAt} 写到 {@code resolvedAt} 之前，
+     * 破坏 {@code closedAt >= resolvedAt}。</p>
+     */
     private static void requireTimeline(Instant createdAt, Instant updatedAt, Instant resolvedAt, Instant closedAt) {
         if (createdAt.isAfter(updatedAt)) {
             throw new TicketDomainException(TicketErrorCode.INVALID_RESTORED_STATE,
                     "创建时间不能晚于最近更新时间");
         }
-        if (resolvedAt != null && resolvedAt.isBefore(createdAt)) {
-            throw new TicketDomainException(TicketErrorCode.INVALID_RESTORED_STATE,
-                    "解决时间不能早于创建时间");
+        if (resolvedAt != null) {
+            if (resolvedAt.isBefore(createdAt)) {
+                throw new TicketDomainException(TicketErrorCode.INVALID_RESTORED_STATE,
+                        "解决时间不能早于创建时间");
+            }
+            if (resolvedAt.isAfter(updatedAt)) {
+                throw new TicketDomainException(TicketErrorCode.INVALID_RESTORED_STATE,
+                        "解决时间不能晚于最近更新时间");
+            }
         }
-        if (closedAt != null && (resolvedAt == null || closedAt.isBefore(resolvedAt))) {
-            throw new TicketDomainException(TicketErrorCode.INVALID_RESTORED_STATE,
-                    "关闭时间不能早于解决时间");
+        if (closedAt != null) {
+            if (resolvedAt == null || closedAt.isBefore(resolvedAt)) {
+                throw new TicketDomainException(TicketErrorCode.INVALID_RESTORED_STATE,
+                        "关闭时间不能早于解决时间");
+            }
+            if (closedAt.isAfter(updatedAt)) {
+                throw new TicketDomainException(TicketErrorCode.INVALID_RESTORED_STATE,
+                        "关闭时间不能晚于最近更新时间");
+            }
         }
     }
 

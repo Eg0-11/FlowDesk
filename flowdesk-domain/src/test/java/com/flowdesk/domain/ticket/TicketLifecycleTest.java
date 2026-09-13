@@ -69,9 +69,13 @@ class TicketLifecycleTest {
         ticket.resolve(RESOLUTION, BASE.plusSeconds(180));
         ticket.close(BASE.plusSeconds(240));
 
-        assertThat(ticket.updatedAt()).isAfterOrEqualTo(ticket.createdAt());
-        assertThat(ticket.resolvedAt().orElseThrow()).isAfterOrEqualTo(ticket.createdAt());
-        assertThat(ticket.closedAt().orElseThrow()).isAfterOrEqualTo(ticket.resolvedAt().orElseThrow());
+        Instant resolvedAt = ticket.resolvedAt().orElseThrow();
+        Instant closedAt = ticket.closedAt().orElseThrow();
+
+        // createdAt <= resolvedAt <= closedAt <= updatedAt
+        assertThat(ticket.createdAt()).isBeforeOrEqualTo(resolvedAt);
+        assertThat(resolvedAt).isBeforeOrEqualTo(closedAt);
+        assertThat(closedAt).isBeforeOrEqualTo(ticket.updatedAt());
     }
 
     @Test
