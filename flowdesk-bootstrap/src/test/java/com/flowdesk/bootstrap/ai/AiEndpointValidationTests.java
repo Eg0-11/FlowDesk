@@ -9,6 +9,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import com.flowdesk.bootstrap.web.FlowDeskProblems;
 
 /**
  * 端到端参数校验：使用真实装配（真实 Controller + 真实用例实现）验证非法入参被挡在模型调用之前。
@@ -31,7 +32,7 @@ class AiEndpointValidationTests {
                 Map.of("issueType", "PRINTER_JAM"), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
-        assertThat(response.getBody()).contains(AiExceptionHandler.CODE_INVALID_REQUEST);
+        assertThat(response.getBody()).contains(FlowDeskProblems.CODE_INVALID_REQUEST);
         assertThat(response.getBody()).doesNotContain("PRINTER_JAM");
     }
 
@@ -57,7 +58,7 @@ class AiEndpointValidationTests {
                 Map.of("message", "   "), String.class);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
-        assertThat(response.getBody()).contains(AiExceptionHandler.CODE_INVALID_REQUEST);
+        assertThat(response.getBody()).contains(FlowDeskProblems.CODE_INVALID_REQUEST);
     }
 
     @Test

@@ -17,6 +17,7 @@ import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
+import com.flowdesk.bootstrap.web.FlowDeskProblems;
 
 /**
  * 上游模型失败的 HTTP 契约：必须映射为 502，且响应体不得泄露供应商异常细节。
@@ -61,7 +62,7 @@ class AiProviderErrorWebTests {
                                 {"message":"请用一句话介绍 FlowDesk"}
                                 """))
                 .andExpect(status().isBadGateway())
-                .andExpect(jsonPath("$.code").value(AiExceptionHandler.CODE_AI_PROVIDER_ERROR))
+                .andExpect(jsonPath("$.code").value(FlowDeskProblems.CODE_AI_PROVIDER_ERROR))
                 .andExpect(jsonPath("$.requestId").value(REQUEST_ID));
     }
 
@@ -73,7 +74,7 @@ class AiProviderErrorWebTests {
                                 {"issueType":"VPN_FAILURE"}
                                 """))
                 .andExpect(status().isBadGateway())
-                .andExpect(jsonPath("$.code").value(AiExceptionHandler.CODE_AI_PROVIDER_ERROR));
+                .andExpect(jsonPath("$.code").value(FlowDeskProblems.CODE_AI_PROVIDER_ERROR));
     }
 
     @Test

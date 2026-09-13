@@ -21,11 +21,14 @@ import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.sql.DataSource;
@@ -366,17 +369,29 @@ class JdbcTicketRepositoryIntegrationTest {
 
         int connectionsBefore = CONNECTIONS.get();
         AtomicInteger successes = new AtomicInteger();
+        AtomicInteger conflicts = new AtomicInteger();
         AtomicReference<Throwable> unexpected = new AtomicReference<>();
 
+        // 两阶段同步：两个线程都先把 version 0 的独立快照读出来并改好，
+        // 在栅栏处汇合之后，才同时发起 update —— 这样竞争的只有 CAS 本身。
+        // 栅栏带超时，不会无限等待。
+        CyclicBarrier bothSnapshotsReady = new CyclicBarrier(2);
+
         runConcurrently(() -> {
-            Ticket ticket = repository.findById(id).orElseThrow().ticket();
-            ticket.assign(UserId.of("bob"), BASE.plusSeconds(60));
+            Ticket snapshot = repository.findById(id).orElseThrow().ticket();
+            snapshot.assign(UserId.of("bob"), BASE.plusSeconds(60));
+            if (!awaitBarrier(bothSnapshotsReady, unexpected)) {
+                return;
+            }
             try {
-                repository.update(ticket, 0L);
+                repository.update(snapshot, 0L);
                 successes.incrementAndGet();
             }
             catch (TicketApplicationException ex) {
-                if (ex.errorCode() != TicketApplicationErrorCode.TICKET_VERSION_CONFLICT) {
+                if (ex.errorCode() == TicketApplicationErrorCode.TICKET_VERSION_CONFLICT) {
+                    conflicts.incrementAndGet();
+                }
+                else {
                     unexpected.set(ex);
                 }
             }
@@ -386,8 +401,12 @@ class JdbcTicketRepositoryIntegrationTest {
                 .as("并发更新必须使用至少两个数据库连接")
                 .isGreaterThanOrEqualTo(2);
         assertThat(unexpected.get()).isNull();
-        assertThat(successes.get()).as("只能有一个线程更新成功").isEqualTo(1);
+        assertThat(successes.get()).as("成功数必须恰好为 1").isEqualTo(1);
+        assertThat(conflicts.get()).as("版本冲突必须恰好为 1").isEqualTo(1);
         assertThat(scalarLong("SELECT version FROM tickets")).as("最终版本必须为 1").isEqualTo(1);
+        assertThat(repository.findById(id).orElseThrow().ticket().status())
+                .as("最终状态必须为 ASSIGNED")
+                .isEqualTo(TicketStatus.ASSIGNED);
     }
 
     @Test
@@ -399,9 +418,16 @@ class JdbcTicketRepositoryIntegrationTest {
         AtomicInteger alreadyExists = new AtomicInteger();
         AtomicReference<Throwable> unexpected = new AtomicReference<>();
 
+        // 两个线程各自构造好同 ID 的工单后在栅栏汇合，再同时插入
+        CyclicBarrier bothTicketsReady = new CyclicBarrier(2);
+
         runConcurrently(() -> {
+            Ticket candidate = ticketInStatus(id, TicketStatus.NEW);
+            if (!awaitBarrier(bothTicketsReady, unexpected)) {
+                return;
+            }
             try {
-                repository.insert(ticketInStatus(id, TicketStatus.NEW));
+                repository.insert(candidate);
                 successes.incrementAndGet();
             }
             catch (TicketApplicationException ex) {
@@ -418,8 +444,8 @@ class JdbcTicketRepositoryIntegrationTest {
                 .as("并发插入必须使用至少两个数据库连接")
                 .isGreaterThanOrEqualTo(2);
         assertThat(unexpected.get()).isNull();
-        assertThat(successes.get()).as("只能有一个线程插入成功").isEqualTo(1);
-        assertThat(alreadyExists.get()).isEqualTo(1);
+        assertThat(successes.get()).as("成功数必须恰好为 1").isEqualTo(1);
+        assertThat(alreadyExists.get()).as("已存在必须恰好为 1").isEqualTo(1);
         assertThat(scalarLong("SELECT COUNT(*) FROM tickets")).isEqualTo(1);
     }
 
@@ -529,6 +555,25 @@ class JdbcTicketRepositoryIntegrationTest {
             throw new IllegalStateException(ex);
         }
         task.run();
+    }
+
+    /**
+     * 在栅栏处等待另一个线程，带超时；失败时把原因记进 {@code unexpected} 而不是无限等待。
+     */
+    private static boolean awaitBarrier(CyclicBarrier barrier, AtomicReference<Throwable> unexpected) {
+        try {
+            barrier.await(20, TimeUnit.SECONDS);
+            return true;
+        }
+        catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            unexpected.compareAndSet(null, ex);
+            return false;
+        }
+        catch (BrokenBarrierException | TimeoutException ex) {
+            unexpected.compareAndSet(null, ex);
+            return false;
+        }
     }
 
     private static void assertDatabaseRejects(ThrowingCallable callable) {

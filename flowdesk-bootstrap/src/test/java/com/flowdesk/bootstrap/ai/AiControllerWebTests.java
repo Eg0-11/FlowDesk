@@ -18,6 +18,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
+import com.flowdesk.bootstrap.web.FlowDeskProblems;
 
 /**
  * AI HTTP 边界的正常响应与参数校验测试。
@@ -88,7 +89,7 @@ class AiControllerWebTests {
                                 {"message":"   "}
                                 """))
                 .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.code").value(AiExceptionHandler.CODE_INVALID_REQUEST));
+                .andExpect(jsonPath("$.code").value(FlowDeskProblems.CODE_INVALID_REQUEST));
     }
 
     @Test
@@ -97,7 +98,7 @@ class AiControllerWebTests {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{}"))
                 .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.code").value(AiExceptionHandler.CODE_INVALID_REQUEST));
+                .andExpect(jsonPath("$.code").value(FlowDeskProblems.CODE_INVALID_REQUEST));
     }
 
     // 说明：消息长度不在这一层校验。规范化规则是「先 strip、再判空、最后判长度」，
@@ -112,7 +113,7 @@ class AiControllerWebTests {
                                 {"issueType":""}
                                 """))
                 .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.code").value(AiExceptionHandler.CODE_INVALID_REQUEST));
+                .andExpect(jsonPath("$.code").value(FlowDeskProblems.CODE_INVALID_REQUEST));
     }
 
     @Test
@@ -121,6 +122,6 @@ class AiControllerWebTests {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{ this is not json }"))
                 .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.code").value(AiExceptionHandler.CODE_INVALID_REQUEST));
+                .andExpect(jsonPath("$.code").value(FlowDeskProblems.CODE_INVALID_REQUEST));
     }
 }

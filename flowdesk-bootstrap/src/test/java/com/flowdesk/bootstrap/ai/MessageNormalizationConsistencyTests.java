@@ -19,6 +19,7 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import com.flowdesk.bootstrap.web.FlowDeskProblems;
 
 /**
  * HTTP 入口与直接调用 use case 的消息校验语义必须完全一致。
@@ -120,7 +121,7 @@ class MessageNormalizationConsistencyTests {
         assertThat(response.getStatusCode())
                 .as("HTTP 入口应拒绝该消息")
                 .isEqualTo(HttpStatus.BAD_REQUEST);
-        assertThat(response.getBody()).contains(AiExceptionHandler.CODE_INVALID_REQUEST);
+        assertThat(response.getBody()).contains(FlowDeskProblems.CODE_INVALID_REQUEST);
 
         assertThatThrownBy(() -> this.aiChatUseCase.chat(new ChatCommand(value)))
                 .as("use case 入口应拒绝同一条消息")

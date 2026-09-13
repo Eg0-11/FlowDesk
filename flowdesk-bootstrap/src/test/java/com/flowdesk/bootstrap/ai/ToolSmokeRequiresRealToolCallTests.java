@@ -18,6 +18,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import com.flowdesk.bootstrap.web.FlowDeskProblems;
 
 /**
  * 「模型跳过工具」不得算成功。
@@ -78,7 +79,7 @@ class ToolSmokeRequiresRealToolCallTests {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_GATEWAY);
         String body = response.getBody();
-        assertThat(body).contains(AiExceptionHandler.CODE_AI_PROVIDER_ERROR);
+        assertThat(body).contains(FlowDeskProblems.CODE_AI_PROVIDER_ERROR);
         assertThat(body).contains("requestId");
         // 不得退化成 200 + toolCalled=false
         assertThat(body).doesNotContain("toolCalled");

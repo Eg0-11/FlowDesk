@@ -18,7 +18,7 @@
   <packaging>pom</packaging>
 
   <name>flowdesk</name>
-  <description>FlowDesk 企业智能工单与知识运营平台（当前阶段：已完成 JDBC 持久化与 Spring 装配）</description>
+  <description>FlowDesk 企业智能工单与知识运营平台（当前阶段：已完成工单 REST 接口与 ETag 并发协议）</description>
 
   <modules>
     <module>flowdesk-shared</module>

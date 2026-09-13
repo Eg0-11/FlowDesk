@@ -2,81 +2,52 @@ package com.flowdesk.bootstrap.ai;
 
 import com.flowdesk.application.ai.AiProviderException;
 import com.flowdesk.application.ai.AiRequestException;
+import com.flowdesk.bootstrap.web.FlowDeskProblems;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
-import org.springframework.http.converter.HttpMessageNotReadableException;
-import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 /**
- * AI 接口异常到 HTTP 状态码的映射。
+ * AI 接口业务异常到 HTTP 状态码的映射。
  *
  * <p>契约：</p>
  * <ul>
- *   <li>参数非法 → 400，错误码 {@code INVALID_REQUEST}</li>
+ *   <li>应用层判定的请求不合法 → 400，错误码 {@code INVALID_REQUEST}</li>
  *   <li>上游模型调用失败 → 502，错误码 {@code AI_PROVIDER_ERROR}</li>
  * </ul>
  *
- * <p>响应体为 Spring {@link ProblemDetail}，只包含 FlowDesk 自己的文案与错误码，
+ * <p>只处理 AI 自己的异常类型。「JSON 无法解析」「Bean Validation 失败」「路径参数类型不匹配」
+ * 这三类与业务无关的失败由 {@code ApiRequestExceptionHandler} 统一处理，
+ * 本类不再声明它们 —— 同一个异常类型在全应用只有一个处理入口。</p>
+ *
+ * <p>响应体为 {@link ProblemDetail}，只包含 FlowDesk 自己的文案与错误码，
  * 绝不包含供应商原始报文、堆栈或配置；上游异常的 cause 仅保留在服务端。</p>
  */
 @RestControllerAdvice
 public class AiExceptionHandler {
 
-    /** 业务错误码：请求不合法。 */
-    public static final String CODE_INVALID_REQUEST = "INVALID_REQUEST";
-
-    /** 业务错误码：上游 AI 服务错误。 */
-    public static final String CODE_AI_PROVIDER_ERROR = "AI_PROVIDER_ERROR";
-
     /**
      * 应用层判定的请求不合法。
      */
     @ExceptionHandler(AiRequestException.class)
-    public ProblemDetail handleRequestException(AiRequestException ex) {
-        return problem(HttpStatus.BAD_REQUEST, CODE_INVALID_REQUEST, "请求不合法", ex.getMessage(), null);
-    }
-
-    /**
-     * Bean Validation 失败（例如 {@code message} 缺失或为纯空白）。
-     *
-     * <p>消息长度不在这里判断：规范化规则是「先 strip、再判空、最后判长度」，
-     * 由应用层统一执行，详见 {@code ChatClientAiService}。</p>
-     */
-    @ExceptionHandler(MethodArgumentNotValidException.class)
-    public ProblemDetail handleValidationException(MethodArgumentNotValidException ex) {
-        String detail = ex.getBindingResult().getFieldErrors().stream()
-                .findFirst()
-                .map(error -> error.getField() + " " + error.getDefaultMessage())
-                .orElse("请求参数不合法");
-        return problem(HttpStatus.BAD_REQUEST, CODE_INVALID_REQUEST, "请求不合法", detail, null);
-    }
-
-    /**
-     * 请求体无法解析（非法 JSON、类型不匹配）。
-     */
-    @ExceptionHandler(HttpMessageNotReadableException.class)
-    public ProblemDetail handleUnreadableBody(HttpMessageNotReadableException ex) {
-        return problem(HttpStatus.BAD_REQUEST, CODE_INVALID_REQUEST, "请求不合法", "请求体不是合法 JSON", null);
+    public ProblemDetail handleRequestException(AiRequestException ex, HttpServletRequest request) {
+        return FlowDeskProblems.of(HttpStatus.BAD_REQUEST, FlowDeskProblems.CODE_INVALID_REQUEST,
+                "请求不合法", ex.getMessage(), request.getRequestURI());
     }
 
     /**
      * 上游模型调用失败。detail 使用固定文案，不回显 {@code ex.getMessage()}。
      */
     @ExceptionHandler(AiProviderException.class)
-    public ProblemDetail handleProviderException(AiProviderException ex) {
-        return problem(HttpStatus.BAD_GATEWAY, CODE_AI_PROVIDER_ERROR, "AI 服务错误",
-                "上游 AI 服务暂时不可用，请稍后重试", ex.requestId());
-    }
-
-    private ProblemDetail problem(HttpStatus status, String code, String title, String detail, String requestId) {
-        ProblemDetail problemDetail = ProblemDetail.forStatusAndDetail(status, detail);
-        problemDetail.setTitle(title);
-        problemDetail.setProperty("code", code);
-        if (requestId != null) {
-            problemDetail.setProperty("requestId", requestId);
+    public ProblemDetail handleProviderException(AiProviderException ex, HttpServletRequest request) {
+        ProblemDetail problem = FlowDeskProblems.of(HttpStatus.BAD_GATEWAY,
+                FlowDeskProblems.CODE_AI_PROVIDER_ERROR, "AI 服务错误",
+                "上游 AI 服务暂时不可用，请稍后重试", request.getRequestURI());
+        if (ex.requestId() != null) {
+            problem.setProperty("requestId", ex.requestId());
         }
-        return problemDetail;
+        return problem;
     }
 }

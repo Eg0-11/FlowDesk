@@ -1,10 +1,11 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0005 —— JDBC 持久化适配器、Flyway 迁移与 Spring 装配（已完成）**
+> **当前阶段：FD-0006 —— 工单 REST API、ProblemDetail 与 ETag 乐观并发协议（已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
-> JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）。
-> 尚未实现：工单 HTTP 接口、分页搜索、RAG、MCP 能力、Agent Graph、鉴权与前端。
+> JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
+> 工单 REST 接口 + ETag 并发协议 + 统一错误契约（FD-0006）。
+> 尚未实现：**分页与条件搜索（计划 FD-0007）**、RAG、MCP 能力、Agent Graph、鉴权与前端。
 
 ## 一、项目简介
 
@@ -25,7 +26,7 @@ Tool 调用、MCP 资产/监控服务以及基于 Agent Graph 的自动化编排
 | `flowdesk-application` | 用例服务、输入输出端口 | 已实现 AI 用例（`…application.ai`）与工单用例 + 乐观并发契约（`…application.ticket`） |
 | `flowdesk-agent` | AI 编排：实现 application 的 AI 用例，用 ChatClient 编排提示词与本地工具 | 已实现普通聊天与工具冒烟 |
 | `flowdesk-infrastructure` | 持久化与模型适配器 | 已提供 JDBC 工单存储（`…ticket.persistence.jdbc`）与 DeepSeek 传输适配 |
-| `flowdesk-bootstrap` | FlowDesk 主服务启动模块（Web + Validation + Actuator + AI 接口） | 可启动，端口 8080 |
+| `flowdesk-bootstrap` | FlowDesk 主服务启动模块（Web + Validation + Actuator + AI 接口 + 工单 REST 接口） | 可启动，端口 8080 |
 | `flowdesk-mcp-asset` | 独立资产 MCP 服务（Web + Actuator） | 可启动，端口 8091 |
 | `flowdesk-mcp-monitoring` | 独立监控 MCP 服务（Web + Actuator） | 可启动，端口 8092 |
 
@@ -460,7 +461,91 @@ java -jar flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar --spri
 > 验证过 SQL、约束与并发行为；迁移脚本与 SQL 都是按标准 SQL 编写、预期在 PostgreSQL 上同样成立，
 > 但在真实 PostgreSQL 上跑通之前，不应认为它已被验证。
 
-## 十一、代码约束
+## 十一、工单 REST 接口
+
+决策理由见 [`docs/adr/0003-ticket-http-etag-concurrency.md`](docs/adr/0003-ticket-http-etag-concurrency.md)。
+
+### 11.1 接口表
+
+统一前缀 `/api/v1/tickets`。
+
+| 方法 | 路径 | 请求体 | 成功响应 |
+| --- | --- | --- | --- |
+| POST | `/api/v1/tickets` | 创建工单 | 201 Created + `Location` + `ETag` |
+| GET | `/api/v1/tickets/{ticketId}` | 无 | 200 OK + `ETag` |
+| POST | `/api/v1/tickets/{ticketId}/assign` | `assigneeId` | 200 OK + `ETag` |
+| POST | `/api/v1/tickets/{ticketId}/reassign` | `assigneeId` | 200 OK + `ETag` |
+| POST | `/api/v1/tickets/{ticketId}/start` | 无 | 200 OK + `ETag` |
+| POST | `/api/v1/tickets/{ticketId}/resolve` | `resolution` | 200 OK + `ETag` |
+| POST | `/api/v1/tickets/{ticketId}/close` | 无 | 200 OK + `ETag` |
+
+请求示例：
+
+```json
+POST /api/v1/tickets
+{
+  "title": "无法登录办公系统",
+  "description": "输入正确密码后仍提示认证失败",
+  "category": "ACCOUNT_ACCESS",
+  "priority": "P2",
+  "requesterId": "alice"
+}
+```
+
+```json
+POST /api/v1/tickets/{ticketId}/assign      →  { "assigneeId": "bob" }
+POST /api/v1/tickets/{ticketId}/resolve     →  { "resolution": "已重置认证状态" }
+```
+
+响应体字段：`id`、`title`、`description`、`category`、`priority`、`requesterId`、`assigneeId`、
+`status`、`resolution`、`createdAt`、`updatedAt`、`resolvedAt`、`closedAt`、`version`。
+其中 `id` 是 UUID 字符串，用户标识是普通字符串，枚举使用领域枚举名称，时间是 ISO-8601，
+可空字段输出 JSON `null`，**`version` 与响应头 `ETag` 永远一致**。
+
+### 11.2 ETag 乐观并发
+
+所有状态变更接口必须携带 `If-Match`，**请求体中不存在 `expectedVersion`**：
+
+```powershell
+# 读取当前版本
+curl.exe http://localhost:8080/api/v1/tickets/$id
+# → ETag: "0"
+
+# 带上该版本做变更
+curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
+  -H 'Content-Type: application/json' -H 'If-Match: "0"' -d '{"assigneeId":"bob"}'
+# → 200 OK, ETag: "1"
+```
+
+只接受**单个、强类型、规范十进制** ETag（如 `"0"`、`"1"`、`"25"`，允许去除头值首尾空格）。
+以下一律 400 `INVALID_IF_MATCH`：弱 ETag `W/"0"`、`*`、多个 ETag、未加引号、负数、
+非数字、小数、前导零、超出 `long` 范围、空值。缺少 `If-Match` 返回 428 `PRECONDITION_REQUIRED`，
+版本过期返回 412 `TICKET_VERSION_CONFLICT`。
+
+### 11.3 错误契约
+
+所有错误都是 `application/problem+json`，包含 `type`（`urn:flowdesk:problem:<code 小写连字符>`）、
+`title`、`status`、`detail`、`instance`、`code`。
+
+| 场景 | HTTP | code |
+| --- | --- | --- |
+| JSON、UUID、枚举、Bean Validation 错误 | 400 | `INVALID_REQUEST` |
+| 非法 `If-Match` | 400 | `INVALID_IF_MATCH` |
+| 缺少 `If-Match` | 428 | `PRECONDITION_REQUIRED` |
+| 应用层命令不合法 | 400 | `INVALID_COMMAND` |
+| 工单不存在 | 404 | `TICKET_NOT_FOUND` |
+| 工单标识已存在 | 409 | `TICKET_ALREADY_EXISTS` |
+| 版本冲突 | 412 | `TICKET_VERSION_CONFLICT` |
+| 非法状态转换 | 409 | `ILLEGAL_STATUS_TRANSITION` |
+| 相同处理人 | 409 | `SAME_ASSIGNEE` |
+| 字段级领域校验失败 | 422 | 保留对应领域错误码 |
+| 持久化快照不自洽 | 500 | `INVALID_PERSISTED_TICKET` |
+
+错误响应不包含异常类名、堆栈、SQL、表结构、数据库驱动信息，也不回显请求中的标题、描述或处理结论原文。
+
+**分页、排序与条件搜索不在本阶段范围**，计划在 FD-0007 实现。
+
+## 十二、代码约束
 
 - 不使用 Lombok。
 - 不创建空的 Controller、Service、Repository、Entity 占位类。
@@ -468,7 +553,7 @@ java -jar flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar --spri
 - 不使用通配符版本；子模块不重复声明受 BOM 管理的版本。
 - 不隐藏编译警告，不跳过测试；全部文件使用 UTF-8。
 
-## 十二、后续阶段简述
+## 十三、后续阶段简述
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
@@ -477,11 +562,23 @@ java -jar flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar --spri
 | FD-0003 | 工单核心领域模型与生命周期状态机 | ✅ 已完成 |
 | FD-0004 | 工单应用用例、输入输出端口与乐观并发契约 | ✅ 已完成 |
 | FD-0005 | JDBC 持久化适配器、Flyway 迁移与 Spring 装配 | ✅ 已完成 |
-| 后续 | 工单 HTTP 接口与分页搜索 | 未开始 |
+| FD-0006 | 工单 REST API、ProblemDetail 与 ETag 并发协议 | ✅ 已完成 |
+| **FD-0007（计划）** | **工单分页、排序与条件搜索** | 未开始 |
 | 后续 | RAG：文档解析、切分、向量化、检索增强 | 未开始 |
 | 后续 | Tool 体系扩展：面向工单与知识的工具注册 | 未开始 |
 | 后续 | MCP：资产 MCP 服务与监控 MCP 服务的能力实现 | 未开始 |
 | 后续 | Agent Graph：基于 Spring AI Alibaba Agent Framework 的多节点编排 | 未开始 |
+
+## 十四、真实验证状态（重要）
+
+| 项 | 状态 | 含义 |
+| --- | --- | --- |
+| H2 集成 / HTTP 集成 | ✅ 已执行 | 真实 Spring 上下文、真实 JDBC、真实 Flyway 迁移、真实并发线程 |
+| PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证** |
+| 真实 DeepSeek | ⚠️ **LIVE_SMOKE=NOT_RUN** | 无 `DEEPSEEK_API_KEY`，**未对真实模型发起过任何请求** |
+
+> **本文档不宣称 PostgreSQL 或真实 DeepSeek 已验证。** 相关代码按标准 SQL 与 OpenAI 兼容协议编写、
+> 预期可用，但在真实环境跑通之前不应当作已验证。
 
 > Spring AI Alibaba 的 BOM 已在根 pom 中导入并锁定版本，但其 Agent Framework 制品尚未使用；
 > 后续阶段接入时直接复用现有 BOM，不需要改动版本基线。
