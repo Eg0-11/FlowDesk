@@ -1,5 +1,6 @@
 package com.flowdesk.bootstrap.ticket;
 
+import com.flowdesk.application.ticket.TicketApplicationException;
 import com.flowdesk.application.ticket.command.AssignTicketCommand;
 import com.flowdesk.application.ticket.command.CloseTicketCommand;
 import com.flowdesk.application.ticket.command.CreateTicketCommand;
@@ -9,6 +10,8 @@ import com.flowdesk.application.ticket.command.StartTicketCommand;
 import com.flowdesk.application.ticket.port.in.TicketCommandUseCase;
 import com.flowdesk.application.ticket.port.in.TicketQueryUseCase;
 import com.flowdesk.application.ticket.query.GetTicketQuery;
+import com.flowdesk.application.ticket.query.SearchTicketsQuery;
+import com.flowdesk.application.ticket.query.TicketSearchQueryNormalizer;
 import com.flowdesk.application.ticket.view.TicketView;
 import com.flowdesk.bootstrap.web.InvalidRequestException;
 import com.flowdesk.domain.ticket.TicketDomainException;
@@ -26,6 +29,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
@@ -70,6 +74,61 @@ public class TicketController {
     public TicketController(TicketCommandUseCase ticketCommandUseCase, TicketQueryUseCase ticketQueryUseCase) {
         this.ticketCommandUseCase = ticketCommandUseCase;
         this.ticketQueryUseCase = ticketQueryUseCase;
+    }
+
+    /**
+     * 分页查询 / 条件搜索工单。
+     *
+     * <p>全部查询参数都是可选的，缺省即「不过滤」；默认按 {@code updatedAt} 倒序、每页 20 条。
+     * 所有筛选条件以 <b>AND</b> 组合。越界页返回 200 与空 {@code items}，不是 404。</p>
+     *
+     * <p><b>错误约定</b>：非整数格式（如 {@code page=abc}）属于线格式问题，在本层直接拒绝；
+     * 取值范围、枚举取值、字符串规范化规则由应用层校验器
+     * （{@code TicketSearchQueryNormalizer}）裁决。两类失败在响应上完全一致：
+     * 400 + {@code code=INVALID_REQUEST} + {@code application/problem+json}，
+     * 且文案固定、不回显客户端原始输入。</p>
+     *
+     * <p>本方法<b>不</b>返回 ETag：集合没有单一版本号（见 {@link TicketPageResponse}）。</p>
+     *
+     * @param page       页码，从 0 开始；缺省 0
+     * @param size       每页条数，1～100；缺省 20
+     * @param status     状态精确匹配
+     * @param category   分类精确匹配
+     * @param priority   优先级精确匹配
+     * @param requesterId 请求人精确匹配（strip 后）
+     * @param assigneeId  处理人精确匹配（strip 后）
+     * @param keyword     标题 / 描述包含搜索（strip 后，大小写不敏感）
+     * @param sortBy      排序字段：{@code createdAt}、{@code updatedAt}、{@code priority}、{@code status}
+     * @param direction   排序方向：{@code asc}、{@code desc}
+     * @return 200 OK，分页结果
+     */
+    @GetMapping
+    public ResponseEntity<TicketPageResponse> list(
+            @RequestParam(name = "page", required = false) String page,
+            @RequestParam(name = "size", required = false) String size,
+            @RequestParam(name = "status", required = false) String status,
+            @RequestParam(name = "category", required = false) String category,
+            @RequestParam(name = "priority", required = false) String priority,
+            @RequestParam(name = "requesterId", required = false) String requesterId,
+            @RequestParam(name = "assigneeId", required = false) String assigneeId,
+            @RequestParam(name = "keyword", required = false) String keyword,
+            @RequestParam(name = "sortBy", required = false) String sortBy,
+            @RequestParam(name = "direction", required = false) String direction) {
+
+        SearchTicketsQuery query = new SearchTicketsQuery(
+                parseOptionalInt(page, "page"),
+                parseOptionalInt(size, "size"),
+                status,
+                category,
+                priority,
+                requesterId,
+                assigneeId,
+                keyword,
+                sortBy,
+                direction);
+
+        requireValidSearchQuery(query);
+        return ResponseEntity.ok(TicketPageResponse.from(this.ticketQueryUseCase.search(query)));
     }
 
     /**
@@ -182,6 +241,39 @@ public class TicketController {
 
         long expectedVersion = TicketEtag.requireVersion(ifMatch);
         return ok(this.ticketCommandUseCase.close(new CloseTicketCommand(parseTicketId(ticketId), expectedVersion)));
+    }
+
+    /**
+     * 解析可选的整数查询参数。
+     *
+     * <p>线索格式（是不是整数）在这里判定，取值<b>范围</b>留给应用层校验器 ——
+     * 这样「什么算合法查询」只有一份规则。解析失败抛出的是固定文案，
+     * 不回显客户端传入的内容。</p>
+     */
+    private static Integer parseOptionalInt(String rawValue, String parameterName) {
+        if (rawValue == null) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(rawValue.strip());
+        } catch (NumberFormatException ex) {
+            throw new InvalidRequestException(parameterName + " 必须是整数");
+        }
+    }
+
+    /**
+     * 提前跑一遍应用层校验，把「查询条件不合法」翻译成 HTTP 契约里的 400 {@code INVALID_REQUEST}。
+     *
+     * <p>应用层校验器抛的是 {@code INVALID_COMMAND}（那是应用层的语义），
+     * 而列表接口对外承诺的错误码是 {@code INVALID_REQUEST}。翻译放在 HTTP 边界，
+     * 规则本身仍只有一份实现。用例内部还会再校验一次：绕过 HTTP 的调用方同样拿不到非法查询。</p>
+     */
+    private static void requireValidSearchQuery(SearchTicketsQuery query) {
+        try {
+            TicketSearchQueryNormalizer.normalize(query);
+        } catch (TicketApplicationException ex) {
+            throw new InvalidRequestException(ex.getMessage());
+        }
     }
 
     /**

@@ -72,4 +72,27 @@ public interface TicketRepository {
      *                                    {@link TicketApplicationErrorCode#TICKET_VERSION_CONFLICT}
      */
     VersionedTicket update(Ticket ticket, long expectedVersion);
+
+    /**
+     * 分页查询 / 条件搜索工单。
+     *
+     * <h2>实现约束</h2>
+     * <ul>
+     *   <li>只做<b>两次</b>数据访问：一次取满足条件的总数，一次取当前页的数据，
+     *       不允许对每一行再发起查询（N+1）；</li>
+     *   <li>全部筛选值必须参数绑定；筛选条件的组合只能由<b>程序控制的固定片段</b>拼装，
+     *       绝不允许把调用方文本拼进 SQL；</li>
+     *   <li>排序必须按 {@link com.flowdesk.application.ticket.query.TicketSortField} 与
+     *       {@link com.flowdesk.application.ticket.query.TicketSortDirection} 的白名单映射成固定列名，
+     *       并追加 {@code id} 升序作为稳定兜底键；</li>
+     *   <li>关键字搜索中 {@code %}、{@code _} 与转义符本身必须按普通字符处理；</li>
+     *   <li>返回的每一行都必须经 {@code Ticket#restore} 恢复成独立聚合（与 {@link #findById} 同等隔离性）。</li>
+     * </ul>
+     *
+     * <p>越界页返回<b>空列表</b>，不是错误；{@code totalElements} 仍是满足条件的总数。</p>
+     *
+     * @param criteria 已规范化的查询条件
+     * @return 当前页数据与总数，均不为 {@code null}
+     */
+    TicketSearchResult search(TicketSearchCriteria criteria);
 }

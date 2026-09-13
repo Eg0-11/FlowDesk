@@ -3,6 +3,8 @@ package com.flowdesk.infrastructure.ticket.persistence.jdbc;
 import com.flowdesk.application.ticket.TicketApplicationErrorCode;
 import com.flowdesk.application.ticket.TicketApplicationException;
 import com.flowdesk.application.ticket.port.out.TicketRepository;
+import com.flowdesk.application.ticket.port.out.TicketSearchCriteria;
+import com.flowdesk.application.ticket.port.out.TicketSearchResult;
 import com.flowdesk.application.ticket.port.out.VersionedTicket;
 import com.flowdesk.domain.ticket.Ticket;
 import com.flowdesk.domain.ticket.TicketId;
@@ -11,6 +13,7 @@ import java.sql.Types;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import org.springframework.dao.DuplicateKeyException;
@@ -161,6 +164,44 @@ public final class JdbcTicketRepository implements TicketRepository {
         return findById(ticketId)
                 .orElseThrow(() -> new TicketApplicationException(TicketApplicationErrorCode.TICKET_NOT_FOUND,
                         "工单不存在"));
+    }
+
+    /**
+     * 分页 / 条件搜索：一条 COUNT + 一条分页查询，绝不按行再查（无 N+1）。
+     *
+     * <p>SQL 由 {@link TicketSearchSql} 从<b>程序常量</b>拼装：筛选值是 {@code ?} 占位符，
+     * 排序来自枚举白名单，因此调用方文本无法进入语句结构。
+     * {@code LIMIT}/{@code OFFSET} 同样绑定，偏移量用 {@code long} 计算。</p>
+     *
+     * <p>总数为 0 时直接返回空页，不再发起第二次查询（此时分页查询必然返回空，
+     * 白白多一次数据库往返）。</p>
+     *
+     * <p>读到的每一行都经 {@link TicketRowMapper} 走 {@code Ticket.restore}，
+     * 与 {@link #findById} 的隔离性完全一致；不做任何缓存，也不复用聚合实例。</p>
+     */
+    @Override
+    public TicketSearchResult search(TicketSearchCriteria criteria) {
+        Objects.requireNonNull(criteria, "criteria 不能为 null");
+
+        List<Object> filterParameters = TicketSearchSql.filterParameters(criteria);
+
+        Long totalElements = this.jdbcClient.sql(TicketSearchSql.countSql(criteria))
+                .params(filterParameters)
+                .query(Long.class)
+                .single();
+        long total = totalElements == null ? 0L : totalElements;
+        if (total == 0L) {
+            return new TicketSearchResult(List.of(), 0L);
+        }
+
+        List<VersionedTicket> items = this.jdbcClient.sql(TicketSearchSql.pageSql(criteria))
+                .params(filterParameters)
+                .param(criteria.size())
+                .param(criteria.offset())
+                .query(TicketRowMapper::mapRow)
+                .list();
+
+        return new TicketSearchResult(items, total);
     }
 
     private static OffsetDateTime toOffsetDateTime(Instant instant) {

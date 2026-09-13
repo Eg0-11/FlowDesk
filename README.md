@@ -1,11 +1,13 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0006 —— 工单 REST API、ProblemDetail 与 ETag 乐观并发协议（已完成）**
+> **当前阶段：FD-0007 —— 工单列表、分页、排序与条件搜索（已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
-> 工单 REST 接口 + ETag 并发协议 + 统一错误契约（FD-0006）。
-> 尚未实现：**分页与条件搜索（计划 FD-0007）**、RAG、MCP 能力、Agent Graph、鉴权与前端。
+> 工单 REST 接口 + ETag 并发协议 + 统一错误契约（FD-0006）、
+> 列表接口 + offset 分页 + 排序白名单 + 条件搜索（FD-0007）。
+> 尚未实现：游标/keyset 分页、PostgreSQL 全文检索与 pg_trgm、RAG、MCP 能力、Agent Graph、
+> 鉴权与前端。
 
 ## 一、项目简介
 
@@ -356,6 +358,7 @@ NEW --assign--> ASSIGNED --start--> IN_PROGRESS --resolve--> RESOLVED --close-->
 | `TicketRepository.findById` | 返回**独立恢复**的聚合；不存在返回 `Optional.empty()`，绝不返回 `null`；适配器不得交出内部可变存储引用 |
 | `TicketRepository.insert` | 新工单初始版本为 0；**原子拒绝**重复标识，失败抛 `TICKET_ALREADY_EXISTS` |
 | `TicketRepository.update` | **原子 compare-and-set**：仅当存储版本等于 `expectedVersion` 时写入并**严格加 1**；记录不存在抛 `TICKET_NOT_FOUND`，版本不匹配抛 `TICKET_VERSION_CONFLICT`（两者必须区分） |
+| `TicketRepository.search` | 分页 / 条件搜索：返回「当前页 + 总数」；只发两条语句（一条 `COUNT`、一条分页查询），**无 N+1**；筛选值全部参数绑定，排序按白名单映射固定列名，每行仍经 `Ticket.restore` 恢复成独立聚合 |
 
 ### 9.2 用例流程与顺序保证
 
@@ -368,6 +371,10 @@ NEW --assign--> ASSIGNED --start--> IN_PROGRESS --resolve--> RESOLVED --close-->
 领域规则失败时异常原样向上抛出（携带 `TicketErrorCode`），**不写存储**；
 读取后写入前发生并发写入时，存储抛出的 `TICKET_VERSION_CONFLICT` 原样传播。
 查询只读，不读时间、不写存储、不推进版本。
+
+列表 / 搜索：校验并规范化查询（套默认值、strip、解析枚举与排序白名单；不合法即报错且**不触碰存储**）
+→ `search(条件)` 一次取回「当前页 + 总数」→ 映射成视图并推导分页元数据。
+全过程**不生成标识、不读取时间、不写存储、不推进版本**，因此列表查询永远无副作用。
 
 ### 9.3 错误契约
 
@@ -399,7 +406,11 @@ NEW --assign--> ASSIGNED --start--> IN_PROGRESS --resolve--> RESOLVED --close-->
 `V1__create_tickets.sql` 建立 `tickets` 表（`id UUID` 主键、`version BIGINT`、三列时间戳
 `TIMESTAMP(6) WITH TIME ZONE`），索引：
 
-- `(status, updated_at)`、`(assignee_id, status)`、`(created_at)`
+- V1：`(status, updated_at)`、`(assignee_id, status)`、`(created_at)`
+- V2（FD-0007，列表与搜索）：`(updated_at DESC, id ASC)`、`(requester_id, updated_at DESC, id ASC)`
+
+索引取舍与「为什么某些候选索引刻意不加」见
+[`docs/adr/0004-ticket-search-pagination.md`](docs/adr/0004-ticket-search-pagination.md)。
 
 数据库层面的 CHECK 约束（标准 SQL，PostgreSQL 与 H2 兼容模式都能执行，不使用数据库专属枚举类型）：
 
@@ -463,7 +474,8 @@ java -jar flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar --spri
 
 ## 十一、工单 REST 接口
 
-决策理由见 [`docs/adr/0003-ticket-http-etag-concurrency.md`](docs/adr/0003-ticket-http-etag-concurrency.md)。
+决策理由见 [`docs/adr/0003-ticket-http-etag-concurrency.md`](docs/adr/0003-ticket-http-etag-concurrency.md)；
+列表与搜索的设计取舍见 [`docs/adr/0004-ticket-search-pagination.md`](docs/adr/0004-ticket-search-pagination.md)。
 
 ### 11.1 接口表
 
@@ -472,6 +484,7 @@ java -jar flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar --spri
 
 | 方法 | 路径 | 请求体 | 成功响应 |
 | --- | --- | --- | --- |
+| GET | `/api/v1/tickets` | 无（查询参数见 11.5） | 200 OK，**无 ETag** |
 | POST | `/api/v1/tickets` | 创建工单 | 201 Created + `Location` + `ETag` |
 | GET | `/api/v1/tickets/{ticketId}` | 无 | 200 OK + `ETag` |
 | POST | `/api/v1/tickets/{ticketId}/assign` | `assigneeId` | 200 OK + `ETag` |
@@ -531,6 +544,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | 场景 | HTTP | code |
 | --- | --- | --- |
 | JSON、UUID、枚举、Bean Validation 错误 | 400 | `INVALID_REQUEST` |
+| 列表查询参数非法（页码、页大小、枚举、排序字段/方向、空白或超长的字符串） | 400 | `INVALID_REQUEST` |
 | 非法 `If-Match` | 400 | `INVALID_IF_MATCH` |
 | 缺少 `If-Match` | 428 | `PRECONDITION_REQUIRED` |
 | 应用层命令不合法 | 400 | `INVALID_COMMAND` |
@@ -569,8 +583,82 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 - **工单标识**：路径参数 `{ticketId}` 只接受**规范的 36 位连字符 UUID**（大小写不敏感）。
   `1-1-1-1-1`、缺少连字符、含首尾空白等宽松写法一律 400 `INVALID_REQUEST`，
   不会被静默补齐或当成合法标识处理。
+- **枚举查询参数不做规范化**：`status`、`category`、`priority`、`sortBy`、`direction` 必须与
+  文档给出的取值**完全一致**（区分大小写、不接受首尾空白）。`status=new` 或 `" NEW"` 一律 400，
+  而不是被静默纠正为 `NEW` —— 宽松纠正会让客户端永远发现不了自己的拼写问题。
 
-**分页、排序与条件搜索不在本阶段范围**，计划在 FD-0007 实现。
+### 11.5 列表与条件搜索
+
+`GET /api/v1/tickets` 支持分页、排序与条件筛选。所有参数可选，**缺省即不过滤**；
+多个筛选条件以 **AND** 组合。
+
+| 参数 | 默认 | 取值与规则 |
+| --- | --- | --- |
+| `page` | `0` | 从 0 开始，不得为负 |
+| `size` | `20` | 1～100 |
+| `status` | — | `TicketStatus` 枚举名精确匹配 |
+| `category` | — | `TicketCategory` 枚举名精确匹配 |
+| `priority` | — | `TicketPriority` 枚举名精确匹配 |
+| `requesterId` | — | `strip` 后精确匹配；提供但为空白或超过 64 字符 → 400 |
+| `assigneeId` | — | 同上 |
+| `keyword` | — | `strip` 后在 `title`、`description` 中做**大小写不敏感**的包含搜索；提供但为空白 → 400；最长 200 |
+| `sortBy` | `updatedAt` | `createdAt`、`updatedAt`、`priority`、`status` |
+| `direction` | `desc` | `asc`、`desc` |
+
+响应：
+
+```json
+{
+  "items": [ { "id": "…", "title": "…", "version": 1, "…": "…" } ],
+  "page": 0,
+  "size": 20,
+  "totalElements": 42,
+  "totalPages": 3,
+  "hasNext": true,
+  "hasPrevious": false,
+  "sort": { "field": "updatedAt", "direction": "desc" }
+}
+```
+
+- `items` **永不为 `null`**（空结果是 `[]`），每一项复用单条查询的 `TicketResponse`，含**正确的 `version`**；
+- `totalElements` 是满足条件的总条数（`long`）；`totalPages` 亦按 `long` 推导，不会溢出；
+- **越界页返回 200 与空 `items`**，并照常给出 `totalElements`/`totalPages`，**不是 404**；
+- **列表响应不返回集合 ETag**（集合没有单一版本号）；
+- `sort` 回显**实际生效**的取值，客户端不必自行推断默认值。
+
+**排序规则**
+
+1. `createdAt`、`updatedAt` 按真实时间排序；
+2. `priority` 按业务顺序 `P1 → P2 → P3 → P4`（用 `CASE` 映射，不依赖字典序）；
+3. `status` 按生命周期顺序 `NEW → ASSIGNED → IN_PROGRESS → RESOLVED → CLOSED`（同上；
+   注意字典序是 `ASSIGNED, CLOSED, IN_PROGRESS, NEW, RESOLVED`，与业务顺序无关）；
+4. 所有排序都追加 **`id ASC`** 作为稳定的最终排序键，保证并列行的分页不重不漏；
+5. 排序字段与方向接受的是**白名单取值**，服务端只按枚举映射固定列名，
+   客户端文本永远不会进入 SQL。
+
+**关键字与通配符转义**
+
+`keyword` 只做「包含」匹配（不是相关性排序）。为避免用户输入的 `%`、`_` 被当成 LIKE 通配符，
+服务端以 `!` 为转义符并在 SQL 中声明 `ESCAPE '!'`：
+
+| 输入 | 绑定到 SQL 的模式 | 含义 |
+| --- | --- | --- |
+| `登录` | `%登录%` | 包含「登录」 |
+| `100%` | `%100!%%` | 包含字面量 `100%`（**不是**「以 100 开头」） |
+| `under_score` | `%under!_score%` | 包含字面量 `under_score`（`_` 不是任意单字符） |
+| `!` | `%!!%` | 包含字面量 `!` |
+
+匹配是**大小写不敏感**的：数据库侧 `LOWER(列)`，绑定值在 Java 侧 `toLowerCase(Locale.ROOT)`。
+模式本身是**参数绑定值**，不参与 SQL 结构拼接。
+
+**分页模型的取舍（本阶段）**
+
+本阶段采用 **offset 分页**（`page`/`size` + `COUNT(*)`），因为它能直接表达「第几页」「共几条」；
+代价是深翻页时 `OFFSET` 仍需跳过前 N 行，且跨越多次请求的翻页过程中并发写入可能造成重复/跳行
+（并列行已由 `id ASC` 兜底，单次请求内始终是自洽的全序）。
+**cursor/keyset 分页与 PostgreSQL 全文检索、`pg_trgm` 均属于后续优化，本任务不实现**；
+包含搜索当前是可移植的 `LIKE`，无法使用 B 树索引，即全表扫描 + 过滤。
+完整论证见 [`docs/adr/0004-ticket-search-pagination.md`](docs/adr/0004-ticket-search-pagination.md)。
 
 ## 十二、代码约束
 
@@ -590,7 +678,8 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0004 | 工单应用用例、输入输出端口与乐观并发契约 | ✅ 已完成 |
 | FD-0005 | JDBC 持久化适配器、Flyway 迁移与 Spring 装配 | ✅ 已完成 |
 | FD-0006 | 工单 REST API、ProblemDetail 与 ETag 并发协议 | ✅ 已完成 |
-| **FD-0007（计划）** | **工单分页、排序与条件搜索** | 未开始 |
+| FD-0007 | 工单列表、分页、排序与条件搜索 | ✅ 已完成 |
+| 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm` | 未开始 |
 | 后续 | RAG：文档解析、切分、向量化、检索增强 | 未开始 |
 | 后续 | Tool 体系扩展：面向工单与知识的工具注册 | 未开始 |
 | 后续 | MCP：资产 MCP 服务与监控 MCP 服务的能力实现 | 未开始 |
@@ -600,7 +689,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 
 | 项 | 状态 | 含义 |
 | --- | --- | --- |
-| H2 集成 / HTTP 集成 | ✅ 已执行 | 真实 Spring 上下文、真实 JDBC、真实 Flyway 迁移、真实并发线程 |
+| H2 集成 / HTTP 集成 | ✅ 已执行 | 真实 Spring 上下文、真实 JDBC、真实 Flyway 迁移（V1+V2）、真实并发线程 |
 | PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证** |
 | 真实 DeepSeek | ⚠️ **LIVE_SMOKE=NOT_RUN** | 无 `DEEPSEEK_API_KEY`，**未对真实模型发起过任何请求** |
 

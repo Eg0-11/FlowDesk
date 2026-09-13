@@ -1,6 +1,8 @@
 package com.flowdesk.application.ticket;
 
 import com.flowdesk.application.ticket.port.out.TicketRepository;
+import com.flowdesk.application.ticket.port.out.TicketSearchCriteria;
+import com.flowdesk.application.ticket.port.out.TicketSearchResult;
 import com.flowdesk.application.ticket.port.out.VersionedTicket;
 import com.flowdesk.domain.ticket.Ticket;
 import com.flowdesk.domain.ticket.TicketCategory;
@@ -11,6 +13,7 @@ import com.flowdesk.domain.ticket.UserId;
 import java.time.Instant;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -38,11 +41,32 @@ final class InMemoryTicketRepository implements TicketRepository {
 
     private int updateCalls;
 
+    private int searchCalls;
+
+    private TicketSearchCriteria lastCriteria;
+
     @Override
     public Optional<VersionedTicket> findById(TicketId ticketId) {
         this.findCalls++;
         Snapshot snapshot = this.storage.get(ticketId);
         return snapshot == null ? Optional.empty() : Optional.of(snapshot.toVersionedTicket());
+    }
+
+    /**
+     * 记录查询条件并返回存储中的全部工单。
+     *
+     * <p><b>刻意不做筛选、排序与分页</b>：本替身用于验证「用例把条件原样传给了存储」
+     * 以及「查询没有副作用」，而不是复刻 SQL 语义 ——
+     * 筛选与排序的真实语义由 JDBC 集成测试在真实数据库上验证，避免在这里造第二份实现。</p>
+     */
+    @Override
+    public TicketSearchResult search(TicketSearchCriteria criteria) {
+        this.searchCalls++;
+        this.lastCriteria = criteria;
+        List<VersionedTicket> all = this.storage.values().stream()
+                .map(Snapshot::toVersionedTicket)
+                .toList();
+        return new TicketSearchResult(all, all.size());
     }
 
     @Override
@@ -85,6 +109,14 @@ final class InMemoryTicketRepository implements TicketRepository {
 
     int updateCalls() {
         return this.updateCalls;
+    }
+
+    int searchCalls() {
+        return this.searchCalls;
+    }
+
+    TicketSearchCriteria lastCriteria() {
+        return this.lastCriteria;
     }
 
     boolean contains(TicketId ticketId) {

@@ -4,7 +4,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -91,13 +93,22 @@ class TicketFrameworkErrorTests {
 
     @Test
     void wrongMethodReturns405AndKeepsTheAllowHeader() throws Exception {
-        this.mockMvc.perform(get(BASE_PATH))
+        // 集合端点在 FD-0007 之后同时支持 GET（列表）与 POST（创建），
+        // 因此 405 必须改用确实不被支持的方法来触发
+        this.mockMvc.perform(put(BASE_PATH))
                 .andExpect(status().isMethodNotAllowed())
                 .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(header().string(HttpHeaders.ALLOW, containsString("GET")))
                 .andExpect(header().string(HttpHeaders.ALLOW, containsString("POST")))
                 .andExpect(jsonPath("$.type").value("urn:flowdesk:problem:method-not-allowed"))
                 .andExpect(jsonPath("$.code").value("METHOD_NOT_ALLOWED"))
                 .andExpect(jsonPath("$.status").value(405));
+
+        this.mockMvc.perform(patch(BASE_PATH))
+                .andExpect(status().isMethodNotAllowed())
+                .andExpect(header().string(HttpHeaders.ALLOW, containsString("GET")))
+                .andExpect(header().string(HttpHeaders.ALLOW, containsString("POST")))
+                .andExpect(jsonPath("$.code").value("METHOD_NOT_ALLOWED"));
 
         this.mockMvc.perform(delete(BASE_PATH + "/{id}", UUID.randomUUID().toString()))
                 .andExpect(status().isMethodNotAllowed())

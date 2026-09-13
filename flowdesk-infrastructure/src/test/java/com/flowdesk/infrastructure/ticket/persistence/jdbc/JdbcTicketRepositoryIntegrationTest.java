@@ -101,7 +101,7 @@ class JdbcTicketRepositoryIntegrationTest {
 
     @Test
     void flywayMigratesAnEmptyDatabase() {
-        assertThat(migrateResult.migrationsExecuted).as("必须从空库应用 1 个迁移").isEqualTo(1);
+        assertThat(migrateResult.migrationsExecuted).as("V1 建表 + V2 搜索索引").isEqualTo(2);
         assertThat(scalarLong("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'tickets'"))
                 .as("tickets 表必须存在")
                 .isEqualTo(1);
@@ -116,6 +116,8 @@ class JdbcTicketRepositoryIntegrationTest {
 
         assertThat(indexes).contains("idx_tickets_status_updated_at", "idx_tickets_assignee_status",
                 "idx_tickets_created_at");
+        // V2（FD-0007）为列表默认排序与"我提交的工单"筛选补的索引
+        assertThat(indexes).contains("idx_tickets_updated_at_id", "idx_tickets_requester_updated_at_id");
     }
 
     // ---------- ②③④ 插入与往返 ----------

@@ -12,9 +12,14 @@ import com.flowdesk.application.ticket.port.in.TicketCommandUseCase;
 import com.flowdesk.application.ticket.port.in.TicketQueryUseCase;
 import com.flowdesk.application.ticket.port.out.TicketIdGenerator;
 import com.flowdesk.application.ticket.port.out.TicketRepository;
+import com.flowdesk.application.ticket.port.out.TicketSearchCriteria;
+import com.flowdesk.application.ticket.port.out.TicketSearchResult;
 import com.flowdesk.application.ticket.port.out.TimeProvider;
 import com.flowdesk.application.ticket.port.out.VersionedTicket;
 import com.flowdesk.application.ticket.query.GetTicketQuery;
+import com.flowdesk.application.ticket.query.SearchTicketsQuery;
+import com.flowdesk.application.ticket.query.TicketSearchQueryNormalizer;
+import com.flowdesk.application.ticket.view.TicketPageView;
 import com.flowdesk.application.ticket.view.TicketView;
 import com.flowdesk.domain.ticket.Ticket;
 import com.flowdesk.domain.ticket.TicketId;
@@ -52,7 +57,17 @@ import java.util.Objects;
  *   <li>用存储返回的新版本生成视图。</li>
  * </ol>
  *
- * <p>查询流程只读取一次存储，不读时间、不写存储、不推进版本。</p>
+ * <p>查询流程只读取一次存储，不读时间、不写存储、不推进版本、不生成标识。</p>
+ *
+ * <h2>列表 / 搜索流程</h2>
+ * <ol>
+ *   <li>校验查询非 {@code null}；</li>
+ *   <li>{@link TicketSearchQueryNormalizer#normalize} 套用默认值、strip 字符串、
+ *       解析枚举与排序白名单 —— 不合法即抛 {@code INVALID_COMMAND}，此时<b>不触碰存储</b>；</li>
+ *   <li>调用 {@link TicketRepository#search} 一次取回「当前页 + 总数」；</li>
+ *   <li>把 {@link VersionedTicket} 映射成 {@link TicketView} 并推导分页元数据。</li>
+ * </ol>
+ * <p>全程不生成标识、不读取时间、不写存储、不推进版本，因此列表查询永远是无副作用的。</p>
  *
  * <p>错误码语义见 {@link TicketApplicationErrorCode}；领域层抛出的
  * {@code TicketDomainException} 不被包装，保持原始领域错误码向上传递。</p>
@@ -159,6 +174,18 @@ public final class TicketApplicationService implements TicketCommandUseCase, Tic
                         "工单不存在"));
 
         return toView(found);
+    }
+
+    @Override
+    public TicketPageView search(SearchTicketsQuery query) {
+        requireCommand(query);
+
+        // 校验与规范化集中在校验器里：本方法只负责编排（校验 → 查询 → 映射视图）
+        TicketSearchCriteria criteria = TicketSearchQueryNormalizer.normalize(query);
+
+        TicketSearchResult result = this.ticketRepository.search(criteria);
+
+        return TicketPageView.from(result, criteria);
     }
 
     /**

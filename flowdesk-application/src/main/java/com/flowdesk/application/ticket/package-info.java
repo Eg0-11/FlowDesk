@@ -8,11 +8,12 @@
  * <p>结构：</p>
  * <ul>
  *   <li>{@code command} —— 输入命令 record，只承载数据，不复制领域校验；</li>
- *   <li>{@code query} —— 只读查询条件；</li>
+ *   <li>{@code query} —— 只读查询条件（含列表查询与排序白名单枚举），
+ *       并提供纯 Java 的规范化 / 校验器；</li>
  *   <li>{@code port.in} —— 输入端口（写入用例与查询用例）；</li>
- *   <li>{@code port.out} —— 输出端口（存储、标识生成、时间）；</li>
+ *   <li>{@code port.out} —— 输出端口（存储、标识生成、时间）与存储查询条件；</li>
  *   <li>{@code service} —— 纯 Java 无状态用例实现；</li>
- *   <li>{@code view} —— 对外只读视图，输入适配器拿不到可变聚合。</li>
+ *   <li>{@code view} —— 对外只读视图（单条与分页），输入适配器拿不到可变聚合。</li>
  * </ul>
  *
  * <p>错误契约由 {@link com.flowdesk.application.ticket.TicketApplicationException} 与
