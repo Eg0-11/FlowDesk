@@ -12,12 +12,24 @@
 
   <artifactId>flowdesk-domain</artifactId>
   <name>flowdesk-domain</name>
-  <description>领域实体、值对象与领域规则；刻意不引入 Spring、JPA、Web、AI 依赖</description>
+  <description>领域层：工单聚合、值对象与生命周期规则；刻意不引入 Spring、JPA、Web、AI 依赖</description>
 
   <dependencies>
     <dependency>
       <groupId>com.flowdesk</groupId>
       <artifactId>flowdesk-shared</artifactId>
+    </dependency>
+
+    <!-- 领域单元测试：纯 JUnit 5 + AssertJ，不启动 Spring 上下文。版本由 BOM 管理。 -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <scope>test</scope>
     </dependency>
   </dependencies>
 </project>

@@ -18,7 +18,7 @@
   <packaging>pom</packaging>
 
   <name>flowdesk</name>
-  <description>FlowDesk 企业智能工单与知识运营平台（当前阶段：已完成 DeepSeek 接入与本地 Tool Calling 冒烟闭环）</description>
+  <description>FlowDesk 企业智能工单与知识运营平台（当前阶段：已完成工单领域生命周期模型）</description>
 
   <modules>
     <module>flowdesk-shared</module>

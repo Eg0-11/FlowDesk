@@ -1,25 +1,26 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0002 —— DeepSeek 接入与本地 Tool Calling 冒烟闭环（已完成）**
-> 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 的 OpenAI 兼容传输适配、
-> 普通聊天接口、单次本地只读工具调用闭环、配置隔离、异常映射与自动化测试。
-> 尚未实现：工单业务、RAG、MCP 能力、Agent Graph、数据库/Redis/MQ、会话记忆、流式输出、鉴权与前端。
+> **当前阶段：FD-0003 —— 工单核心领域模型与生命周期状态机（已完成）**
+> 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 的 OpenAI 兼容传输适配与工具调用闭环（FD-0002）、
+> 工单聚合与生命周期状态机（FD-0003）。
+> 尚未实现：工单应用用例与持久化、RAG、MCP 能力、Agent Graph、数据库/Redis/MQ、鉴权与前端。
 
 ## 一、项目简介
 
 FlowDesk 面向企业 IT 服务与运营场景，规划能力包括：智能化工单流转、知识库运营、RAG 检索增强、
 Tool 调用、MCP 资产/监控服务以及基于 Agent Graph 的自动化编排。
 
-当前仓库已经打通第一条 AI 垂直链路：**HTTP → 用例 → Agent 编排 → Spring AI ChatClient →
-DeepSeek（OpenAI 兼容传输）→ 本地只读工具 → 模型汇总 → HTTP 响应**，
-并保留了清晰的模块边界、单向依赖方向与统一的版本基线。
+当前仓库已经完成两件事：一是打通的 AI 垂直链路
+（**HTTP → 用例 → Agent 编排 → Spring AI ChatClient → DeepSeek（OpenAI 兼容传输）→
+本地只读工具 → 模型汇总 → HTTP 响应**），二是纯 Java 的工单领域核心
+（工单聚合与生命周期状态机），并保留了清晰的模块边界、单向依赖方向与统一的版本基线。
 
 ## 二、模块职责
 
 | 模块 | 职责 | 当前状态 |
 | --- | --- | --- |
 | `flowdesk-shared` | 通用异常、基础类型、工具类 | 仅模块与 `package-info.java` |
-| `flowdesk-domain` | 领域实体、值对象、领域规则（**不依赖 Spring**） | 仅模块与 `package-info.java` |
+| `flowdesk-domain` | 领域实体、值对象、领域规则（**不依赖 Spring**） | 已实现工单聚合与生命周期状态机（`com.flowdesk.domain.ticket`） |
 | `flowdesk-application` | 用例服务、输入输出端口 | 已定义 AI 用例接口与命令/结果对象（`com.flowdesk.application.ai`，框架无关） |
 | `flowdesk-agent` | AI 编排：实现 application 的 AI 用例，用 ChatClient 编排提示词与本地工具 | 已实现普通聊天与工具冒烟 |
 | `flowdesk-infrastructure` | 数据库、Redis、向量库、模型等适配器 | 已提供 DeepSeek 的 OpenAI 兼容传输适配 |
@@ -294,7 +295,40 @@ spring:
 典型故障（连接被拒）下约 1.5 秒即返回 502。该时效由
 `ProviderFailureBoundedTests` 锁死。
 
-## 八、代码约束
+## 八、工单领域模型
+
+`flowdesk-domain` 中的 `com.flowdesk.domain.ticket` 是纯 Java（只用 JDK）实现的工单聚合，
+不依赖 Spring、持久化框架或任何外部系统，时间与标识一律由调用方传入，
+聚合内部从不读取系统时钟 —— 因此行为完全确定，可直接单元测试。
+
+**状态机**：
+
+```
+NEW --assign--> ASSIGNED --start--> IN_PROGRESS --resolve--> RESOLVED --close--> CLOSED
+                    |                     |
+                    +------ reassign -----+      （状态不变，仅更换处理人）
+```
+
+除上述转换外，任何组合都抛 `ILLEGAL_STATUS_TRANSITION`。状态字段没有公共 setter。
+
+**聚合不变量**：
+
+- `createdAt <= updatedAt`；
+- `resolvedAt` 存在时不早于 `createdAt`；`closedAt` 存在时不早于 `resolvedAt`；
+- 状态与可选字段严格共存：`NEW` 无处理人/结论/时间戳；`ASSIGNED`、`IN_PROGRESS` 有处理人、
+  无结论与时间戳；`RESOLVED` 有处理人、结论与 `resolvedAt`、无 `closedAt`；`CLOSED` 全部齐备。
+
+**两种构造入口**：`Ticket.create(...)` 用于新工单（产出 `NEW` 状态）；
+`Ticket.restore(...)` 用于数据库适配器恢复快照，会完整校验字段规则、状态一致性与时间线，
+任何不自洽都抛 `INVALID_RESTORED_STATE`。
+
+**错误契约**：所有失败都抛 `TicketDomainException` 并携带 `TicketErrorCode`，
+上层据此做稳定映射，不必解析异常文案；异常信息不回显调用方传入的原始非法值。
+
+**实体语义**：相等性只由 `TicketId` 决定；`toString` 只输出标识、状态与时间线，
+不含标题、描述与处理结论。
+
+## 九、代码约束
 
 - 不使用 Lombok。
 - 不创建空的 Controller、Service、Repository、Entity 占位类。
@@ -302,13 +336,16 @@ spring:
 - 不使用通配符版本；子模块不重复声明受 BOM 管理的版本。
 - 不隐藏编译警告，不跳过测试；全部文件使用 UTF-8。
 
-## 九、后续阶段简述
+## 十、后续阶段简述
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
 | FD-0001 | Maven 多模块骨架与版本基线 | ✅ 已完成 |
 | FD-0002 | DeepSeek 接入与本地 Tool Calling 冒烟闭环 | ✅ 已完成 |
-| 后续 | 工单业务（领域模型、用例、持久化、接口） | 未开始 |
+| FD-0003 | 工单核心领域模型与生命周期状态机 | ✅ 已完成 |
+| 后续 | 工单应用用例与输入输出端口 | 未开始 |
+| 后续 | 工单持久化适配器与数据库迁移 | 未开始 |
+| 后续 | 工单 HTTP 接口 | 未开始 |
 | 后续 | RAG：文档解析、切分、向量化、检索增强 | 未开始 |
 | 后续 | Tool 体系扩展：面向工单与知识的工具注册 | 未开始 |
 | 后续 | MCP：资产 MCP 服务与监控 MCP 服务的能力实现 | 未开始 |
