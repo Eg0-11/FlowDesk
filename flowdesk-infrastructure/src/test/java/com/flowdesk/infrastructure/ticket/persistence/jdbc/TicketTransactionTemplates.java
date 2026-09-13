@@ -24,10 +24,14 @@ final class TicketTransactionTemplates {
     }
 
     /**
-     * 列表查询路径：只读 + {@code REPEATABLE_READ}（与生产一致）。
+     * 列表查询路径：{@code REQUIRES_NEW} + 只读 + {@code REPEATABLE_READ}（与生产一致）。
+     *
+     * <p>{@code REQUIRES_NEW} 不可省：默认的 {@code REQUIRED} 会加入调用方已有的外层事务，
+     * 那时只读与隔离级别的设置都不会生效（见 {@code TicketPersistenceConfiguration} 的说明）。</p>
      */
     static TransactionTemplate readOnly(DataSource dataSource) {
         TransactionTemplate template = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
+        template.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
         template.setReadOnly(true);
         template.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
         return template;

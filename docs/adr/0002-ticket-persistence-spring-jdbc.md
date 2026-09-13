@@ -65,9 +65,10 @@ WHERE id = ? AND version = ?;
 - 整个流程由一个 `TransactionOperations` 包住，异常即回滚，因此 CAS 失败不会留下部分写入。
 
 > **写事务的隔离级别刻意保持默认（`READ_COMMITTED`）。** CAS 的正确性来自行锁与条件更新，
-> 与隔离级别无关，提升隔离级别只会增加锁竞争与序列化失败。列表查询另用一个只读、
-> `REPEATABLE_READ` 的事务模板（那是为了 COUNT 与分页查询看到同一快照），
-> 两个模板互不影响，见 [ADR 0004](0004-ticket-search-pagination.md)。
+> 与隔离级别无关，提升隔离级别只会增加锁竞争与序列化失败。列表查询另用一个
+> **`REQUIRES_NEW` + 只读 + `REPEATABLE_READ`** 的事务模板（那是为了 COUNT 与分页查询看到同一快照，
+> 且必须在已有事务中调用时仍然独立），两个模板互不影响，
+> 见 [ADR 0004](0004-ticket-search-pagination.md)。
 
 `insert` 则依赖**主键唯一约束**作为并发插入的最终防线：两个并发插入同一标识时只有一个成功，
 另一个由数据库抛出重复键异常，适配器把它映射为 `TICKET_ALREADY_EXISTS`。

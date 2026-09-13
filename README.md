@@ -358,7 +358,7 @@ NEW --assign--> ASSIGNED --start--> IN_PROGRESS --resolve--> RESOLVED --close-->
 | `TicketRepository.findById` | 返回**独立恢复**的聚合；不存在返回 `Optional.empty()`，绝不返回 `null`；适配器不得交出内部可变存储引用 |
 | `TicketRepository.insert` | 新工单初始版本为 0；**原子拒绝**重复标识，失败抛 `TICKET_ALREADY_EXISTS` |
 | `TicketRepository.update` | **原子 compare-and-set**：仅当存储版本等于 `expectedVersion` 时写入并**严格加 1**；记录不存在抛 `TICKET_NOT_FOUND`，版本不匹配抛 `TICKET_VERSION_CONFLICT`（两者必须区分） |
-| `TicketRepository.search` | 分页 / 条件搜索：返回「当前页 + 总数」，两者来自**同一个只读 `REPEATABLE_READ` 事务**的同一数据库快照；**最多两条语句**（一条 `COUNT`、一条分页查询，零结果时只有 `COUNT`），**无 N+1**；筛选值全部参数绑定，排序按白名单映射固定列名，每行仍经 `Ticket.restore` 恢复成独立聚合 |
+| `TicketRepository.search` | 分页 / 条件搜索：返回「当前页 + 总数」，两者来自**同一个独立（`REQUIRES_NEW`）只读 `REPEATABLE_READ` 事务**的同一数据库快照；**最多两条语句**（一条 `COUNT`、一条分页查询，零结果时只有 `COUNT`），**无 N+1**；筛选值全部参数绑定，排序按白名单映射固定列名，每行仍经 `Ticket.restore` 恢复成独立聚合 |
 
 ### 9.2 用例流程与顺序保证
 
@@ -661,9 +661,11 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 包含搜索当前是可移植的 `LIKE`，无法使用 B 树索引，即全表扫描 + 过滤。
 完整论证见 [`docs/adr/0004-ticket-search-pagination.md`](docs/adr/0004-ticket-search-pagination.md)。
 
-**单次响应内部一定自洽**：`totalElements` 与 `items` 由**同一个只读 `REPEATABLE_READ` 事务**
-中的两条语句取得，因此不可能出现「总数 5 却返回 6 行」这类矛盾 —— 默认的 `READ_COMMITTED`
-下每条语句各取一个新快照，**不足以保证**这一点。写路径的事务定义与隔离级别保持不变。
+**单次响应内部一定自洽**：`totalElements` 与 `items` 由**同一个独立（`REQUIRES_NEW`）的只读
+`REPEATABLE_READ` 事务**中的两条语句取得，因此不可能出现「总数 5 却返回 6 行」这类矛盾 ——
+默认的 `READ_COMMITTED` 下每条语句各取一个新快照，**不足以保证**这一点。
+`REQUIRES_NEW` 也不可省：默认的 `REQUIRED` 会加入调用方已有的事务，那时只读与隔离级别都不会生效；
+代价是在已有事务中调用列表查询会额外占用一条数据库连接。写路径的事务定义与隔离级别保持不变。
 
 ## 十二、代码约束
 

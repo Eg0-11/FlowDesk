@@ -88,24 +88,37 @@ public class TicketPersistenceConfiguration {
     }
 
     /**
-     * 列表查询专用的事务模板：<b>只读 + {@code REPEATABLE_READ}</b>。
+     * 列表查询专用的事务模板：<b>{@code REQUIRES_NEW} + 只读 + {@code REPEATABLE_READ}</b>。
      *
      * <p>列表接口要发两条 SELECT（COUNT 与分页查询），它们必须来自同一个数据库快照，
      * 否则会出现「总数 5 却返回 6 行」这种自相矛盾的响应。默认的 {@code READ_COMMITTED}
      * <b>不足以</b>保证这一点 —— PostgreSQL 在 READ COMMITTED 下每条语句各取一个新快照，
      * 同一事务里的两条 SELECT 仍可能看到不同数据。</p>
      *
-     * <p>只读、不使用行锁，因此不会阻塞并发写入；写路径继续使用上面那个模板，
-     * 两者互不影响。</p>
+     * <h3>为什么必须显式声明 {@code REQUIRES_NEW}</h3>
+     * <p>{@link TransactionTemplate} 的默认传播行为是 {@code PROPAGATION_REQUIRED}：它会<b>加入</b>
+     * 调用方已有的外层事务。一旦加入，本模板的两个关键设置就<b>不会生效</b> ——
+     * 外层事务已经决定并设置好了连接上的隔离级别与只读标志，Spring 不会为参与其中的内层事务
+     * 再改一次。于是「快照一致性」这条契约在「在已有事务里调用 search」这一情形下会静默失效：
+     * 外层若是默认的 READ_COMMITTED，COUNT 与分页查询就又各自取新快照了。</p>
+     * <p>{@code REQUIRES_NEW} 让内层事务真正独立：外层事务被<b>挂起</b>（不提交、不回滚、
+     * 其连接仍被占有），内层用<b>另一条连接</b>开启新事务，内层结束后外层被<b>恢复</b>。
+     * 因此「独立事务 + 只读 + 可重复读」在嵌套调用下同样成立。</p>
+     *
+     * <p>只读、不使用行锁，因此不会阻塞并发写入。代价是嵌套调用时需要额外占用一条数据库连接
+     * （外层连接在外层事务结束前不会归还连接池），这也是本模板只用于一次列表查询的原因。</p>
+     *
+     * <p>写路径继续使用上面那个模板（默认传播、默认隔离级别），两者互不影响。</p>
      *
      * @param transactionManager Spring Boot 自动配置的数据源事务管理器
-     * @return 只读、可重复读的事务操作模板
+     * @return 独立、只读、可重复读的事务操作模板
      */
     @Bean
     public TransactionOperations ticketReadOnlyTransactionOperations(
             PlatformTransactionManager transactionManager) {
 
         TransactionTemplate template = new TransactionTemplate(transactionManager);
+        template.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
         template.setReadOnly(true);
         template.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
         return template;

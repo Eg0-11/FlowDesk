@@ -11,23 +11,13 @@ import com.flowdesk.domain.ticket.TicketCategory;
 import com.flowdesk.domain.ticket.TicketId;
 import com.flowdesk.domain.ticket.TicketPriority;
 import com.flowdesk.domain.ticket.UserId;
-import java.io.PrintWriter;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Proxy;
 import java.sql.Connection;
-import java.sql.SQLException;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.logging.Logger;
-import javax.sql.DataSource;
 import org.flywaydb.core.Flyway;
 import org.h2.jdbcx.JdbcDataSource;
 import org.junit.jupiter.api.BeforeAll;
@@ -297,143 +287,4 @@ class JdbcTicketSearchSnapshotIntegrationTest {
         assertThat(thread.isAlive()).as("并发线程必须已结束").isFalse();
     }
 
-    /**
-     * 拦截型数据源：记录连接的只读/隔离级别设置，统计连接与语句，并支持在
-     * 「下一次分页查询即将执行」时插入一个一次性钩子。
-     */
-    private static final class InterceptingDataSource implements DataSource {
-
-        private final DataSource delegate;
-
-        private final AtomicInteger connections = new AtomicInteger();
-
-        private final List<String> trace = new CopyOnWriteArrayList<>();
-
-        private volatile Runnable pageQueryHook;
-
-        InterceptingDataSource(DataSource delegate) {
-            this.delegate = delegate;
-        }
-
-        /**
-         * 安排一个只执行一次的钩子，在下一个分页查询真正下发之前运行。
-         */
-        void beforeNextPageQuery(Runnable hook) {
-            this.pageQueryHook = hook;
-        }
-
-        int connectionsOpened() {
-            return this.connections.get();
-        }
-
-        /**
-         * 只清连接计数：夹具插入会用到连接，统计「本次搜索期间」的连接数前必须先归零。
-         */
-        void resetConnectionCount() {
-            this.connections.set(0);
-        }
-
-        void clearTrace() {
-            this.trace.clear();
-        }
-
-        List<String> traceFor(String threadName) {
-            List<String> selected = new ArrayList<>();
-            for (String entry : this.trace) {
-                if (entry.startsWith(threadName + " ")) {
-                    selected.add(entry.substring(threadName.length() + 1));
-                }
-            }
-            return Collections.unmodifiableList(selected);
-        }
-
-        void reset() {
-            this.connections.set(0);
-            this.trace.clear();
-            this.pageQueryHook = null;
-        }
-
-        @Override
-        public Connection getConnection() throws SQLException {
-            this.connections.incrementAndGet();
-            return intercept(this.delegate.getConnection());
-        }
-
-        @Override
-        public Connection getConnection(String username, String password) throws SQLException {
-            this.connections.incrementAndGet();
-            return intercept(this.delegate.getConnection(username, password));
-        }
-
-        private Connection intercept(Connection connection) {
-            return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
-                    new Class<?>[] { Connection.class },
-                    (proxy, method, args) -> {
-                        String name = method.getName();
-                        if ("setReadOnly".equals(name)) {
-                            this.trace.add(Thread.currentThread().getName() + " setReadOnly(" + args[0] + ")");
-                        }
-                        else if ("setTransactionIsolation".equals(name)) {
-                            this.trace.add(Thread.currentThread().getName() + " setTransactionIsolation("
-                                    + args[0] + ")");
-                        }
-                        else if (("prepareStatement".equals(name) || "createStatement".equals(name))
-                                && args != null && args.length > 0) {
-                            Runnable hook = this.pageQueryHook;
-                            if (hook != null && String.valueOf(args[0]).contains(" LIMIT ")) {
-                                // 一次性：保证只有被安排的那次分页查询会被拦住
-                                this.pageQueryHook = null;
-                                hook.run();
-                            }
-                        }
-                        return invoke(connection, method, args);
-                    });
-        }
-
-        @Override
-        public PrintWriter getLogWriter() throws SQLException {
-            return this.delegate.getLogWriter();
-        }
-
-        @Override
-        public void setLogWriter(PrintWriter out) throws SQLException {
-            this.delegate.setLogWriter(out);
-        }
-
-        @Override
-        public void setLoginTimeout(int seconds) throws SQLException {
-            this.delegate.setLoginTimeout(seconds);
-        }
-
-        @Override
-        public int getLoginTimeout() throws SQLException {
-            return this.delegate.getLoginTimeout();
-        }
-
-        @Override
-        public Logger getParentLogger() {
-            return Logger.getLogger("flowdesk.test");
-        }
-
-        @Override
-        public <T> T unwrap(Class<T> iface) throws SQLException {
-            return this.delegate.unwrap(iface);
-        }
-
-        @Override
-        public boolean isWrapperFor(Class<?> iface) throws SQLException {
-            return this.delegate.isWrapperFor(iface);
-        }
-
-        private static Object invoke(Object target, java.lang.reflect.Method method, Object[] args)
-                throws Throwable {
-
-            try {
-                return method.invoke(target, args);
-            }
-            catch (InvocationTargetException ex) {
-                throw ex.getCause();
-            }
-        }
-    }
 }

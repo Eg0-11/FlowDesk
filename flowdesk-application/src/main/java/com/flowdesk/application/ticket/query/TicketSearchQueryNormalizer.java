@@ -13,8 +13,18 @@ import java.util.stream.Stream;
  * 列表查询的<b>规范化与校验</b>：把原始 {@link SearchTicketsQuery} 变成可直接下推到存储的
  * {@link TicketSearchCriteria}。
  *
- * <p>纯静态、无状态、不依赖 Spring。规则集中在这一处，HTTP 边界与应用层服务调用的是同一份实现，
- * 因此「接口怎么报错」与「用例怎么判定」不会各说各话。</p>
+ * <p>纯静态、无状态、不依赖 Spring。</p>
+ *
+ * <h2>调用边界（只有一个调用方）</h2>
+ * <p>规范化与校验<b>只由 {@code TicketApplicationService#search} 调用一次</b>。
+ * 其他任何地方都不得直接调用本类：</p>
+ * <ul>
+ *   <li>HTTP 等输入适配器<b>只调用查询输入端口</b>（{@code TicketQueryUseCase#search}），
+ *       把用例抛出的 {@link TicketApplicationErrorCode#INVALID_QUERY} 翻译成自己的错误契约即可；</li>
+ *   <li>输入适配器<b>不得</b>在调用端口之前预先跑一遍本类 —— 那会让规则出现两处调用点、
+ *       两次执行，也容易出现「接口拒绝但用例接受」这类分歧；</li>
+ *   <li>因此「接口怎么报错」与「用例怎么判定」始终来自同一份实现，而不是各自复制一份判断。</li>
+ * </ul>
  *
  * <h2>规则</h2>
  * <ul>
