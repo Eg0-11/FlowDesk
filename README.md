@@ -1,9 +1,9 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0003 —— 工单核心领域模型与生命周期状态机（已完成）**
+> **当前阶段：FD-0004 —— 工单应用用例、输入输出端口与乐观并发契约（已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 的 OpenAI 兼容传输适配与工具调用闭环（FD-0002）、
-> 工单聚合与生命周期状态机（FD-0003）。
-> 尚未实现：工单应用用例与持久化、RAG、MCP 能力、Agent Graph、数据库/Redis/MQ、鉴权与前端。
+> 工单聚合与生命周期状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）。
+> 尚未实现：工单持久化适配器与 HTTP 接口、RAG、MCP 能力、Agent Graph、数据库/Redis/MQ、鉴权与前端。
 
 ## 一、项目简介
 
@@ -21,7 +21,7 @@ Tool 调用、MCP 资产/监控服务以及基于 Agent Graph 的自动化编排
 | --- | --- | --- |
 | `flowdesk-shared` | 通用异常、基础类型、工具类 | 仅模块与 `package-info.java` |
 | `flowdesk-domain` | 领域实体、值对象、领域规则（**不依赖 Spring**） | 已实现工单聚合与生命周期状态机（`com.flowdesk.domain.ticket`） |
-| `flowdesk-application` | 用例服务、输入输出端口 | 已定义 AI 用例接口与命令/结果对象（`com.flowdesk.application.ai`，框架无关） |
+| `flowdesk-application` | 用例服务、输入输出端口 | 已实现 AI 用例（`…application.ai`）与工单用例 + 乐观并发契约（`…application.ticket`） |
 | `flowdesk-agent` | AI 编排：实现 application 的 AI 用例，用 ChatClient 编排提示词与本地工具 | 已实现普通聊天与工具冒烟 |
 | `flowdesk-infrastructure` | 数据库、Redis、向量库、模型等适配器 | 已提供 DeepSeek 的 OpenAI 兼容传输适配 |
 | `flowdesk-bootstrap` | FlowDesk 主服务启动模块（Web + Validation + Actuator + AI 接口） | 可启动，端口 8080 |
@@ -332,7 +332,54 @@ NEW --assign--> ASSIGNED --start--> IN_PROGRESS --resolve--> RESOLVED --close-->
 **实体语义**：相等性只由 `TicketId` 决定；`toString` 只输出标识、状态与时间线，
 不含标题、描述与处理结论。
 
-## 九、代码约束
+## 九、工单应用层与乐观并发
+
+`com.flowdesk.application.ticket` 是框架无关的纯 Java 应用层，只依赖 JDK 与领域模块：
+
+```
+输入端口 TicketCommandUseCase / TicketQueryUseCase
+   → TicketApplicationService（无状态，构造器注入存储、标识、时间三个端口）
+   → Ticket 领域聚合
+   → TicketRepository 输出端口（乐观并发）
+   → TicketView（不可变只读视图）
+```
+
+**不使用** `UUID.randomUUID()`、`Instant.now()`、`Clock.system*`、Spring 注解或静态全局依赖 ——
+标识与时间都来自端口，因此同一份输入永远得到同一份输出。
+
+### 9.1 端口契约
+
+| 端口 | 契约 |
+| --- | --- |
+| `TicketRepository.findById` | 返回**独立恢复**的聚合；不存在返回 `Optional.empty()`，绝不返回 `null`；适配器不得交出内部可变存储引用 |
+| `TicketRepository.insert` | 新工单初始版本为 0；**原子拒绝**重复标识，失败抛 `TICKET_ALREADY_EXISTS` |
+| `TicketRepository.update` | **原子 compare-and-set**：仅当存储版本等于 `expectedVersion` 时写入并**严格加 1**；记录不存在抛 `TICKET_NOT_FOUND`，版本不匹配抛 `TICKET_VERSION_CONFLICT`（两者必须区分） |
+
+### 9.2 用例流程与顺序保证
+
+创建：校验命令 → 取标识与时间 → `Ticket.create(...)` → `insert` → 视图（版本 0）。
+
+状态变更：校验命令/标识/版本 → `findById`（不存在即 `TICKET_NOT_FOUND`）→ 比对版本
+（不一致即 `TICKET_VERSION_CONFLICT`，**此时不读时间、不改聚合、不写存储**）→
+读取一次时间 → 调用领域方法 → `update(ticket, expectedVersion)` → 用返回的新版本生成视图。
+
+领域规则失败时异常原样向上抛出（携带 `TicketErrorCode`），**不写存储**；
+读取后写入前发生并发写入时，存储抛出的 `TICKET_VERSION_CONFLICT` 原样传播。
+查询只读，不读时间、不写存储、不推进版本。
+
+### 9.3 错误契约
+
+| 错误码 | 触发条件 |
+| --- | --- |
+| `INVALID_COMMAND` | 命令／查询为 `null`、工单标识为 `null`、`expectedVersion < 0` |
+| `TICKET_NOT_FOUND` | 目标工单不存在（用例读取时或存储写入时） |
+| `TICKET_ALREADY_EXISTS` | 插入的工单标识已存在 |
+| `TICKET_VERSION_CONFLICT` | 调用方版本过期，或并发写入导致 compare-and-set 失败 |
+
+异常始终携带非空错误码，文案不回显标题、描述、结论或用户原始输入；
+领域层异常**不被包装**，`TicketErrorCode` 直接到达调用方。
+
+## 十、代码约束
 
 - 不使用 Lombok。
 - 不创建空的 Controller、Service、Repository、Entity 占位类。
@@ -340,16 +387,16 @@ NEW --assign--> ASSIGNED --start--> IN_PROGRESS --resolve--> RESOLVED --close-->
 - 不使用通配符版本；子模块不重复声明受 BOM 管理的版本。
 - 不隐藏编译警告，不跳过测试；全部文件使用 UTF-8。
 
-## 十、后续阶段简述
+## 十一、后续阶段简述
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
 | FD-0001 | Maven 多模块骨架与版本基线 | ✅ 已完成 |
 | FD-0002 | DeepSeek 接入与本地 Tool Calling 冒烟闭环 | ✅ 已完成 |
 | FD-0003 | 工单核心领域模型与生命周期状态机 | ✅ 已完成 |
-| 后续 | 工单应用用例与输入输出端口 | 未开始 |
+| FD-0004 | 工单应用用例、输入输出端口与乐观并发契约 | ✅ 已完成 |
 | 后续 | 工单持久化适配器与数据库迁移 | 未开始 |
-| 后续 | 工单 HTTP 接口 | 未开始 |
+| 后续 | 工单 HTTP 接口（Spring 装配） | 未开始 |
 | 后续 | RAG：文档解析、切分、向量化、检索增强 | 未开始 |
 | 后续 | Tool 体系扩展：面向工单与知识的工具注册 | 未开始 |
 | 后续 | MCP：资产 MCP 服务与监控 MCP 服务的能力实现 | 未开始 |

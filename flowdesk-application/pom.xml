@@ -12,12 +12,24 @@
 
   <artifactId>flowdesk-application</artifactId>
   <name>flowdesk-application</name>
-  <description>用例服务与输入输出端口；只依赖领域模块，保持框架无关</description>
+  <description>应用层：用例服务与输入输出端口；只依赖领域模块，保持框架无关</description>
 
   <dependencies>
     <dependency>
       <groupId>com.flowdesk</groupId>
       <artifactId>flowdesk-domain</artifactId>
+    </dependency>
+
+    <!-- 应用层单元测试：纯 JUnit 5 + AssertJ，不启动 Spring 上下文。版本由 BOM 管理。 -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <scope>test</scope>
     </dependency>
   </dependencies>
 </project>

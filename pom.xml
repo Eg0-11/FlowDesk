@@ -18,7 +18,7 @@
   <packaging>pom</packaging>
 
   <name>flowdesk</name>
-  <description>FlowDesk 企业智能工单与知识运营平台（当前阶段：已完成工单领域生命周期模型）</description>
+  <description>FlowDesk 企业智能工单与知识运营平台（当前阶段：已完成工单应用用例与乐观并发契约）</description>
 
   <modules>
     <module>flowdesk-shared</module>
