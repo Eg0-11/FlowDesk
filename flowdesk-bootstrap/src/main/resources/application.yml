@@ -2,6 +2,21 @@ spring:
   application:
     name: flowdesk
 
+  # 默认数据源：内存 H2，运行在 PostgreSQL 兼容模式下。
+  #
+  # H2 仅用于本地开发与自动化测试，不是生产数据库；生产使用 postgres profile
+  # （见 application-postgres.yml）。默认环境不需要任何数据库密码即可启动。
+  # 刻意不开启 H2 Console。
+  datasource:
+    url: jdbc:h2:mem:flowdesk;MODE=PostgreSQL;DB_CLOSE_DELAY=-1;DATABASE_TO_LOWER=TRUE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+
+  # 迁移默认启用：启动时把 db/migration 下的脚本应用到当前数据源。
+  flyway:
+    enabled: true
+
   # 默认不装配任何模型适配器：没有 API Key 也能启动与测试，且不存在出网可能。
   #
   # OpenAI starter 在类路径上时，除 chat 之外还会自动装配 embedding / image /

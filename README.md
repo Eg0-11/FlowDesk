@@ -1,9 +1,10 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0004 —— 工单应用用例、输入输出端口与乐观并发契约（已完成）**
-> 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 的 OpenAI 兼容传输适配与工具调用闭环（FD-0002）、
-> 工单聚合与生命周期状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）。
-> 尚未实现：工单持久化适配器与 HTTP 接口、RAG、MCP 能力、Agent Graph、数据库/Redis/MQ、鉴权与前端。
+> **当前阶段：FD-0005 —— JDBC 持久化适配器、Flyway 迁移与 Spring 装配（已完成）**
+> 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
+> 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
+> JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）。
+> 尚未实现：工单 HTTP 接口、分页搜索、RAG、MCP 能力、Agent Graph、鉴权与前端。
 
 ## 一、项目简介
 
@@ -23,7 +24,7 @@ Tool 调用、MCP 资产/监控服务以及基于 Agent Graph 的自动化编排
 | `flowdesk-domain` | 领域实体、值对象、领域规则（**不依赖 Spring**） | 已实现工单聚合与生命周期状态机（`com.flowdesk.domain.ticket`） |
 | `flowdesk-application` | 用例服务、输入输出端口 | 已实现 AI 用例（`…application.ai`）与工单用例 + 乐观并发契约（`…application.ticket`） |
 | `flowdesk-agent` | AI 编排：实现 application 的 AI 用例，用 ChatClient 编排提示词与本地工具 | 已实现普通聊天与工具冒烟 |
-| `flowdesk-infrastructure` | 数据库、Redis、向量库、模型等适配器 | 已提供 DeepSeek 的 OpenAI 兼容传输适配 |
+| `flowdesk-infrastructure` | 持久化与模型适配器 | 已提供 JDBC 工单存储（`…ticket.persistence.jdbc`）与 DeepSeek 传输适配 |
 | `flowdesk-bootstrap` | FlowDesk 主服务启动模块（Web + Validation + Actuator + AI 接口） | 可启动，端口 8080 |
 | `flowdesk-mcp-asset` | 独立资产 MCP 服务（Web + Actuator） | 可启动，端口 8091 |
 | `flowdesk-mcp-monitoring` | 独立监控 MCP 服务（Web + Actuator） | 可启动，端口 8092 |
@@ -379,7 +380,87 @@ NEW --assign--> ASSIGNED --start--> IN_PROGRESS --resolve--> RESOLVED --close-->
 异常始终携带非空错误码，文案不回显标题、描述、结论或用户原始输入；
 领域层异常**不被包装**，`TicketErrorCode` 直接到达调用方。
 
-## 十、代码约束
+## 十、工单持久化（JDBC + Flyway + H2/PostgreSQL）
+
+技术选型与理由见 [`docs/adr/0002-ticket-persistence-spring-jdbc.md`](docs/adr/0002-ticket-persistence-spring-jdbc.md)。
+
+### 10.1 组件职责
+
+| 组件 | 职责 |
+| --- | --- |
+| Spring JDBC `JdbcClient` | 显式 SQL + 参数绑定，实现 `TicketRepository`；**不使用 JPA/Hibernate/MyBatis** |
+| Flyway | `flowdesk-infrastructure/src/main/resources/db/migration` 下的迁移；默认启用 |
+| PostgreSQL | 目标数据库；通过 `postgres` profile 连接 |
+| H2（PostgreSQL 兼容模式） | 默认 profile 的内存数据库，用于本地开发与自动化集成测试；**不是生产数据库** |
+
+### 10.2 表结构与约束
+
+`V1__create_tickets.sql` 建立 `tickets` 表（`id UUID` 主键、`version BIGINT`、三列时间戳
+`TIMESTAMP(6) WITH TIME ZONE`），索引：
+
+- `(status, updated_at)`、`(assignee_id, status)`、`(created_at)`
+
+数据库层面的 CHECK 约束（标准 SQL，PostgreSQL 与 H2 兼容模式都能执行，不使用数据库专属枚举类型）：
+
+| 约束 | 内容 |
+| --- | --- |
+| 版本 | `version >= 0` |
+| 枚举 | `category` / `priority` / `status` 只能是领域枚举取值 |
+| 状态组合 | `NEW` 无处理人/结论/时间戳；`ASSIGNED`、`IN_PROGRESS` 有处理人、无结论与时间戳；`RESOLVED` 有处理人、结论与 `resolved_at`、无 `closed_at`；`CLOSED` 全部齐备 |
+| 时间链 | `created_at <= resolved_at <= closed_at <= updated_at` |
+| 文本 | 必填文本不能是空字符串或纯空格；长度与领域上限一致（200 / 4000 / 2000 / 64） |
+
+> 已知边界：SQL 标准的 `TRIM()` 只去空格，不去制表符等其它空白；领域层的 `strip()` 更严格。
+> 两层是「领域更严、数据库兜底」，不是完全等价。
+
+### 10.3 乐观锁链路
+
+```
+TicketApplicationService
+  → TicketRepository（端口）
+  → JdbcTicketRepository（适配器）
+  → 同一事务内：SELECT version ... FOR UPDATE
+              → 不存在：TICKET_NOT_FOUND
+              → 版本不匹配：TICKET_VERSION_CONFLICT（不产生任何写入）
+              → UPDATE ... WHERE id = ? AND version = ?（影响行数必须为 1）
+              → 重新读取并返回独立恢复的聚合
+```
+
+`insert` 固定写入 `version = 0`，以主键唯一约束作为并发插入的最终防线；
+适配器只把主键重复映射为 `TICKET_ALREADY_EXISTS`，其它约束异常原样抛出。
+
+### 10.4 启动方式
+
+**默认（内存 H2，无需数据库密码）**：
+
+```powershell
+.\mvnw.cmd clean package
+java -jar flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar
+```
+
+**连接 PostgreSQL**：
+
+```powershell
+$env:FLOWDESK_DB_URL = 'jdbc:postgresql://localhost:5432/flowdesk'
+$env:FLOWDESK_DB_USERNAME = '<your-user>'
+$env:FLOWDESK_DB_PASSWORD = '<your-password>'
+java -jar flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar --spring.profiles.active=postgres
+```
+
+环境变量清单见 [`.env.example`](.env.example)（该文件不会被 Spring Boot 自动加载）。
+
+### 10.5 当前验证状态
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| `H2_INTEGRATION` | ✅ 已执行 | 真实 JDBC + 真实 Flyway 迁移 + 真实并发线程（两个连接） |
+| `POSTGRES_LIVE` | ⚠️ **NOT_RUN** | 本机没有 PostgreSQL 服务、没有 Docker、没有 psql，未做任何跳过式伪装 |
+
+> **`POSTGRES_LIVE=NOT_RUN` 不等于 PostgreSQL 已验收。** 目前只在 H2 的 PostgreSQL 兼容模式上
+> 验证过 SQL、约束与并发行为；迁移脚本与 SQL 都是按标准 SQL 编写、预期在 PostgreSQL 上同样成立，
+> 但在真实 PostgreSQL 上跑通之前，不应认为它已被验证。
+
+## 十一、代码约束
 
 - 不使用 Lombok。
 - 不创建空的 Controller、Service、Repository、Entity 占位类。
@@ -387,7 +468,7 @@ NEW --assign--> ASSIGNED --start--> IN_PROGRESS --resolve--> RESOLVED --close-->
 - 不使用通配符版本；子模块不重复声明受 BOM 管理的版本。
 - 不隐藏编译警告，不跳过测试；全部文件使用 UTF-8。
 
-## 十一、后续阶段简述
+## 十二、后续阶段简述
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
@@ -395,8 +476,8 @@ NEW --assign--> ASSIGNED --start--> IN_PROGRESS --resolve--> RESOLVED --close-->
 | FD-0002 | DeepSeek 接入与本地 Tool Calling 冒烟闭环 | ✅ 已完成 |
 | FD-0003 | 工单核心领域模型与生命周期状态机 | ✅ 已完成 |
 | FD-0004 | 工单应用用例、输入输出端口与乐观并发契约 | ✅ 已完成 |
-| 后续 | 工单持久化适配器与数据库迁移 | 未开始 |
-| 后续 | 工单 HTTP 接口（Spring 装配） | 未开始 |
+| FD-0005 | JDBC 持久化适配器、Flyway 迁移与 Spring 装配 | ✅ 已完成 |
+| 后续 | 工单 HTTP 接口与分页搜索 | 未开始 |
 | 后续 | RAG：文档解析、切分、向量化、检索增强 | 未开始 |
 | 后续 | Tool 体系扩展：面向工单与知识的工具注册 | 未开始 |
 | 后续 | MCP：资产 MCP 服务与监控 MCP 服务的能力实现 | 未开始 |

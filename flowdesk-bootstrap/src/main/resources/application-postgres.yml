@@ -1,0 +1,20 @@
+# PostgreSQL profile：连接真实 PostgreSQL 数据库。
+#
+# 使用方式：--spring.profiles.active=postgres，并通过环境变量注入连接信息。
+# 仓库中不保存任何真实用户名、密码或连接串。
+#
+#   $env:FLOWDESK_DB_URL = 'jdbc:postgresql://localhost:5432/flowdesk'
+#   $env:FLOWDESK_DB_USERNAME = '<user>'
+#   $env:FLOWDESK_DB_PASSWORD = '<password>'
+#   java -jar flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar --spring.profiles.active=postgres
+spring:
+  config:
+    activate:
+      on-profile: postgres
+  datasource:
+    url: ${FLOWDESK_DB_URL}
+    username: ${FLOWDESK_DB_USERNAME}
+    password: ${FLOWDESK_DB_PASSWORD}
+    driver-class-name: org.postgresql.Driver
+  flyway:
+    enabled: true

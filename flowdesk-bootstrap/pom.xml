@@ -46,6 +46,17 @@
       <artifactId>spring-boot-starter-actuator</artifactId>
     </dependency>
 
+    <!--
+      默认 profile 使用内存 H2（PostgreSQL 兼容模式）运行，无需数据库密码即可启动。
+      H2 只服务本地开发与自动化测试，生产使用 postgres profile 连接 PostgreSQL。
+      版本由 spring-boot-dependencies 管理。
+    -->
+    <dependency>
+      <groupId>com.h2database</groupId>
+      <artifactId>h2</artifactId>
+      <scope>runtime</scope>
+    </dependency>
+
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-test</artifactId>

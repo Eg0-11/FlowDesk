@@ -12,7 +12,7 @@
 
   <artifactId>flowdesk-infrastructure</artifactId>
   <name>flowdesk-infrastructure</name>
-  <description>基础设施层：数据库、Redis、向量库、模型等适配器；当前只提供 DeepSeek 的 OpenAI 兼容传输适配</description>
+  <description>基础设施层：持久化、模型等外部系统适配器（Spring JDBC 工单存储、DeepSeek 传输适配）</description>
 
   <dependencies>
     <dependency>
@@ -28,6 +28,32 @@
     <dependency>
       <groupId>org.springframework.ai</groupId>
       <artifactId>spring-ai-starter-model-openai</artifactId>
+    </dependency>
+
+    <!-- 工单持久化：显式 SQL + JdbcClient，不使用 JPA。决策理由见 docs/adr/0002。 -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-jdbc</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.flywaydb</groupId>
+      <artifactId>flyway-core</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.flywaydb</groupId>
+      <artifactId>flyway-database-postgresql</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.postgresql</groupId>
+      <artifactId>postgresql</artifactId>
+      <scope>runtime</scope>
+    </dependency>
+
+    <!-- H2 仅用于本地运行与自动化集成测试，不是生产数据库。 -->
+    <dependency>
+      <groupId>com.h2database</groupId>
+      <artifactId>h2</artifactId>
+      <scope>test</scope>
     </dependency>
 
     <dependency>
