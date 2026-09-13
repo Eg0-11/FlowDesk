@@ -9,13 +9,17 @@ import org.springframework.http.ProblemDetail;
 /**
  * FlowDesk 的 HTTP 错误契约。
  *
- * <p>所有错误响应都是 {@code application/problem+json}，并且必然包含：</p>
+ * <p><b>由 FlowDesk 处理</b>的所有错误响应都是 {@code application/problem+json}，并且必然包含：</p>
  * <ul>
  *   <li>{@code type} —— 稳定的问题类型 URI，形如 {@code urn:flowdesk:problem:ticket-not-found}
  *       （由错误码小写化、下划线转连字符得到）；</li>
  *   <li>{@code title}、{@code status}、{@code detail}、{@code instance}；</li>
  *   <li>{@code code} —— 稳定的业务错误码，调用方应当据此分支，而不是解析文案。</li>
  * </ul>
+ *
+ * <p><b>覆盖范围</b>（与 README「错误契约」表逐行对应）：工单业务错误、AI 业务错误、
+ * 请求解析与 Bean Validation 失败，以及四类框架错误 —— 端点不存在、方法不被支持、
+ * 媒体类型不受支持、未预期异常。</p>
  *
  * <p>本类刻意不提供任何把异常信息、SQL、堆栈或请求原文拼进 detail 的能力：
  * detail 一律由调用方传入固定文案。</p>
@@ -56,6 +60,18 @@ public final class FlowDeskProblems {
 
     /** 上游 AI 服务调用失败。 */
     public static final String CODE_AI_PROVIDER_ERROR = "AI_PROVIDER_ERROR";
+
+    /** 请求的路径没有对应端点。 */
+    public static final String CODE_ENDPOINT_NOT_FOUND = "ENDPOINT_NOT_FOUND";
+
+    /** 路径存在但不支持该 HTTP 方法。 */
+    public static final String CODE_METHOD_NOT_ALLOWED = "METHOD_NOT_ALLOWED";
+
+    /** 请求的 {@code Content-Type} 不受支持。 */
+    public static final String CODE_UNSUPPORTED_MEDIA_TYPE = "UNSUPPORTED_MEDIA_TYPE";
+
+    /** 未预期异常，兜底为服务端错误。 */
+    public static final String CODE_INTERNAL_SERVER_ERROR = "INTERNAL_SERVER_ERROR";
 
     private FlowDeskProblems() {
     }

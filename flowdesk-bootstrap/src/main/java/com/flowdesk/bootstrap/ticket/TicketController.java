@@ -10,11 +10,12 @@ import com.flowdesk.application.ticket.port.in.TicketCommandUseCase;
 import com.flowdesk.application.ticket.port.in.TicketQueryUseCase;
 import com.flowdesk.application.ticket.query.GetTicketQuery;
 import com.flowdesk.application.ticket.view.TicketView;
+import com.flowdesk.bootstrap.web.InvalidRequestException;
+import com.flowdesk.domain.ticket.TicketDomainException;
 import com.flowdesk.domain.ticket.TicketId;
 import com.flowdesk.domain.ticket.UserId;
 import jakarta.validation.Valid;
 import java.net.URI;
-import java.util.UUID;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -86,8 +87,8 @@ public class TicketController {
      * @return 200 OK，带 ETag
      */
     @GetMapping("/{ticketId}")
-    public ResponseEntity<TicketResponse> get(@PathVariable UUID ticketId) {
-        return ok(this.ticketQueryUseCase.get(new GetTicketQuery(TicketId.of(ticketId))));
+    public ResponseEntity<TicketResponse> get(@PathVariable String ticketId) {
+        return ok(this.ticketQueryUseCase.get(new GetTicketQuery(parseTicketId(ticketId))));
     }
 
     /**
@@ -99,12 +100,12 @@ public class TicketController {
      * @return 200 OK，带新版本 ETag
      */
     @PostMapping("/{ticketId}/assign")
-    public ResponseEntity<TicketResponse> assign(@PathVariable UUID ticketId,
+    public ResponseEntity<TicketResponse> assign(@PathVariable String ticketId,
             @RequestHeader(name = HttpHeaders.IF_MATCH, required = false) String ifMatch,
             @Valid @RequestBody AssignTicketRequest request) {
 
         long expectedVersion = TicketEtag.requireVersion(ifMatch);
-        return ok(this.ticketCommandUseCase.assign(new AssignTicketCommand(TicketId.of(ticketId),
+        return ok(this.ticketCommandUseCase.assign(new AssignTicketCommand(parseTicketId(ticketId),
                 UserId.of(request.assigneeId()), expectedVersion)));
     }
 
@@ -117,12 +118,12 @@ public class TicketController {
      * @return 200 OK，带新版本 ETag
      */
     @PostMapping("/{ticketId}/reassign")
-    public ResponseEntity<TicketResponse> reassign(@PathVariable UUID ticketId,
+    public ResponseEntity<TicketResponse> reassign(@PathVariable String ticketId,
             @RequestHeader(name = HttpHeaders.IF_MATCH, required = false) String ifMatch,
             @Valid @RequestBody AssignTicketRequest request) {
 
         long expectedVersion = TicketEtag.requireVersion(ifMatch);
-        return ok(this.ticketCommandUseCase.reassign(new ReassignTicketCommand(TicketId.of(ticketId),
+        return ok(this.ticketCommandUseCase.reassign(new ReassignTicketCommand(parseTicketId(ticketId),
                 UserId.of(request.assigneeId()), expectedVersion)));
     }
 
@@ -134,11 +135,11 @@ public class TicketController {
      * @return 200 OK，带新版本 ETag
      */
     @PostMapping("/{ticketId}/start")
-    public ResponseEntity<TicketResponse> start(@PathVariable UUID ticketId,
+    public ResponseEntity<TicketResponse> start(@PathVariable String ticketId,
             @RequestHeader(name = HttpHeaders.IF_MATCH, required = false) String ifMatch) {
 
         long expectedVersion = TicketEtag.requireVersion(ifMatch);
-        return ok(this.ticketCommandUseCase.start(new StartTicketCommand(TicketId.of(ticketId), expectedVersion)));
+        return ok(this.ticketCommandUseCase.start(new StartTicketCommand(parseTicketId(ticketId), expectedVersion)));
     }
 
     /**
@@ -150,12 +151,12 @@ public class TicketController {
      * @return 200 OK，带新版本 ETag
      */
     @PostMapping("/{ticketId}/resolve")
-    public ResponseEntity<TicketResponse> resolve(@PathVariable UUID ticketId,
+    public ResponseEntity<TicketResponse> resolve(@PathVariable String ticketId,
             @RequestHeader(name = HttpHeaders.IF_MATCH, required = false) String ifMatch,
             @Valid @RequestBody ResolveTicketRequest request) {
 
         long expectedVersion = TicketEtag.requireVersion(ifMatch);
-        return ok(this.ticketCommandUseCase.resolve(new ResolveTicketCommand(TicketId.of(ticketId),
+        return ok(this.ticketCommandUseCase.resolve(new ResolveTicketCommand(parseTicketId(ticketId),
                 request.resolution(), expectedVersion)));
     }
 
@@ -167,11 +168,26 @@ public class TicketController {
      * @return 200 OK，带新版本 ETag
      */
     @PostMapping("/{ticketId}/close")
-    public ResponseEntity<TicketResponse> close(@PathVariable UUID ticketId,
+    public ResponseEntity<TicketResponse> close(@PathVariable String ticketId,
             @RequestHeader(name = HttpHeaders.IF_MATCH, required = false) String ifMatch) {
 
         long expectedVersion = TicketEtag.requireVersion(ifMatch);
-        return ok(this.ticketCommandUseCase.close(new CloseTicketCommand(TicketId.of(ticketId), expectedVersion)));
+        return ok(this.ticketCommandUseCase.close(new CloseTicketCommand(parseTicketId(ticketId), expectedVersion)));
+    }
+
+    /**
+     * 严格解析路径中的工单标识。
+     *
+     * <p>刻意绑定为 {@code String} 而不是 {@code UUID}：Spring 默认的 UUID 转换是宽松的，
+     * 会把 {@code 1-1-1-1-1} 这类缩写形式解析成一个看起来正常的 UUID。这里按规范形式
+     * （36 位连字符，忽略大小写）严格校验，失败统一按 400 {@code INVALID_REQUEST} 处理。</p>
+     */
+    private static TicketId parseTicketId(String rawTicketId) {
+        try {
+            return TicketId.parse(rawTicketId);
+        } catch (TicketDomainException ex) {
+            throw new InvalidRequestException("ticketId 必须是规范的 36 位 UUID");
+        }
     }
 
     /**

@@ -5,6 +5,7 @@ import com.flowdesk.application.ticket.TicketApplicationException;
 import com.flowdesk.bootstrap.web.FlowDeskProblems;
 import com.flowdesk.domain.ticket.TicketDomainException;
 import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ProblemDetail;
@@ -36,6 +37,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
  * 已确保不含原始输入的消息，不包含异常类名、堆栈、SQL 或请求原文。</p>
  */
 @RestControllerAdvice
+@Order(10)
 public class TicketExceptionHandler {
 
     /**

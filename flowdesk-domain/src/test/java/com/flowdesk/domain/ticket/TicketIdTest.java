@@ -65,6 +65,26 @@ class TicketIdTest {
     }
 
     @Test
+    void rejectsAbbreviatedFormsThatUuidFromStringWouldSilentlyAccept() {
+        // JDK 的 UUID.fromString 接受缩写分组：1-1-1-1-1 会被静默补齐成
+        // 00000001-0001-0001-0001-000000000001。若沿用该行为，调用方的拼写错误
+        // 会变成「查不到某个工单」，而不是一个明确的 400。
+        assertThat(UUID.fromString("1-1-1-1-1").toString())
+                .isEqualTo("00000001-0001-0001-0001-000000000001");
+
+        for (String abbreviated : new String[] {
+                "1-1-1-1-1",
+                "11111111-2222-3333-4444-555555555555-6666",
+                "111111112222333344445555555555555",
+                "111111112222-3333-4444-555555555555",
+                "11111111_2222_3333_4444_555555555555",
+                "1111-2222-3333-4444-555555555555",
+        }) {
+            assertErrorCode(() -> TicketId.parse(abbreviated), TicketErrorCode.INVALID_TICKET_ID);
+        }
+    }
+
+    @Test
     void doesNotEchoTheInvalidInputInTheException() {
         String sentinel = "sentinel-ticket-id-abcdef";
 

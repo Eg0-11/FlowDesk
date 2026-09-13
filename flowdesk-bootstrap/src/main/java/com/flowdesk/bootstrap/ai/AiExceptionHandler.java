@@ -4,6 +4,7 @@ import com.flowdesk.application.ai.AiProviderException;
 import com.flowdesk.application.ai.AiRequestException;
 import com.flowdesk.bootstrap.web.FlowDeskProblems;
 import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -26,6 +27,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
  * 绝不包含供应商原始报文、堆栈或配置；上游异常的 cause 仅保留在服务端。</p>
  */
 @RestControllerAdvice
+@Order(20)
 public class AiExceptionHandler {
 
     /**
