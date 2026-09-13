@@ -17,6 +17,17 @@ spring:
   flyway:
     enabled: true
 
+  servlet:
+    # multipart 上限：容器侧的第一道栅栏。
+    #
+    # 它**不是**知识文档上传的真正限制依据 —— Content-Length 可被伪造，且并非所有入口都经过
+    # Servlet 容器。应用层会按实际读取到的字节数再限一次（flowdesk.knowledge.upload.max-size）。
+    # 这里保持一致，让「明显过大」的请求尽早被拒；max-request-size 略大，给 multipart 边界留余量。
+    multipart:
+      max-file-size: 20MB
+      max-request-size: 22MB
+      file-size-threshold: 0
+
   # 默认不装配任何模型适配器：没有 API Key 也能启动与测试，且不存在出网可能。
   #
   # OpenAI starter 在类路径上时，除 chat 之外还会自动装配 embedding / image /
@@ -44,3 +55,12 @@ management:
 flowdesk:
   ai:
     enabled: false
+
+  knowledge:
+    upload:
+      # 应用层自己的上传上限：按实际读取到的字节数判断，不依赖 Content-Length 或容器配置。
+      max-size: 20MB
+    storage:
+      # 本地文件系统内容存储的根目录（默认适配器；将来可替换为对象存储）。
+      # 内容写入 <root>/documents，临时文件在 <root>/tmp —— 同根保证原子移动在同一文件系统内。
+      root: data/knowledge

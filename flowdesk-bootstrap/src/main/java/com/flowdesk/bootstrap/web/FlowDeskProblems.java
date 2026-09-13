@@ -17,8 +17,8 @@ import org.springframework.http.ProblemDetail;
  *   <li>{@code code} —— 稳定的业务错误码，调用方应当据此分支，而不是解析文案。</li>
  * </ul>
  *
- * <p><b>覆盖范围</b>（与 README「错误契约」表逐行对应）：工单业务错误、AI 业务错误、
- * 请求解析与 Bean Validation 失败，以及五类框架错误 —— 端点不存在、方法不被支持、
+ * <p><b>覆盖范围</b>（与 README「错误契约」表逐行对应）：工单业务错误、知识文档业务错误、
+ * AI 业务错误、请求解析与 Bean Validation 失败，以及五类框架错误 —— 端点不存在、方法不被支持、
  * 媒体类型不可接受（{@code Accept}）、媒体类型不受支持（{@code Content-Type}）、未预期异常。</p>
  *
  * <p>本类刻意不提供任何把异常信息、SQL、堆栈或请求原文拼进 detail 的能力：
@@ -69,6 +69,15 @@ public final class FlowDeskProblems {
 
     /** 请求的 {@code Content-Type} 不受支持。 */
     public static final String CODE_UNSUPPORTED_MEDIA_TYPE = "UNSUPPORTED_MEDIA_TYPE";
+
+    /** 上传的知识文档类型不受支持（扩展名、媒体类型或文件内容不一致）。 */
+    public static final String CODE_UNSUPPORTED_DOCUMENT_TYPE = "UNSUPPORTED_DOCUMENT_TYPE";
+
+    /** 上传内容超过允许的最大大小。 */
+    public static final String CODE_DOCUMENT_TOO_LARGE = "DOCUMENT_TOO_LARGE";
+
+    /** 知识文档不存在。 */
+    public static final String CODE_KNOWLEDGE_DOCUMENT_NOT_FOUND = "KNOWLEDGE_DOCUMENT_NOT_FOUND";
 
     /**
      * 请求的 {@code Accept} 无法被满足：服务端没有任何可产出的表示能满足它。

@@ -1,12 +1,14 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0007 —— 工单列表、分页、排序与条件搜索（已完成）**
+> **当前阶段：FD-0008 —— 知识文档领域模型与安全上传链路（RAG 1/6，已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
 > 工单 REST 接口 + ETag 并发协议 + 统一错误契约（FD-0006）、
-> 列表接口 + offset 分页 + 排序白名单 + 条件搜索（FD-0007）。
-> 尚未实现：游标/keyset 分页、PostgreSQL 全文检索与 pg_trgm、RAG、MCP 能力、Agent Graph、
+> 列表接口 + offset 分页 + 排序白名单 + 条件搜索（FD-0007）、
+> 知识文档上传 + 原始文件存储 + 元数据查询（FD-0008）。
+> 尚未实现：文档解析与切片、Embedding 与向量库、RAG 检索、文档列表/下载/删除、
+> 孤立文件清理任务、游标分页、PostgreSQL 全文检索与 pg_trgm、MCP 能力、Agent Graph、
 > 鉴权与前端。
 
 ## 一、项目简介
@@ -556,14 +558,18 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | 相同处理人 | 409 | `SAME_ASSIGNEE` |
 | 字段级领域校验失败 | 422 | 保留对应领域错误码 |
 | 持久化快照不自洽 | 500 | `INVALID_PERSISTED_TICKET` |
+| 知识文档：标题/文件名等非法输入、空文件 | 400 | `INVALID_REQUEST` |
+| 知识文档：超过大小限制（含容器侧 multipart 超限） | 413 | `DOCUMENT_TOO_LARGE` |
+| 知识文档：格式不受支持或声明与实际内容不一致 | 415 | `UNSUPPORTED_DOCUMENT_TYPE` |
+| 知识文档不存在 | 404 | `KNOWLEDGE_DOCUMENT_NOT_FOUND` |
 | 路径不存在 | 404 | `ENDPOINT_NOT_FOUND` |
 | 路径存在但方法不支持 | 405 | `METHOD_NOT_ALLOWED`（保留标准 `Allow` 头） |
 | `Accept` 无法被满足 | 406 | `NOT_ACCEPTABLE` |
 | `Content-Type` 不受支持 | 415 | `UNSUPPORTED_MEDIA_TYPE` |
 | 未预期异常 | 500 | `INTERNAL_SERVER_ERROR` |
 
-上表覆盖 FlowDesk 自行处理（以及兜底处理）的全部错误来源：工单业务错误、应用层错误、
-请求解析与 Bean Validation 失败，以及五类框架错误（404 / 405 / 406 / 415 / 500）。
+上表覆盖 FlowDesk 自行处理（以及兜底处理）的全部错误来源：工单业务错误、知识文档业务错误、
+应用层错误、请求解析与 Bean Validation 失败，以及五类框架错误（404 / 405 / 406 / 415 / 500）。
 除 405 按 RFC 9110 保留 `Allow` 头外，所有错误响应体形状一致。
 
 **406 与 415 方向相反**：415 是「你发来的请求体我读不懂」（`Content-Type`），
@@ -686,8 +692,11 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0005 | JDBC 持久化适配器、Flyway 迁移与 Spring 装配 | ✅ 已完成 |
 | FD-0006 | 工单 REST API、ProblemDetail 与 ETag 并发协议 | ✅ 已完成 |
 | FD-0007 | 工单列表、分页、排序与条件搜索 | ✅ 已完成 |
+| FD-0008 | 知识文档领域模型与安全上传链路（RAG 1/6） | ✅ 已完成 |
+| 后续 | RAG 2/6：文档解析与切片 | 未开始 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm` | 未开始 |
-| 后续 | RAG：文档解析、切分、向量化、检索增强 | 未开始 |
+| 后续 | RAG：向量化、向量库与检索增强 | 未开始 |
+| 后续 | 孤立文件清理任务 | 未开始 |
 | 后续 | Tool 体系扩展：面向工单与知识的工具注册 | 未开始 |
 | 后续 | MCP：资产 MCP 服务与监控 MCP 服务的能力实现 | 未开始 |
 | 后续 | Agent Graph：基于 Spring AI Alibaba Agent Framework 的多节点编排 | 未开始 |
@@ -696,7 +705,8 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 
 | 项 | 状态 | 含义 |
 | --- | --- | --- |
-| H2 集成 / HTTP 集成 | ✅ 已执行 | 真实 Spring 上下文、真实 JDBC、真实 Flyway 迁移（V1+V2）、真实并发线程 |
+| H2 集成 / HTTP 集成 | ✅ 已执行 | 真实 Spring 上下文、真实 JDBC、真实 Flyway 迁移（V1+V2+V3）、真实并发线程、真实文件系统与真实 multipart 上传 |
+| 本地 smoke（默认 profile） | ✅ 已执行 | 真实进程 + 真实 HTTP multipart 上传 + 存储目录落盘校验（见 FD-0008 交付报告） |
 | PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证** |
 | 真实 DeepSeek | ⚠️ **LIVE_SMOKE=NOT_RUN** | 无 `DEEPSEEK_API_KEY`，**未对真实模型发起过任何请求** |
 
@@ -705,3 +715,101 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 
 > Spring AI Alibaba 的 BOM 已在根 pom 中导入并锁定版本，但其 Agent Framework 制品尚未使用；
 > 后续阶段接入时直接复用现有 BOM，不需要改动版本基线。
+
+## 十五、知识文档上传（RAG 1/6）
+
+设计取舍见 [`docs/adr/0005-knowledge-document-upload-storage.md`](docs/adr/0005-knowledge-document-upload-storage.md)。
+
+本阶段只做「收进来 + 查得到」：**不做**文档解析、切片、Embedding、向量库与 RAG 检索，
+也没有文档列表、下载、删除或版本更新接口。
+
+### 15.1 接口表
+
+统一前缀 `/api/v1/knowledge/documents`。
+
+| 方法 | 路径 | 请求 | 成功响应 |
+| --- | --- | --- | --- |
+| POST | `/api/v1/knowledge/documents` | `multipart/form-data`：`title`（必填）+ `file`（必填） | 201 Created + `Location` |
+| GET | `/api/v1/knowledge/documents/{documentId}` | 无 | 200 OK |
+
+响应字段：`id`、`title`、`originalFilename`、`format`、`mediaType`、`sizeBytes`、`sha256`、
+`status`、`version`、`createdAt`、`updatedAt`。
+
+**响应里绝不出现 `contentKey`、磁盘路径、临时文件路径或存储根目录** ——
+视图类型里根本没有这些字段（有反射测试锁定），因此这条约束不依赖响应组装时的纪律。
+
+```json
+{
+  "id": "4fac368c-64ca-41ab-9ab8-a27502e814f6",
+  "title": "季度运维报告",
+  "originalFilename": "report.pdf",
+  "format": "PDF",
+  "mediaType": "application/pdf",
+  "sizeBytes": 1024,
+  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "status": "UPLOADED",
+  "version": 0,
+  "createdAt": "2026-09-13T14:12:04.873200Z",
+  "updatedAt": "2026-09-13T14:12:04.873200Z"
+}
+```
+
+### 15.2 支持的文件类型与内容校验
+
+| 格式 | 扩展名 | 内容校验 |
+| --- | --- | --- |
+| PDF | `.pdf` | 文件头必须是 `%PDF-` |
+| DOCX | `.docx` | 必须是 ZIP 容器（本地文件头 `PK\x03\x04`）；**不解压、不解析正文** |
+| Markdown | `.md` | 必须是合法 UTF-8，且不含 NUL |
+| Text | `.txt` | 同上 |
+
+- 扩展名**大小写不敏感**；
+- `Content-Type` 为空或 `application/octet-stream` → 视为未声明，按扩展名 + 内容识别；
+- 明确声明了不兼容的 `Content-Type`（例如 `image/png` 配 `report.pdf`）→ 415；
+- 原始文件名先按 `/` 与 `\` 取最后一段（兼容 `C:\fakepath\file.txt`），
+  领域层再拒绝任何含路径分隔符或控制字符的值；
+- **原始文件名只作为元数据，绝不参与磁盘路径拼接**。
+
+### 15.3 大小限制与流式处理
+
+- 默认上限 **20 MiB**，可配置：`flowdesk.knowledge.upload.max-size=20MB`；
+- 同时配置容器侧 `spring.servlet.multipart.max-file-size` / `max-request-size`，但**不只依赖它**：
+  应用层按**实际读取到的字节数**限流，因此伪造的 `Content-Length` 或错误的声明大小都会被拦住
+  （二者都有真实容器测试覆盖）；
+- 禁止 `MultipartFile.getBytes()`，禁止把整个文件载入内存：固定缓冲区边复制边计算 SHA-256；
+- 实际大小为 0 时在**移动之前**拒绝；超限时立刻停止读取并清理临时文件；`InputStream` 总是被关闭。
+
+### 15.4 存储布局与一致性
+
+```
+<flowdesk.knowledge.storage.root>/
+├─ documents/<contentKey>      # 最终对象；contentKey = kdoc-<文档标识>，由服务端生成
+└─ tmp/upload-*.part           # 临时文件；成功后原子移动，失败即清理
+```
+
+- 内容键由**服务端根据文档标识**派生，客户端无法影响；解析路径时还要通过字符集白名单与
+  「必须仍在存储根目录内」的包含性检查；
+- 优先 `ATOMIC_MOVE`，文件系统不支持时安全降级为同目录移动；**绝不覆盖已有对象**；
+- 上传顺序固定为：校验命令与文件元数据 → 生成文档标识 → 流式写临时文件并算摘要 →
+  原子移动到最终位置 → 插入元数据 → 返回。**文件复制期间不持有数据库事务**；
+- 元数据写入失败 → 调用 `contentStore.delete(contentKey)` 补偿；补偿失败**只可能留下孤立文件**，
+  **绝不会留下指向不存在内容的元数据记录**；
+- **已知边界**：进程在「内容已落盘」与「元数据写入」之间崩溃仍可能留下孤立文件，
+  本阶段不实现清理任务（见 ADR 0005）。
+
+### 15.5 数据与错误契约
+
+`knowledge_documents` 表由 Flyway **V3** 建立：`content_key` 唯一，`sha256` 只建**普通索引**
+（相同内容允许作为不同逻辑文档上传），并对 `size_bytes > 0`、`version >= 0`、
+枚举取值、摘要长度与小写、时间链设有 CHECK 约束。
+
+| 场景 | HTTP | code |
+| --- | --- | --- |
+| 标题、文件名等非法输入（含领域字段校验失败） | 400 | `INVALID_REQUEST` |
+| 空文件 | 400 | `INVALID_REQUEST` |
+| 超过大小限制（应用侧或容器侧 multipart 上限） | 413 | `DOCUMENT_TOO_LARGE` |
+| 不支持的格式、扩展名/Content-Type/文件头不一致、非法 UTF-8 或含 NUL | 415 | `UNSUPPORTED_DOCUMENT_TYPE` |
+| 文档不存在 | 404 | `KNOWLEDGE_DOCUMENT_NOT_FOUND` |
+| 内容存储 / 元数据存储失败、快照损坏 | 500 | `INTERNAL_SERVER_ERROR` |
+
+错误 `detail` 一律是固定安全文案：不含原始文件名、标题原文、内容键、本地路径、SQL、异常类名或堆栈。

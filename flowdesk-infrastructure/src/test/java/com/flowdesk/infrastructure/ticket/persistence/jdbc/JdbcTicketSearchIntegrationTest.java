@@ -128,8 +128,14 @@ class JdbcTicketSearchIntegrationTest {
     // ---------- ① 迁移与索引 ----------
 
     @Test
-    void flywayAppliesBothMigrations() {
-        assertThat(migrateResult.migrationsExecuted).as("V1 + V2").isEqualTo(2);
+    void flywayAppliesAllMigrations() {
+        assertThat(migrateResult.migrationsExecuted).as("V1 建表 + V2 搜索索引 + V3 知识文档表").isEqualTo(3);
+        assertThat(jdbcClient
+                .sql("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'knowledge_documents'")
+                .query(Long.class)
+                .single())
+                .as("V3 建立的知识文档表与工单表共存")
+                .isEqualTo(1L);
     }
 
     @Test
