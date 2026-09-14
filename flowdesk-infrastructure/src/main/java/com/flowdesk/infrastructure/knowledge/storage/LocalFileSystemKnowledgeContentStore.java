@@ -3,6 +3,7 @@ package com.flowdesk.infrastructure.knowledge.storage;
 import com.flowdesk.application.knowledge.KnowledgeApplicationErrorCode;
 import com.flowdesk.application.knowledge.KnowledgeApplicationException;
 import com.flowdesk.application.knowledge.port.out.ContentSource;
+import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentContentReader;
 import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentContentStore;
 import com.flowdesk.application.knowledge.port.out.StoredContent;
 import com.flowdesk.domain.knowledge.KnowledgeDocumentId;
@@ -13,8 +14,10 @@ import java.io.OutputStream;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileSystemException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
@@ -43,7 +46,8 @@ import java.util.regex.Pattern;
  *   <li><b>流式处理。</b>固定大小缓冲区边读边算 SHA-256，绝不把文件整体载入内存。</li>
  * </ul>
  */
-public final class LocalFileSystemKnowledgeContentStore implements KnowledgeDocumentContentStore {
+public final class LocalFileSystemKnowledgeContentStore
+        implements KnowledgeDocumentContentStore, KnowledgeDocumentContentReader {
 
     /** 内容对象所在子目录。 */
     private static final String DOCUMENTS_DIRECTORY = "documents";
@@ -148,6 +152,45 @@ public final class LocalFileSystemKnowledgeContentStore implements KnowledgeDocu
         catch (IOException ex) {
             throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.CONTENT_STORAGE_FAILURE,
                     "内容删除失败", ex);
+        }
+    }
+
+    /**
+     * 按内容键打开原始内容流（FD-0009 的读取端口）。
+     *
+     * <p>读写两个端口由同一个适配器实现是<b>有意</b>的：它们共享同一套路径安全解析
+     * （字符集白名单 + 必须仍在存储根目录内），拆成两个类只会把这段安全逻辑复制两份。</p>
+     *
+     * <p>只读取<b>普通文件</b>且<b>不跟随符号链接</b>：{@code isRegularFile(..., NOFOLLOW_LINKS)}
+     * 对符号链接返回 {@code false}，因此指向根目录之外（甚至指向 {@code /etc/passwd}）的链接
+     * 在这里就被拒绝，而不是等到读出来才发现。异常只携带稳定错误码，
+     * <b>不</b>包含真实路径。</p>
+     *
+     * @param contentKey 服务端生成的内容键
+     * @return 内容输入流，由调用方关闭
+     */
+    @Override
+    public InputStream openStream(String contentKey) {
+        Path target;
+        try {
+            target = resolveWithinRoot(this.documentsRoot, contentKey);
+        }
+        catch (KnowledgeApplicationException ex) {
+            // 读取路径上的「内容键非法 / 路径越界」与「对象不存在」对应用层是同一件事：
+            // 原始内容不可读。写路径（store/delete）保持 CONTENT_STORAGE_FAILURE 语义。
+            throw new KnowledgeApplicationException(
+                    KnowledgeApplicationErrorCode.DOCUMENT_CONTENT_UNREADABLE, "原始内容不可读", ex);
+        }
+        try {
+            if (!Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS)) {
+                throw new KnowledgeApplicationException(
+                        KnowledgeApplicationErrorCode.DOCUMENT_CONTENT_UNREADABLE, "原始内容不可读");
+            }
+            return Files.newInputStream(target, StandardOpenOption.READ);
+        }
+        catch (IOException ex) {
+            throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.DOCUMENT_CONTENT_UNREADABLE,
+                    "原始内容不可读", ex);
         }
     }
 

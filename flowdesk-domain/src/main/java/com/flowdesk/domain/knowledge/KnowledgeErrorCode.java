@@ -38,6 +38,15 @@ public enum KnowledgeErrorCode {
     /** 时间缺失或时间链不成立（{@code createdAt > updatedAt}）。 */
     INVALID_TIMELINE,
 
+    /** 当前状态不允许该操作（例如重复领取、对非 PARSING 状态调用完成）。 */
+    ILLEGAL_STATUS_TRANSITION,
+
+    /** 解析失败码缺失或不该出现时出现了。 */
+    INVALID_PARSE_FAILURE_CODE,
+
+    /** 切片不满足自身不变量（序号、内容、计数或摘要）。 */
+    INVALID_CHUNK,
+
     /** 从持久化快照恢复时发现快照自相矛盾（数据损坏，非调用方错误）。 */
     INVALID_RESTORED_STATE
 }

@@ -44,6 +44,15 @@
     <spring-ai.version>1.1.2</spring-ai.version>
     <spring-ai-alibaba.version>1.1.2.2</spring-ai-alibaba.version>
 
+    <!--
+      文档解析（FD-0009）：Apache Tika 3.x。
+
+      单一显式属性锁定版本：BOM 不管理 Tika，因此所有 Tika 制品共用这一个版本，
+      不会出现「core 与 parsers 版本不一致」这种最难排查的组合。
+      刻意不使用 tika-app（它把 CLI 与全部解析器打成一个胖 jar，会带入大量无关依赖）。
+    -->
+    <tika.version>3.3.2</tika.version>
+
     <!-- 构建插件版本（BOM 未管理者显式锁定，避免依赖漂移） -->
     <maven-enforcer-plugin.version>3.5.0</maven-enforcer-plugin.version>
   </properties>
@@ -113,6 +122,18 @@
         <version>${spring-ai-alibaba.version}</version>
         <type>pom</type>
         <scope>import</scope>
+      </dependency>
+
+      <!-- 文档解析（FD-0009）：两者共用 ${tika.version}，不允许子模块各自写版本 -->
+      <dependency>
+        <groupId>org.apache.tika</groupId>
+        <artifactId>tika-core</artifactId>
+        <version>${tika.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.tika</groupId>
+        <artifactId>tika-parsers-standard-package</artifactId>
+        <version>${tika.version}</version>
       </dependency>
     </dependencies>
   </dependencyManagement>

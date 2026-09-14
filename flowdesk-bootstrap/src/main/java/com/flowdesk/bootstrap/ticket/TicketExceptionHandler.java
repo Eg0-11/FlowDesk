@@ -16,9 +16,10 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 /**
  * 工单业务异常到 HTTP 状态码与错误码的映射。
  *
- * <p>只处理工单自己的异常类型，因此与 AI 的异常处理<b>互不误伤</b>：
+ * <p>只处理工单自己的异常类型，因此与 AI、知识文档的异常处理<b>互不误伤</b>：
  * 请求解析与 Bean Validation 由 {@code ApiRequestExceptionHandler} 统一处理，
- * AI 的业务异常由 {@code AiExceptionHandler} 处理，本类不再声明它们。</p>
+ * AI 的业务异常由 {@code AiExceptionHandler} 处理，{@code If-Match} 前置条件由
+ * {@code PreconditionExceptionHandler} 统一处理（工单与知识文档共用一套协议）。</p>
  *
  * <table border="1">
  *   <caption>映射矩阵</caption>
@@ -42,29 +43,11 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 public class TicketExceptionHandler {
 
     /**
-     * 缺少 {@code If-Match}：状态变更接口要求版本前置条件。
-     */
-    @ExceptionHandler(MissingIfMatchException.class)
-    public ResponseEntity<ProblemDetail> handleMissingIfMatch(MissingIfMatchException ex,
-            HttpServletRequest request) {
-
-        return problem(HttpStatus.PRECONDITION_REQUIRED, FlowDeskProblems.CODE_PRECONDITION_REQUIRED,
-                "缺少版本前置条件", "状态变更请求必须携带 If-Match 头", request);
-    }
-
-    /**
-     * {@code If-Match} 格式非法。
-     */
-    @ExceptionHandler(InvalidIfMatchException.class)
-    public ResponseEntity<ProblemDetail> handleInvalidIfMatch(InvalidIfMatchException ex,
-            HttpServletRequest request) {
-
-        return problem(HttpStatus.BAD_REQUEST, FlowDeskProblems.CODE_INVALID_IF_MATCH, "版本前置条件非法",
-                "If-Match 必须是单个强类型十进制 ETag，例如 \"0\"", request);
-    }
-
-    /**
      * 应用层异常。
+     *
+     * <p>{@code If-Match} 的缺失（428）与格式非法（400）不在这里处理：
+     * 那是两类资源共用的 HTTP 协议层映射，见
+     * {@link com.flowdesk.bootstrap.web.PreconditionExceptionHandler}。</p>
      */
     @ExceptionHandler(TicketApplicationException.class)
     public ResponseEntity<ProblemDetail> handleApplicationException(TicketApplicationException ex,

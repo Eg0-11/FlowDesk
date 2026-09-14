@@ -1,19 +1,30 @@
 package com.flowdesk.infrastructure.knowledge;
 
+import com.flowdesk.application.knowledge.port.out.DocumentChunker;
+import com.flowdesk.application.knowledge.port.out.DocumentTextParser;
+import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentChunkStore;
 import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentContentStore;
 import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentIdGenerator;
 import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentRepository;
 import com.flowdesk.application.knowledge.port.out.KnowledgeTimeProvider;
+import com.flowdesk.infrastructure.knowledge.chunking.DeterministicDocumentChunker;
+import com.flowdesk.infrastructure.knowledge.chunking.KnowledgeChunkingProperties;
+import com.flowdesk.infrastructure.knowledge.parsing.TikaDocumentTextParser;
+import com.flowdesk.infrastructure.knowledge.persistence.jdbc.JdbcKnowledgeDocumentChunkStore;
 import com.flowdesk.infrastructure.knowledge.persistence.jdbc.JdbcKnowledgeDocumentRepository;
 import com.flowdesk.infrastructure.knowledge.storage.LocalFileSystemKnowledgeContentStore;
 import com.flowdesk.infrastructure.knowledge.support.SystemKnowledgeTimeProvider;
 import com.flowdesk.infrastructure.knowledge.support.UuidKnowledgeDocumentIdGenerator;
 import java.time.Clock;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.web.servlet.MultipartProperties;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionOperations;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * 知识文档基础设施装配。
@@ -32,7 +43,8 @@ import org.springframework.jdbc.core.simple.JdbcClient;
  * 应用服务只拿到一个 {@code long}，不认识 Spring 的 {@code DataSize}。</p>
  */
 @Configuration(proxyBeanMethods = false)
-@EnableConfigurationProperties({ KnowledgeUploadProperties.class, KnowledgeStorageProperties.class })
+@EnableConfigurationProperties({ KnowledgeUploadProperties.class, KnowledgeStorageProperties.class,
+        KnowledgeChunkingProperties.class })
 public class KnowledgeConfiguration {
 
     /**
@@ -53,20 +65,101 @@ public class KnowledgeConfiguration {
     }
 
     /**
+     * 知识文档写事务模板：CAS 更新、切片替换与状态更新需要显式事务边界。
+     *
+     * <p>与列表查询的只读模板无关：这里的写事务很短（解析与切片都在事务之外完成）。</p>
+     *
+     * @param transactionManager Spring Boot 自动配置的数据源事务管理器
+     * @return 写事务模板
+     */
+    @Bean
+    public TransactionOperations knowledgeWriteTransactions(PlatformTransactionManager transactionManager) {
+        return new TransactionTemplate(transactionManager);
+    }
+
+    /**
      * @param jdbcClient JDBC 客户端
      * @return 元数据仓储
      */
     @Bean
-    public KnowledgeDocumentRepository knowledgeDocumentRepository(JdbcClient jdbcClient) {
-        return new JdbcKnowledgeDocumentRepository(jdbcClient);
+    public JdbcKnowledgeDocumentRepository knowledgeDocumentRepository(JdbcClient jdbcClient,
+            @Qualifier("knowledgeWriteTransactions") TransactionOperations knowledgeWriteTransactions) {
+
+        return new JdbcKnowledgeDocumentRepository(jdbcClient, knowledgeWriteTransactions);
     }
 
     /**
+     * @param jdbcClient             JDBC 客户端
+     * @param knowledgeWriteTransactions 写事务模板
+     * @param documentRepository     文档仓储（同一事务内复用）
+     * @return 切片与「完成解析」的原子存储
+     */
+    @Bean
+    public KnowledgeDocumentChunkStore knowledgeDocumentChunkStore(JdbcClient jdbcClient,
+            @Qualifier("knowledgeWriteTransactions") TransactionOperations knowledgeWriteTransactions,
+            JdbcKnowledgeDocumentRepository documentRepository) {
+
+        return new JdbcKnowledgeDocumentChunkStore(jdbcClient, knowledgeWriteTransactions, documentRepository);
+    }
+
+    /**
+     * 文档文本提取适配器（Apache Tika 3.x）。
+     *
+     * @param chunking 切片配置（提供提取文本上限）
+     * @return 文本提取端口
+     */
+    @Bean
+    public DocumentTextParser documentTextParser(KnowledgeChunkingProperties chunking) {
+        return new TikaDocumentTextParser(chunking.getMaxExtractedCodePoints());
+    }
+
+    /**
+     * 确定性切片适配器。
+     *
+     * @param chunking 切片配置
+     * @return 切片端口
+     */
+    @Bean
+    public DocumentChunker documentChunker(KnowledgeChunkingProperties chunking) {
+        return new DeterministicDocumentChunker(chunking.getChunkSize(), chunking.getOverlap(),
+                chunking.getMaxChunks());
+    }
+
+    /**
+     * 启动期校验切片与解析规模配置。
+     *
+     * <p>Bean 在装配阶段创建，因此非法配置（chunk-size 超过列容量、overlap 不小于 chunk-size、
+     * 上限组合溢出等）会让应用<b>启动失败</b>，而不是等到解析某个文档时才在运行期暴露。</p>
+     *
+     * <p>刻意<b>不</b>校验「提取文本上限 vs 上传大小上限」的关系：两者量纲不同 ——
+     * 上传上限约束的是压缩后的字节数，而提取上限约束的是解压后的文本量，
+     * 一个 1KB 的 DOCX 完全可能展开出数兆文本。提取上限存在的意义正是挡住这类解压炸弹，
+     * 因此它与上传上限之间不存在「必须大于/小于」的固定关系。</p>
+     *
+     * @param chunking 切片配置
+     * @return 校验通过标记
+     */
+    @Bean
+    public Boolean knowledgeChunkingConsistency(KnowledgeChunkingProperties chunking) {
+        chunking.validate();
+        return Boolean.TRUE;
+    }
+
+    /**
+     * 本地文件系统内容存储。
+     *
+     * <p>Bean 的声明类型是具体类而不是端口接口：同一个适配器同时实现
+     * {@link KnowledgeDocumentContentStore}（写）与
+     * {@link com.flowdesk.application.knowledge.port.out.KnowledgeDocumentContentReader}（读），
+     * 两条路径共用同一份路径安全校验。声明为具体类后，按任一端口类型注入都能拿到它。</p>
+     *
      * @param properties 存储配置
      * @return 本地文件系统内容存储
      */
     @Bean
-    public KnowledgeDocumentContentStore knowledgeDocumentContentStore(KnowledgeStorageProperties properties) {
+    public LocalFileSystemKnowledgeContentStore knowledgeDocumentContentStore(
+            KnowledgeStorageProperties properties) {
+
         return new LocalFileSystemKnowledgeContentStore(properties.getRoot());
     }
 

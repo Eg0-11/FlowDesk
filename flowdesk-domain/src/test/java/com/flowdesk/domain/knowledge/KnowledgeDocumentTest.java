@@ -46,8 +46,13 @@ class KnowledgeDocumentTest {
     }
 
     @Test
-    void theOnlyStatusInThisStageIsUploaded() {
-        assertThat(KnowledgeDocumentStatus.values()).containsExactly(KnowledgeDocumentStatus.UPLOADED);
+    void theStatusSetIsExactlyTheParseLifecycle() {
+        // FD-0009 起文档有完整的解析状态机：状态只有这四个，多一个都意味着契约被悄悄改动
+        assertThat(KnowledgeDocumentStatus.values()).containsExactly(
+                KnowledgeDocumentStatus.UPLOADED,
+                KnowledgeDocumentStatus.PARSING,
+                KnowledgeDocumentStatus.PARSED,
+                KnowledgeDocumentStatus.PARSE_FAILED);
     }
 
     @Test
@@ -151,10 +156,59 @@ class KnowledgeDocumentTest {
         String sentinel = "sentinel-../evil";
 
         assertThatThrownBy(() -> KnowledgeDocument.restore(ID, TITLE, sentinel, DocumentFormat.TEXT, "text/plain",
-                10L, Sha256Digest.of(DIGEST), CONTENT_KEY, KnowledgeDocumentStatus.UPLOADED, NOW, NOW))
+                10L, Sha256Digest.of(DIGEST), CONTENT_KEY, KnowledgeDocumentStatus.UPLOADED, NOW, NOW,
+                null, null, null))
                 .isInstanceOf(KnowledgeDomainException.class)
                 .hasMessageNotContaining(sentinel)
                 .hasMessageContaining(KnowledgeErrorCode.INVALID_ORIGINAL_FILENAME.name());
+    }
+
+    @Test
+    void restoresParsedAndFailedSnapshotsWithTheirParseFields() {
+        KnowledgeDocument parsed = restore(DocumentFormat.TEXT, "notes.txt", "text/plain", 10L,
+                Sha256Digest.of(DIGEST), CONTENT_KEY, KnowledgeDocumentStatus.PARSED, NOW, NOW.plusSeconds(5),
+                NOW.plusSeconds(5), null, null);
+
+        assertThat(parsed.status()).isEqualTo(KnowledgeDocumentStatus.PARSED);
+        assertThat(parsed.parsedAt()).isEqualTo(NOW.plusSeconds(5));
+        assertThat(parsed.parseFailedAt()).isNull();
+        assertThat(parsed.parseFailureCode()).isNull();
+
+        KnowledgeDocument failed = restore(DocumentFormat.TEXT, "notes.txt", "text/plain", 10L,
+                Sha256Digest.of(DIGEST), CONTENT_KEY, KnowledgeDocumentStatus.PARSE_FAILED, NOW,
+                NOW.plusSeconds(5), null, NOW.plusSeconds(5), KnowledgeParseFailureCode.CORRUPTED_DOCUMENT);
+
+        assertThat(failed.status()).isEqualTo(KnowledgeDocumentStatus.PARSE_FAILED);
+        assertThat(failed.parsedAt()).isNull();
+        assertThat(failed.parseFailedAt()).isEqualTo(NOW.plusSeconds(5));
+        assertThat(failed.parseFailureCode()).isEqualTo(KnowledgeParseFailureCode.CORRUPTED_DOCUMENT);
+    }
+
+    @Test
+    void restoreRejectsSnapshotsWhoseStatusAndParseFieldsDisagree() {
+        // PARSED 必须带 parsedAt
+        assertRestoreRejected(KnowledgeDocumentStatus.PARSED, NOW, NOW, null, null, null);
+        // PARSED 不得同时带失败信息
+        assertRestoreRejected(KnowledgeDocumentStatus.PARSED, NOW, NOW, NOW, NOW,
+                KnowledgeParseFailureCode.PARSER_FAILURE);
+        // PARSE_FAILED 必须同时带失败时间与失败码
+        assertRestoreRejected(KnowledgeDocumentStatus.PARSE_FAILED, NOW, NOW, null, NOW, null);
+        assertRestoreRejected(KnowledgeDocumentStatus.PARSE_FAILED, NOW, NOW, null, null,
+                KnowledgeParseFailureCode.PARSER_FAILURE);
+        // UPLOADED / PARSING 不得携带任何解析结果字段
+        assertRestoreRejected(KnowledgeDocumentStatus.UPLOADED, NOW, NOW, NOW, null, null);
+        assertRestoreRejected(KnowledgeDocumentStatus.PARSING, NOW, NOW, null, NOW,
+                KnowledgeParseFailureCode.PARSER_FAILURE);
+    }
+
+    @Test
+    void restoreRejectsParseTimesOutsideTheDocumentWindow() {
+        // parsedAt 早于 createdAt
+        assertRestoreRejected(KnowledgeDocumentStatus.PARSED, NOW, NOW.plusSeconds(5), NOW.minusSeconds(1),
+                null, null);
+        // parsedAt 晚于 updatedAt
+        assertRestoreRejected(KnowledgeDocumentStatus.PARSED, NOW, NOW.plusSeconds(5), NOW.plusSeconds(6),
+                null, null);
     }
 
     // ---------- 相等性与日志安全 ----------
@@ -184,12 +238,16 @@ class KnowledgeDocumentTest {
     }
 
     @Test
-    void aggregateExposesNoMutators() {
-        // 本阶段文档不可变：没有任何 setter 或状态流转方法
+    void aggregateExposesNoRawMutators() {
+        // 元数据不可变：没有任何 setter，也没有「直接改状态」的通用入口。
+        // 状态只能经由 markParsing / markParsed / markParseFailed 三个领域行为转换。
         assertThat(KnowledgeDocument.class.getMethods())
                 .noneMatch(method -> method.getName().startsWith("set"))
                 .noneMatch(method -> method.getName().equals("update"))
-                .noneMatch(method -> method.getName().equals("changeStatus"));
+                .noneMatch(method -> method.getName().equals("changeStatus"))
+                .anyMatch(method -> method.getName().equals("markParsing"))
+                .anyMatch(method -> method.getName().equals("markParsed"))
+                .anyMatch(method -> method.getName().equals("markParseFailed"));
     }
 
     // ---------- 辅助 ----------
@@ -205,8 +263,17 @@ class KnowledgeDocumentTest {
             long sizeBytes, Sha256Digest digest, String contentKey, KnowledgeDocumentStatus status,
             Instant createdAt, Instant updatedAt) {
 
+        return restore(format, fileName, mediaType, sizeBytes, digest, contentKey, status, createdAt, updatedAt,
+                null, null, null);
+    }
+
+    private static KnowledgeDocument restore(DocumentFormat format, String fileName, String mediaType,
+            long sizeBytes, Sha256Digest digest, String contentKey, KnowledgeDocumentStatus status,
+            Instant createdAt, Instant updatedAt, Instant parsedAt, Instant parseFailedAt,
+            KnowledgeParseFailureCode failureCode) {
+
         return KnowledgeDocument.restore(ID, TITLE, fileName, format, mediaType, sizeBytes, digest, contentKey,
-                status, createdAt, updatedAt);
+                status, createdAt, updatedAt, parsedAt, parseFailedAt, failureCode);
     }
 
     private static void assertRestoreRejected(DocumentFormat format, String fileName, String mediaType,
@@ -215,6 +282,14 @@ class KnowledgeDocumentTest {
 
         assertError(KnowledgeErrorCode.INVALID_RESTORED_STATE, () -> restore(format, fileName, mediaType,
                 sizeBytes, digest, contentKey, status, createdAt, updatedAt));
+    }
+
+    private static void assertRestoreRejected(KnowledgeDocumentStatus status, Instant createdAt, Instant updatedAt,
+            Instant parsedAt, Instant parseFailedAt, KnowledgeParseFailureCode failureCode) {
+
+        assertError(KnowledgeErrorCode.INVALID_RESTORED_STATE,
+                () -> restore(DocumentFormat.TEXT, "notes.txt", "text/plain", 10L, Sha256Digest.of(DIGEST),
+                        CONTENT_KEY, status, createdAt, updatedAt, parsedAt, parseFailedAt, failureCode));
     }
 
     private static void assertError(KnowledgeErrorCode expected, Runnable callable) {

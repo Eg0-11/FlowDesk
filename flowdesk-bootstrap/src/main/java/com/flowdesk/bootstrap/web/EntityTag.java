@@ -1,9 +1,10 @@
-package com.flowdesk.bootstrap.ticket;
+package com.flowdesk.bootstrap.web;
 
 /**
- * 工单版本的 ETag 表示与 {@code If-Match} 解析。
+ * 版本前置条件的 ETag 表示与 {@code If-Match} 解析（各资源类型共用）。
  *
- * <p>版本只从 {@code If-Match} 获取，请求体中不允许出现 {@code expectedVersion}。</p>
+ * <p>工单与知识文档都用「资源版本 = ETag」的乐观并发协议，因此解析规则只应有<b>一份实现</b>：
+ * 两个接口各自实现一遍，迟早会在「前导零算不算合法」这类细节上分叉。</p>
  *
  * <h2>接受的形式</h2>
  * <p>只接受<b>单个、强类型、规范十进制</b>的 ETag：{@code "0"}、{@code "1"}、{@code "25"}。
@@ -19,19 +20,23 @@ package com.flowdesk.bootstrap.ticket;
  *   <li>前导零：{@code "01"}；</li>
  *   <li>超出 {@code long} 范围。</li>
  * </ul>
+ *
+ * <p>缺失与非法分别抛 {@link MissingIfMatchException}（→ 428）与
+ * {@link InvalidIfMatchException}（→ 400 {@code INVALID_IF_MATCH}），
+ * 由各自的异常处理器映射为统一错误契约。</p>
  */
-final class TicketEtag {
+public final class EntityTag {
 
     private static final char QUOTE = '"';
 
-    private TicketEtag() {
+    private EntityTag() {
     }
 
     /**
      * @param version 版本号
      * @return 形如 {@code "3"} 的 ETag 头值
      */
-    static String format(long version) {
+    public static String format(long version) {
         return QUOTE + Long.toString(version) + QUOTE;
     }
 
@@ -43,7 +48,7 @@ final class TicketEtag {
      * @throws MissingIfMatchException 头不存在
      * @throws InvalidIfMatchException 头存在但格式非法
      */
-    static long requireVersion(String ifMatchHeader) {
+    public static long requireVersion(String ifMatchHeader) {
         if (ifMatchHeader == null) {
             throw new MissingIfMatchException();
         }

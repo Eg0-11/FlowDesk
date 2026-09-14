@@ -44,4 +44,21 @@ public interface KnowledgeDocumentRepository {
      *                                       {@link KnowledgeApplicationErrorCode#INVALID_PERSISTED_DOCUMENT}
      */
     Optional<VersionedKnowledgeDocument> findById(KnowledgeDocumentId documentId);
+
+    /**
+     * 以 compare-and-set 方式更新文档（FD-0009 解析状态机使用）。
+     *
+     * <p><b>必须原子</b>：只有当存储中的当前版本等于 {@code expectedVersion} 时才写入，
+     * 并把版本<b>严格加 1</b>；否则不产生任何写入。实现要么用行锁 + 条件更新，
+     * 要么用带版本条件的单条 UPDATE —— <b>不允许</b>「先查后改但无条件 update」。</p>
+     *
+     * <p>版本不匹配时抛 {@link KnowledgeApplicationErrorCode#KNOWLEDGE_DOCUMENT_VERSION_CONFLICT}，
+     * 记录不存在时抛 {@link KnowledgeApplicationErrorCode#KNOWLEDGE_DOCUMENT_NOT_FOUND}（两者必须区分）。</p>
+     *
+     * @param document        更新后的文档聚合
+     * @param expectedVersion 调用方读取到的版本
+     * @return 已存储的文档及其新版本（{@code expectedVersion + 1}）
+     * @throws KnowledgeApplicationException 记录不存在或版本冲突
+     */
+    VersionedKnowledgeDocument update(KnowledgeDocument document, long expectedVersion);
 }

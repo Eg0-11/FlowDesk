@@ -79,6 +79,18 @@ public final class FlowDeskProblems {
     /** 知识文档不存在。 */
     public static final String CODE_KNOWLEDGE_DOCUMENT_NOT_FOUND = "KNOWLEDGE_DOCUMENT_NOT_FOUND";
 
+    /** 知识文档版本冲突（{@code If-Match} 已过期或 CAS 失败）。 */
+    public static final String CODE_KNOWLEDGE_DOCUMENT_VERSION_CONFLICT = "KNOWLEDGE_DOCUMENT_VERSION_CONFLICT";
+
+    /** 知识文档当前状态不允许解析（已在解析中、或已经解析完成）。 */
+    public static final String CODE_KNOWLEDGE_DOCUMENT_NOT_PARSABLE = "KNOWLEDGE_DOCUMENT_NOT_PARSABLE";
+
+    /** 文档无法解析：内容损坏、加密、与声明格式不符，或提取不到文本。 */
+    public static final String CODE_DOCUMENT_PARSE_FAILED = "DOCUMENT_PARSE_FAILED";
+
+    /** 文档切片数量超过配置上限。 */
+    public static final String CODE_DOCUMENT_TOO_MANY_CHUNKS = "DOCUMENT_TOO_MANY_CHUNKS";
+
     /**
      * 请求的 {@code Accept} 无法被满足：服务端没有任何可产出的表示能满足它。
      *

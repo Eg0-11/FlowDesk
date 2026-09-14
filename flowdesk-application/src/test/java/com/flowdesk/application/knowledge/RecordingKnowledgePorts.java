@@ -9,6 +9,7 @@ import com.flowdesk.application.knowledge.port.out.StoredContent;
 import com.flowdesk.application.knowledge.port.out.VersionedKnowledgeDocument;
 import com.flowdesk.domain.knowledge.KnowledgeDocument;
 import com.flowdesk.domain.knowledge.KnowledgeDocumentId;
+import com.flowdesk.domain.knowledge.KnowledgeDocumentStatus;
 import com.flowdesk.domain.knowledge.Sha256Digest;
 import java.io.IOException;
 import java.io.InputStream;
@@ -164,21 +165,40 @@ final class RecordingKnowledgePorts {
     }
 
     /**
-     * 记录插入与读取的元数据仓储替身。
+     * 记录插入、读取与 CAS 更新的元数据仓储替身。
+     *
+     * <p>{@link #update} 实现了端口的 CAS 语义（版本不匹配即冲突、成功则版本加 1），
+     * 因此应用层的「领取」与「失败补偿」在单测里也会走真实的并发检查逻辑。</p>
      */
     static final class RecordingDocumentRepository implements KnowledgeDocumentRepository {
 
         private final List<String> calls = new ArrayList<>();
 
+        private final List<Long> updatedExpectedVersions = new ArrayList<>();
+
         private RuntimeException insertFailure;
+
+        private RuntimeException stickyUpdateFailure;
+
+        private RuntimeException nextUpdateFailure;
+
+        private KnowledgeDocumentStatus failingUpdateStatus;
+
+        private RuntimeException statusScopedUpdateFailure;
 
         private int insertCalls;
 
         private int findCalls;
 
+        private int updateCalls;
+
         private KnowledgeDocument lastInserted;
 
+        private KnowledgeDocument lastUpdated;
+
         private VersionedKnowledgeDocument found;
+
+        private long version;
 
         @Override
         public VersionedKnowledgeDocument insert(KnowledgeDocument document) {
@@ -201,16 +221,73 @@ final class RecordingKnowledgePorts {
             return Optional.empty();
         }
 
+        @Override
+        public VersionedKnowledgeDocument update(KnowledgeDocument document, long expectedVersion) {
+            this.calls.add("update");
+            this.updateCalls++;
+            this.lastUpdated = document;
+            this.updatedExpectedVersions.add(expectedVersion);
+            if (this.stickyUpdateFailure != null) {
+                throw this.stickyUpdateFailure;
+            }
+            if (this.failingUpdateStatus != null && document.status() == this.failingUpdateStatus) {
+                throw this.statusScopedUpdateFailure;
+            }
+            if (this.nextUpdateFailure != null) {
+                RuntimeException failure = this.nextUpdateFailure;
+                this.nextUpdateFailure = null;
+                throw failure;
+            }
+            if (this.found == null) {
+                throw new KnowledgeApplicationException(
+                        KnowledgeApplicationErrorCode.KNOWLEDGE_DOCUMENT_NOT_FOUND, "知识文档不存在");
+            }
+            if (this.version != expectedVersion) {
+                throw new KnowledgeApplicationException(
+                        KnowledgeApplicationErrorCode.KNOWLEDGE_DOCUMENT_VERSION_CONFLICT,
+                        "文档版本已变化");
+            }
+            this.version = expectedVersion + 1L;
+            this.found = new VersionedKnowledgeDocument(document, this.version);
+            return this.found;
+        }
+
         void failInsertWith(RuntimeException failure) {
             this.insertFailure = failure;
         }
 
+        /** 之后每一次 update 都失败（用于「领取阶段」失败）。 */
+        void failEveryUpdateWith(RuntimeException failure) {
+            this.stickyUpdateFailure = failure;
+        }
+
+        /** 只让下一次 update 失败（用于「失败补偿本身失败」）。 */
+        void failNextUpdateWith(RuntimeException failure) {
+            this.nextUpdateFailure = failure;
+        }
+
+        /**
+         * 只让「写入处于指定状态的文档」失败。
+         *
+         * <p>用于精确模拟「领取成功、但失败补偿写库被拒」：领取写的是 {@code PARSING}，
+         * 补偿写的是 {@code PARSE_FAILED}，两者可以分别注入。</p>
+         */
+        void failUpdateForStatus(KnowledgeDocumentStatus status, RuntimeException failure) {
+            this.failingUpdateStatus = status;
+            this.statusScopedUpdateFailure = failure;
+        }
+
         void willFind(KnowledgeDocument document, long version) {
             this.found = new VersionedKnowledgeDocument(document, version);
+            this.version = version;
         }
 
         List<String> calls() {
             return List.copyOf(this.calls);
+        }
+
+        List<Long> updatedExpectedVersions() {
+            return List.copyOf(this.updatedExpectedVersions);
         }
 
         int insertCalls() {
@@ -221,8 +298,16 @@ final class RecordingKnowledgePorts {
             return this.findCalls;
         }
 
+        int updateCalls() {
+            return this.updateCalls;
+        }
+
         KnowledgeDocument lastInserted() {
             return this.lastInserted;
+        }
+
+        KnowledgeDocument lastUpdated() {
+            return this.lastUpdated;
         }
     }
 

@@ -14,6 +14,7 @@ import com.flowdesk.application.ticket.query.GetTicketQuery;
 import com.flowdesk.application.ticket.query.SearchTicketsQuery;
 import com.flowdesk.application.ticket.view.TicketPageView;
 import com.flowdesk.application.ticket.view.TicketView;
+import com.flowdesk.bootstrap.web.EntityTag;
 import com.flowdesk.bootstrap.web.InvalidRequestException;
 import com.flowdesk.domain.ticket.TicketDomainException;
 import com.flowdesk.domain.ticket.TicketId;
@@ -170,7 +171,7 @@ public class TicketController {
                 UserId.of(request.requesterId())));
 
         return ResponseEntity.created(URI.create(BASE_PATH + "/" + view.id().value()))
-                .eTag(TicketEtag.format(view.version()))
+                .eTag(EntityTag.format(view.version()))
                 .body(TicketResponse.from(view));
     }
 
@@ -198,7 +199,7 @@ public class TicketController {
             @RequestHeader(name = HttpHeaders.IF_MATCH, required = false) String ifMatch,
             @Valid @RequestBody AssignTicketRequest request) {
 
-        long expectedVersion = TicketEtag.requireVersion(ifMatch);
+        long expectedVersion = EntityTag.requireVersion(ifMatch);
         return ok(this.ticketCommandUseCase.assign(new AssignTicketCommand(parseTicketId(ticketId),
                 UserId.of(request.assigneeId()), expectedVersion)));
     }
@@ -216,7 +217,7 @@ public class TicketController {
             @RequestHeader(name = HttpHeaders.IF_MATCH, required = false) String ifMatch,
             @Valid @RequestBody AssignTicketRequest request) {
 
-        long expectedVersion = TicketEtag.requireVersion(ifMatch);
+        long expectedVersion = EntityTag.requireVersion(ifMatch);
         return ok(this.ticketCommandUseCase.reassign(new ReassignTicketCommand(parseTicketId(ticketId),
                 UserId.of(request.assigneeId()), expectedVersion)));
     }
@@ -232,7 +233,7 @@ public class TicketController {
     public ResponseEntity<TicketResponse> start(@PathVariable String ticketId,
             @RequestHeader(name = HttpHeaders.IF_MATCH, required = false) String ifMatch) {
 
-        long expectedVersion = TicketEtag.requireVersion(ifMatch);
+        long expectedVersion = EntityTag.requireVersion(ifMatch);
         return ok(this.ticketCommandUseCase.start(new StartTicketCommand(parseTicketId(ticketId), expectedVersion)));
     }
 
@@ -249,7 +250,7 @@ public class TicketController {
             @RequestHeader(name = HttpHeaders.IF_MATCH, required = false) String ifMatch,
             @Valid @RequestBody ResolveTicketRequest request) {
 
-        long expectedVersion = TicketEtag.requireVersion(ifMatch);
+        long expectedVersion = EntityTag.requireVersion(ifMatch);
         return ok(this.ticketCommandUseCase.resolve(new ResolveTicketCommand(parseTicketId(ticketId),
                 request.resolution(), expectedVersion)));
     }
@@ -265,7 +266,7 @@ public class TicketController {
     public ResponseEntity<TicketResponse> close(@PathVariable String ticketId,
             @RequestHeader(name = HttpHeaders.IF_MATCH, required = false) String ifMatch) {
 
-        long expectedVersion = TicketEtag.requireVersion(ifMatch);
+        long expectedVersion = EntityTag.requireVersion(ifMatch);
         return ok(this.ticketCommandUseCase.close(new CloseTicketCommand(parseTicketId(ticketId), expectedVersion)));
     }
 
@@ -307,7 +308,7 @@ public class TicketController {
      */
     private static ResponseEntity<TicketResponse> ok(TicketView view) {
         return ResponseEntity.ok()
-                .eTag(TicketEtag.format(view.version()))
+                .eTag(EntityTag.format(view.version()))
                 .body(TicketResponse.from(view));
     }
 }

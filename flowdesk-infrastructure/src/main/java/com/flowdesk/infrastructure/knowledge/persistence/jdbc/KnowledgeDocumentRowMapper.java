@@ -8,6 +8,7 @@ import com.flowdesk.domain.knowledge.KnowledgeDocument;
 import com.flowdesk.domain.knowledge.KnowledgeDocumentId;
 import com.flowdesk.domain.knowledge.KnowledgeDocumentStatus;
 import com.flowdesk.domain.knowledge.KnowledgeDomainException;
+import com.flowdesk.domain.knowledge.KnowledgeParseFailureCode;
 import com.flowdesk.domain.knowledge.Sha256Digest;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -56,12 +57,15 @@ final class KnowledgeDocumentRowMapper {
         KnowledgeDocumentStatus status = parseStatus(resultSet.getString("status"));
         Instant createdAt = toInstant(resultSet.getObject("created_at", OffsetDateTime.class));
         Instant updatedAt = toInstant(resultSet.getObject("updated_at", OffsetDateTime.class));
+        Instant parsedAt = toInstant(resultSet.getObject("parsed_at", OffsetDateTime.class));
+        Instant parseFailedAt = toInstant(resultSet.getObject("parse_failed_at", OffsetDateTime.class));
+        KnowledgeParseFailureCode parseFailureCode = parseFailureCode(resultSet.getString("parse_failure_code"));
         long version = resultSet.getLong("version");
 
         try {
             KnowledgeDocument document = KnowledgeDocument.restore(KnowledgeDocumentId.of(id), title,
                     originalFilename, format, mediaType, sizeBytes, sha256, contentKey, status, createdAt,
-                    updatedAt);
+                    updatedAt, parsedAt, parseFailedAt, parseFailureCode);
             return new VersionedKnowledgeDocument(document, version);
         }
         catch (KnowledgeDomainException ex) {
@@ -92,6 +96,25 @@ final class KnowledgeDocumentRowMapper {
         catch (IllegalArgumentException | NullPointerException ex) {
             throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.INVALID_PERSISTED_DOCUMENT,
                     "持久化的知识文档状态不受支持", ex);
+        }
+    }
+
+    /**
+     * 解析失败码：{@code null} 是合法值（非失败状态），非空时必须是已知枚举常量。
+     *
+     * <p>库里出现未知取值说明数据被外部改坏或来自更新的版本，属于内部错误，
+     * 必须显式暴露而不是静默当成 {@code null}。</p>
+     */
+    private static KnowledgeParseFailureCode parseFailureCode(String value) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            return KnowledgeParseFailureCode.valueOf(value);
+        }
+        catch (IllegalArgumentException ex) {
+            throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.INVALID_PERSISTED_DOCUMENT,
+                    "持久化的解析失败码不受支持", ex);
         }
     }
 

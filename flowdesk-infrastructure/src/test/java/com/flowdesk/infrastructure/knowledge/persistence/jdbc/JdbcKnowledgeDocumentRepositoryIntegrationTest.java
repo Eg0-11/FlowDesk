@@ -27,6 +27,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * 知识文档元数据 JDBC 测试：真实数据库（H2 的 PostgreSQL 兼容模式）+ 真实 Flyway 迁移。
@@ -61,7 +63,8 @@ class JdbcKnowledgeDocumentRepositoryIntegrationTest {
                 .migrate();
 
         jdbcClient = JdbcClient.create(dataSource);
-        repository = new JdbcKnowledgeDocumentRepository(jdbcClient);
+        repository = new JdbcKnowledgeDocumentRepository(jdbcClient,
+                new TransactionTemplate(new DataSourceTransactionManager(dataSource)));
     }
 
     @BeforeEach
@@ -72,9 +75,10 @@ class JdbcKnowledgeDocumentRepositoryIntegrationTest {
     // ---------- ① 迁移 ----------
 
     @Test
-    void flywayAppliesAllThreeMigrations() {
-        assertThat(migrateResult.migrationsExecuted).as("V1 工单表 + V2 搜索索引 + V3 知识文档表")
-                .isEqualTo(3);
+    void flywayAppliesAllFourMigrations() {
+        assertThat(migrateResult.migrationsExecuted)
+                .as("V1 工单表 + V2 搜索索引 + V3 知识文档表 + V4 解析字段与切片表")
+                .isEqualTo(4);
     }
 
     @Test
@@ -371,7 +375,8 @@ class JdbcKnowledgeDocumentRepositoryIntegrationTest {
         empty.setUser("sa");
         empty.setPassword("");
         // 刻意不执行 Flyway：knowledge_documents 表不存在，任何访问都会失败
-        return new JdbcKnowledgeDocumentRepository(JdbcClient.create(empty));
+        return new JdbcKnowledgeDocumentRepository(JdbcClient.create(empty),
+                new TransactionTemplate(new DataSourceTransactionManager(empty)));
     }
 
     // ---------- 辅助 ----------

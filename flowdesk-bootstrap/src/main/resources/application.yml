@@ -64,3 +64,13 @@ flowdesk:
       # 本地文件系统内容存储的根目录（默认适配器；将来可替换为对象存储）。
       # 内容写入 <root>/documents，临时文件在 <root>/tmp —— 同根保证原子移动在同一文件系统内。
       root: data/knowledge
+    chunking:
+      # 确定性切片参数（FD-0009）。这些值是「行为的一部分」，改动它们就会改变切片结果，
+      # 因此必须显式写在这里，而不是散落在代码里的魔法数字。
+      chunk-size: 1000
+      # 相邻切片的重叠字符数（targetSize 的 15%）。必须满足 0 <= overlap < chunk-size。
+      overlap: 150
+      # 单文档切片数量上限：超过即判定文档不适合当前阶段，整个解析失败（不会写入部分切片）。
+      max-chunks: 5000
+      # 提取文本的 code point 上限：解析过程中一旦超过就立即中断读取，防止 ZIP 炸弹式的超大文本。
+      max-extracted-code-points: 1000000

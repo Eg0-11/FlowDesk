@@ -12,8 +12,20 @@ public enum KnowledgeApplicationErrorCode {
     /** 上传命令本身不合法：标题为空、文件名缺失、命令为 {@code null} 等。 */
     INVALID_UPLOAD_COMMAND,
 
-    /** 查询条件本身不合法：查询为 {@code null} 或标识缺失。 */
+    /** 列表查询条件本身不合法：查询为 {@code null} 或标识缺失。 */
     INVALID_QUERY,
+
+    /** 解析命令本身不合法：命令为 {@code null}、标识缺失或期望版本为负。 */
+    INVALID_PARSE_COMMAND,
+
+    /** 调用方持有的版本已过期（CAS 失败或领取前版本比对不通过）。 */
+    KNOWLEDGE_DOCUMENT_VERSION_CONFLICT,
+
+    /** 当前状态不允许解析（重复领取、已解析完成等）。 */
+    KNOWLEDGE_DOCUMENT_NOT_PARSABLE,
+
+    /** 原始内容不可读：对象缺失、不可读或内容键非法（绝不暴露真实路径）。 */
+    DOCUMENT_CONTENT_UNREADABLE,
 
     /** 实际读取到的内容为空（0 字节）。 */
     EMPTY_DOCUMENT_CONTENT,

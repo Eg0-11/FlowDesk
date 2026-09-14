@@ -69,6 +69,7 @@ flowdesk-mcp-monitoring     ← 只依赖 flowdesk-shared
 | Spring AI Alibaba | 1.1.2.2（**仅导入 BOM**，其 Agent Framework 留待后续阶段） |
 | Spring AI Alibaba Extensions | 1.1.2.2（**仅导入 BOM**） |
 | DeepSeek 传输 | OpenAI 兼容 Chat Completions（`spring-ai-starter-model-openai`，见 [ADR 0001](docs/adr/0001-deepseek-openai-compatible-transport.md)） |
+| Apache Tika | 3.3.2（`tika-core` + `tika-parsers-standard-package`，版本由根 pom 的 `tika.version` 单点锁定；**不使用 `tika-app`**） |
 | JUnit | JUnit 5（由 `spring-boot-starter-test` 统一提供） |
 | 编码 | UTF-8（源码与报告输出） |
 
@@ -693,9 +694,10 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0006 | 工单 REST API、ProblemDetail 与 ETag 并发协议 | ✅ 已完成 |
 | FD-0007 | 工单列表、分页、排序与条件搜索 | ✅ 已完成 |
 | FD-0008 | 知识文档领域模型与安全上传链路（RAG 1/6） | ✅ 已完成 |
-| 后续 | RAG 2/6：文档解析与切片 | 未开始 |
+| FD-0009 | 文档解析与确定性切片（RAG 2/6） | ✅ 已完成 |
+| 后续 | RAG 3/6：Embedding 与向量存储 | 未开始 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm` | 未开始 |
-| 后续 | RAG：向量化、向量库与检索增强 | 未开始 |
+| 后续 | RAG：向量检索与检索增强生成 | 未开始 |
 | 后续 | 孤立文件清理任务 | 未开始 |
 | 后续 | Tool 体系扩展：面向工单与知识的工具注册 | 未开始 |
 | 后续 | MCP：资产 MCP 服务与监控 MCP 服务的能力实现 | 未开始 |
@@ -705,7 +707,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 
 | 项 | 状态 | 含义 |
 | --- | --- | --- |
-| H2 集成 / HTTP 集成 | ✅ 已执行 | 真实 Spring 上下文、真实 JDBC、真实 Flyway 迁移（V1+V2+V3）、真实并发线程、真实文件系统与真实 multipart 上传 |
+| H2 集成 / HTTP 集成 | ✅ 已执行 | 真实 Spring 上下文、真实 JDBC、真实 Flyway 迁移（V1+V2+V3+V4）、真实并发线程、真实文件系统、真实 multipart 上传，以及真实 PDF/DOCX 解析（夹具按规范现场生成） |
 | 本地 smoke（默认 profile） | ✅ 已执行 | 真实进程 + 真实 HTTP multipart 上传 + 存储目录落盘校验（见 FD-0008 交付报告） |
 | PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证** |
 | 真实 DeepSeek | ⚠️ **LIVE_SMOKE=NOT_RUN** | 无 `DEEPSEEK_API_KEY`，**未对真实模型发起过任何请求** |
@@ -720,8 +722,8 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 
 设计取舍见 [`docs/adr/0005-knowledge-document-upload-storage.md`](docs/adr/0005-knowledge-document-upload-storage.md)。
 
-本阶段只做「收进来 + 查得到」：**不做**文档解析、切片、Embedding、向量库与 RAG 检索，
-也没有文档列表、下载、删除或版本更新接口。
+本阶段只做「收进来 + 查得到」：**不做**文档解析与切片（由 FD-0009 完成），
+**不做** Embedding、向量库与 RAG 检索，也没有文档列表、下载、删除或版本更新接口。
 
 ### 15.1 接口表
 
@@ -840,3 +842,154 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | 内容存储 / 元数据存储失败、快照损坏 | 500 | `INTERNAL_SERVER_ERROR` |
 
 错误 `detail` 一律是固定安全文案：不含原始文件名、标题原文、内容键、本地路径、SQL、异常类名或堆栈。
+
+## 十六、文档解析与确定性切片（RAG 2/6）
+
+设计取舍见 [`docs/adr/0006-document-parsing-and-deterministic-chunking.md`](docs/adr/0006-document-parsing-and-deterministic-chunking.md)。
+
+本阶段把「已上传的原始文件」变成「可用的纯文本切片」：
+读取原文 → 安全解析 PDF/DOCX/MD/TXT → 规范化 → 确定性切片 → 原子保存 → 状态更新。
+**不做** Embedding、向量库、检索增强，也**没有**读取切片内容的公开接口（那是下一阶段的内部输入）。
+
+### 16.1 接口表
+
+| 方法 | 路径 | 请求 | 成功响应 |
+| --- | --- | --- | --- |
+| POST | `/api/v1/knowledge/documents/{documentId}/parse` | 无请求体；**必须**带 `If-Match` | 200 OK + `ETag` |
+
+- **没有请求体**：调用方无法影响解析器选择、切片参数或存储位置，这些全部由服务端配置决定；
+- **解析是同步的**：返回时切片已经落库，因此是 200 而不是 202；
+- 响应字段：`documentId`、`title`、`status`、`version`、`chunkCount`、`parsedAt`
+  （成功时不含 `failureCode`；失败走错误契约）。
+
+```powershell
+# 1) 上传
+curl.exe -s -X POST http://localhost:8080/api/v1/knowledge/documents `
+  -F "title=季度运维报告" -F "file=@report.pdf"
+# → 201, status=UPLOADED, version=0
+
+# 2) 解析（If-Match 必须是当前版本）
+curl.exe -s -i -X POST http://localhost:8080/api/v1/knowledge/documents/<id>/parse `
+  -H "If-Match: `"0`""
+# → 200 OK, ETag: "2"
+# {"documentId":"<id>","title":"季度运维报告","status":"PARSED",
+#  "version":2,"chunkCount":3,"parsedAt":"2026-09-14T05:12:31.482Z"}
+```
+
+```json
+{
+  "type": "urn:flowdesk:problem:document-parse-failed",
+  "title": "文档无法解析",
+  "status": 422,
+  "detail": "文档内容已损坏或与声明的格式不符",
+  "instance": "/api/v1/knowledge/documents/4fac368c-.../parse",
+  "code": "DOCUMENT_PARSE_FAILED",
+  "failureCode": "CORRUPTED_DOCUMENT"
+}
+```
+
+### 16.2 状态机与 CAS 时序
+
+```
+UPLOADED ──claim──▶ PARSING ──complete──▶ PARSED
+PARSE_FAILED ──claim──┘        └──fail────▶ PARSE_FAILED
+```
+
+| 步骤 | 动作 | 版本变化 |
+| --- | --- | --- |
+| ① 读取 | `findById` | — |
+| ② 版本比对 | 与 `If-Match` 不一致 → **412**（无任何写入） | — |
+| ③ 领取 | `SELECT ... FOR UPDATE` + `UPDATE ... WHERE id AND version` | **+1** |
+| ④ 事务外 | 读原文 → 解析 → 规范化 → 切片 | — |
+| ⑤ 完成 | 删除旧切片 + 插入新切片 + 置 `PARSED`（同一事务） | **+1** |
+| ⑥ 失败 | 把文档 CAS 成 `PARSE_FAILED`（可重试） | **+1** |
+
+- **领取是并发闸门**：CAS 保证同一文档只有一个请求能从 `UPLOADED`/`PARSE_FAILED` 进入 `PARSING`
+  （8 线程并发测试断言「恰好一个成功」）；
+- `PARSED` 不能被重复解析（409），`PARSING` 不能被二次领取（409）；
+- `PARSE_FAILED → PARSING` 是有意放开的：修好原始文件后可以用最新版本重试，
+  不必重新上传（重新上传会得到新的文档标识）；
+- 状态与解析字段严格配对：`PARSED` 只带 `parsedAt`、`PARSE_FAILED` 只带 `parseFailedAt` + 失败码、
+  `UPLOADED`/`PARSING` 两者都不带 —— 领域层与数据库 CHECK 双重强制。
+
+### 16.3 事务边界
+
+- **解析与切片不在任何数据库事务里**：事务只包住「领取」与「完成」两个短操作；
+- **「完成解析」是一个原子端口方法**（`KnowledgeDocumentChunkStore.completeParsing`）：
+  校验行仍是 `PARSING` 且版本匹配 → 删除旧切片 → 插入新切片 → 更新为 `PARSED` 并加版本 →
+  在同一事务内重新读取。任一步失败**整体回滚**（测试用主键冲突与版本错配两条路径验证
+  「文档仍是 `PARSING`、版本未变、切片为零」）；
+- 事务边界属于适配器，应用层不认识事务；JDBC 异常在适配器内被映射为
+  `METADATA_STORAGE_FAILURE`，不向应用层泄漏 Spring/JDBC 类型。
+
+### 16.4 解析安全边界
+
+| 边界 | 做法 |
+| --- | --- |
+| 路径逃逸 | 只接受内容键；字符集白名单 + 解析结果必须在存储根目录内；只读普通文件、**不跟随符号链接** |
+| 伪造格式 | 解析前校验文件头（PDF `%PDF-`、DOCX ZIP），不符 → `UNSUPPORTED_DOCUMENT_CONTENT` |
+| 损坏文档 | 按异常**类型**映射为 `CORRUPTED_DOCUMENT`（不解析异常文本） |
+| 加密文档 | → `ENCRYPTED_DOCUMENT`（测试用现场构造的加密 PDF 真实验证） |
+| XXE / 外部实体 | 用「正文引用本地文件的 DOCX」验证：解析要么安全失败，要么提取不到任何本地文件内容 |
+| 资源耗尽 | 提取文本按 **code point** 限量（默认 1,000,000），超限**立即中断**；切片数量上限 5000 |
+| 非法 UTF-8 | 文本格式用 `CodingErrorAction.REPORT` 的严格解码器（默认的替换行为会静默产生 `U+FFFD`） |
+| 信息泄漏 | 响应里没有原文、切片内容、内容键、路径、解析器名称或异常文本 |
+
+- 解析器由**数据库里保存的格式**直接指定（PDF → PDFBox、DOCX → POI OOXML），不做二次探测；
+- Markdown/Text 不经过解析框架：严格 UTF-8 解码 + 去掉 BOM；
+- 解析器**不关闭**调用方的流（`nonClosing` 包装），流的生命周期由应用服务负责。
+
+### 16.5 规范化、切片算法与参数
+
+规范化（切片之前统一执行）：`CRLF`/`CR` → `LF`、Unicode **NFC**、3 个以上连续换行折叠为 2 个、首尾 `strip()`。
+
+切片按 **Unicode code point** 处理（绝不切断代理对），边界优先级：
+
+1. 段落边界（换行）→ 2. 中英文句末标点（`。！？；.!?;`）→ 3. 普通空白 → 4. 硬切；
+
+回溯窗口限制在后半段（`chunkSize/2` 起），避免因为开头附近的一个句号切出极短片；
+下一片从 `end - overlap` 开始，并**显式保证严格前进**（因此 `overlap = chunkSize - 1` 也不会死循环）。
+
+| 配置 | 默认值 | 含义 |
+| --- | --- | --- |
+| `flowdesk.knowledge.chunking.chunk-size` | `1000` | 单片最大 code point 数（硬上限 2000，由列容量反推） |
+| `flowdesk.knowledge.chunking.overlap` | `150` | 相邻片重叠的 code point 数，必须 `< chunk-size` |
+| `flowdesk.knowledge.chunking.max-chunks` | `5000` | 单文档切片数上限，超过即整体失败（**不写部分切片**） |
+| `flowdesk.knowledge.chunking.max-extracted-code-points` | `1000000` | 提取文本上限，解析中一旦超过立即中断 |
+
+四个属性在**启动期**校验（组合溢出用 `long` 计算），不合法就让应用启动失败。
+
+### 16.6 数据与错误契约
+
+Flyway **V4** 在 `knowledge_documents` 上新增 `parsed_at`、`parse_failed_at`、`parse_failure_code`，
+并重建状态 CHECK 为四个取值；同时新建 `knowledge_document_chunks`：
+
+- 主键 `(document_id, chunk_index)`，外键指向 `knowledge_documents(id)` **ON DELETE CASCADE**；
+- CHECK：序号非负、内容非空、code point 计数为正、摘要为 64 位小写十六进制；
+- 索引 `idx_knowledge_document_chunks_document` 支持按文档分页读取。
+
+| 场景 | HTTP | code |
+| --- | --- | --- |
+| 解析命令不合法（版本为负等） | 400 | `INVALID_REQUEST` |
+| 缺少 `If-Match` | 428 | `PRECONDITION_REQUIRED` |
+| `If-Match` 格式非法 | 400 | `INVALID_IF_MATCH` |
+| 文档不存在 | 404 | `KNOWLEDGE_DOCUMENT_NOT_FOUND` |
+| 当前状态不允许解析（已在解析/已解析完成） | 409 | `KNOWLEDGE_DOCUMENT_NOT_PARSABLE` |
+| `If-Match` 已过期 / 领取 CAS 失败 | 412 | `KNOWLEDGE_DOCUMENT_VERSION_CONFLICT` |
+| 文档损坏 / 加密 / 与声明类型不符 / 无可提取文本 | 422 | `DOCUMENT_PARSE_FAILED` + `failureCode` |
+| 提取文本超限 | 413 | `DOCUMENT_TOO_LARGE` + `failureCode=EXTRACTED_TEXT_TOO_LARGE` |
+| 切片数量超限 | 413 | `DOCUMENT_TOO_MANY_CHUNKS` + `failureCode=TOO_MANY_CHUNKS` |
+| 解析器内部失败、原文不可读、结果写入失败 | 500 | `INTERNAL_SERVER_ERROR` |
+
+`failureCode` 是 `KnowledgeParseFailureCode` 的枚举名（稳定契约，不是自由文本）：
+`CORRUPTED_DOCUMENT`、`ENCRYPTED_DOCUMENT`、`UNSUPPORTED_DOCUMENT_CONTENT`、`EMPTY_EXTRACTED_TEXT`、
+`EXTRACTED_TEXT_TOO_LARGE`、`TOO_MANY_CHUNKS`、`PARSER_FAILURE`。
+
+### 16.7 已知边界
+
+1. **`PARSING` 悬挂**：进程在解析期间崩溃会让文档停在 `PARSING`，既不会自动重试也不能被再次领取。
+   本阶段**不实现**恢复扫描任务，需要人工把状态改回 `UPLOADED`/`PARSE_FAILED`，或由后续任务实现超时回收；
+2. **同步解析**：请求会一直等到解析完成，极大文档可能触及客户端/代理超时（本阶段不引入异步任务与 MQ）；
+3. **切片参数变更不会回填历史数据**：改配置后需要重新解析才会生效；
+4. 解析产物的读取端口（`countChunks` / `findChunks`）已经就位，但**没有公开 HTTP 接口** ——
+   切片内容是下一阶段（向量化）的内部输入。

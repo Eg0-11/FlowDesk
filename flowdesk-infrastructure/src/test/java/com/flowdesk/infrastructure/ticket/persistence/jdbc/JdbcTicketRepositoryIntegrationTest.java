@@ -101,7 +101,8 @@ class JdbcTicketRepositoryIntegrationTest {
 
     @Test
     void flywayMigratesAnEmptyDatabase() {
-        assertThat(migrateResult.migrationsExecuted).as("V1 建表 + V2 搜索索引 + V3 知识文档表").isEqualTo(3);
+        assertThat(migrateResult.migrationsExecuted)
+                .as("V1 建表 + V2 搜索索引 + V3 知识文档表 + V4 解析字段与切片表").isEqualTo(4);
         assertThat(scalarLong("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'tickets'"))
                 .as("tickets 表必须存在")
                 .isEqualTo(1);

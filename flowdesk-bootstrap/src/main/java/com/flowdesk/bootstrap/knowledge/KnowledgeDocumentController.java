@@ -1,19 +1,25 @@
 package com.flowdesk.bootstrap.knowledge;
 
+import com.flowdesk.application.knowledge.command.ParseKnowledgeDocumentCommand;
 import com.flowdesk.application.knowledge.command.UploadKnowledgeDocumentCommand;
 import com.flowdesk.application.knowledge.port.in.KnowledgeDocumentQueryUseCase;
+import com.flowdesk.application.knowledge.port.in.ParseKnowledgeDocumentUseCase;
 import com.flowdesk.application.knowledge.port.in.UploadKnowledgeDocumentUseCase;
 import com.flowdesk.application.knowledge.query.GetKnowledgeDocumentQuery;
 import com.flowdesk.application.knowledge.view.KnowledgeDocumentView;
+import com.flowdesk.application.knowledge.view.ParsedDocumentView;
+import com.flowdesk.bootstrap.web.EntityTag;
 import com.flowdesk.bootstrap.web.InvalidRequestException;
 import com.flowdesk.domain.knowledge.KnowledgeDocumentId;
 import com.flowdesk.domain.knowledge.KnowledgeDomainException;
 import java.net.URI;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -41,15 +47,20 @@ public class KnowledgeDocumentController {
 
     private final KnowledgeDocumentQueryUseCase queryUseCase;
 
+    private final ParseKnowledgeDocumentUseCase parseUseCase;
+
     /**
      * @param uploadUseCase 上传用例输入端口
      * @param queryUseCase  查询用例输入端口
+     * @param parseUseCase  解析用例输入端口
      */
     public KnowledgeDocumentController(UploadKnowledgeDocumentUseCase uploadUseCase,
-            KnowledgeDocumentQueryUseCase queryUseCase) {
+            KnowledgeDocumentQueryUseCase queryUseCase,
+            ParseKnowledgeDocumentUseCase parseUseCase) {
 
         this.uploadUseCase = uploadUseCase;
         this.queryUseCase = queryUseCase;
+        this.parseUseCase = parseUseCase;
     }
 
     /**
@@ -93,6 +104,38 @@ public class KnowledgeDocumentController {
     public ResponseEntity<KnowledgeDocumentResponse> get(@PathVariable String documentId) {
         return ResponseEntity.ok(KnowledgeDocumentResponse.from(
                 this.queryUseCase.get(new GetKnowledgeDocumentQuery(parseDocumentId(documentId)))));
+    }
+
+    /**
+     * 解析知识文档：读取原文 → 安全解析 → 规范化 → 确定性切片 → 原子保存。
+     *
+     * <p><b>没有请求体</b>：解析所需的全部信息（目标文档与期望版本）分别在路径与
+     * {@code If-Match} 头里。因此调用方无法通过请求体影响解析器选择、切片参数或存储位置 ——
+     * 这些都由服务端配置决定。</p>
+     *
+     * <p><b>{@code If-Match} 必填</b>：解析是状态变更（{@code UPLOADED}/{@code PARSE_FAILED}
+     * → {@code PARSING} → {@code PARSED}），因此必须携带版本前置条件。缺失 → 428，
+     * 格式非法 → 400，版本过期 → 412，当前状态不允许解析（已在解析中或已解析完成）→ 409。</p>
+     *
+     * <p>解析是<b>同步</b>完成的：请求返回时切片已经落库。响应体不含原文与切片内容，
+     * 只有新版本号、状态、切片数量与完成时间。</p>
+     *
+     * @param documentId 文档标识
+     * @param ifMatch    {@code If-Match} 头，形如 {@code "0"}
+     * @return 200 OK，带 {@code ETag}
+     */
+    @PostMapping("/{documentId}/parse")
+    public ResponseEntity<ParsedDocumentResponse> parse(
+            @PathVariable String documentId,
+            @RequestHeader(name = HttpHeaders.IF_MATCH, required = false) String ifMatch) {
+
+        long expectedVersion = EntityTag.requireVersion(ifMatch);
+        ParsedDocumentView view = this.parseUseCase.parse(
+                new ParseKnowledgeDocumentCommand(parseDocumentId(documentId), expectedVersion));
+
+        return ResponseEntity.ok()
+                .eTag(EntityTag.format(view.version()))
+                .body(ParsedDocumentResponse.from(view));
     }
 
     /**
