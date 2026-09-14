@@ -15,6 +15,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
@@ -32,6 +34,7 @@ import org.apache.tika.parser.pdf.PDFParser;
 import org.apache.tika.parser.pdf.PDFParserConfig;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
+import org.w3c.dom.NamedNodeMap;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 import org.xml.sax.SAXException;
@@ -103,6 +106,20 @@ public final class TikaDocumentTextParser implements DocumentTextParser {
     /** {@code officeDocument} 关系的类型 URI。 */
     private static final String OFFICE_DOCUMENT_RELATIONSHIP =
             "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument";
+
+    /** OPC 内容类型部件的命名空间。 */
+    private static final String OPC_CONTENT_TYPES_NAMESPACE =
+            "http://schemas.openxmlformats.org/package/2006/content-types";
+
+    /** OPC 关系部件的命名空间。 */
+    private static final String OPC_RELATIONSHIPS_NAMESPACE =
+            "http://schemas.openxmlformats.org/package/2006/relationships";
+
+    /** 内部关系的 {@code TargetMode} 取值（精确匹配，大小写敏感）。 */
+    private static final String TARGET_MODE_INTERNAL = "Internal";
+
+    /** {@code TargetMode} 属性名。 */
+    private static final String TARGET_MODE_ATTRIBUTE = "TargetMode";
 
     /**
      * 读取包元数据（内容类型、关系）时的字节上限。
@@ -313,12 +330,24 @@ public final class TikaDocumentTextParser implements DocumentTextParser {
      * <ol>
      *   <li>{@code [Content_Types].xml} 对 {@code /word/document.xml} 生效的内容类型
      *       必须是 WordprocessingML 主文档类型（Override 优先于 Default，与 OPC 规则一致）；</li>
-     *   <li>{@code _rels/.rels} 里的 {@code officeDocument} 关系必须指向 {@code word/document.xml}
-     *       —— 否则就是「用 DOCX 的内容类型伪装、实际让解析器去读别的部件」；</li>
+     *   <li>{@code _rels/.rels} 里<b>恰好一个</b> {@code officeDocument} 关系必须指向
+     *       {@code word/document.xml}，且必须是<b>内部</b>关系（FD-0009-R2 收紧）；</li>
      *   <li>该部件必须真实存在。</li>
      * </ol>
      * <p>ZIP 容器本身打不开 → 损坏（{@code CORRUPTED_DOCUMENT}）；
      * 包能打开但不能证明自己是 DOCX → 不受支持（{@code UNSUPPORTED_DOCUMENT_CONTENT}）。</p>
+     *
+     * <h3>为什么必须验证到「命名空间 + 层级 + 关系模式」</h3>
+     * <p>「找一个名字叫 Relationship 的元素」这种检查可以被轻易绕过：</p>
+     * <ul>
+     *   <li>把关系标成 {@code TargetMode="External"}：它指向的是<b>包外</b>资源，
+     *       与「包内的主文档部件」根本不是一回事；</li>
+     *   <li>把 {@code Relationships} 放在别的命名空间：那不是 OPC 关系部件；</li>
+     *   <li>把假的 {@code Relationship} 嵌在包装元素里：OPC 只认根元素的<b>直属</b>子元素；</li>
+     *   <li>用大小写不同的 {@code Target} 指向别的部件：部件名是区分大小写的。</li>
+     * </ul>
+     * <p>因此这里对根元素、命名空间、直属子元素与属性值都做精确判定；
+     * 任何「无法唯一、无歧义证明它是内部主文档关系」的情况都判为不受支持。</p>
      *
      * @param spooled 已落盘的包文件
      * @throws DocumentParsingException 不是 DOCX 或包损坏
@@ -340,7 +369,7 @@ public final class TikaDocumentTextParser implements DocumentTextParser {
                 throw unsupportedContent("OOXML 包的主文档部件不是 WordprocessingML");
             }
             if (!officeDocumentRelationshipPointsToWordDocument(open)) {
-                throw unsupportedContent("OOXML 包的 officeDocument 关系未指向 word/document.xml");
+                throw unsupportedContent("OOXML 包没有唯一且内部的 officeDocument 关系指向 word/document.xml");
             }
             if (open.getEntry(WORD_DOCUMENT_PART) == null) {
                 // 包已经明确声明自己是 WordprocessingML、关系也指向主文档部件，但那个部件不存在：
@@ -358,6 +387,10 @@ public final class TikaDocumentTextParser implements DocumentTextParser {
     /**
      * 计算 {@code /word/document.xml} 的生效内容类型（Override 优先，其次按扩展名 Default）。
      *
+     * <p>只有「正确命名空间下的 {@code Types} 根元素」及其「同命名空间的直属
+     * {@code Default}/{@code Override} 子元素」才能作为类型证明：伪造同名元素、
+     * 错误命名空间、嵌套在包装元素里的声明一律不认。</p>
+     *
      * @param zip 已打开的包
      * @return 生效的内容类型；无法确定时返回 {@code null}
      */
@@ -367,54 +400,146 @@ public final class TikaDocumentTextParser implements DocumentTextParser {
             return null;
         }
         Element root = contentTypes.getDocumentElement();
-        if (root == null || !"Types".equals(root.getLocalName() == null ? root.getNodeName()
-                : root.getLocalName())) {
+        if (!isElementInNamespace(root, "Types", OPC_CONTENT_TYPES_NAMESPACE)) {
             return null;
         }
 
         String partName = "/" + WORD_DOCUMENT_PART;
-        NodeList children = root.getChildNodes();
+        String overrideForMainPart = null;
         String defaultForXml = null;
-        for (int index = 0; index < children.getLength(); index++) {
-            Node node = children.item(index);
-            if (!(node instanceof Element element)) {
-                continue;
+        for (Element child : directChildrenInNamespace(root, OPC_CONTENT_TYPES_NAMESPACE)) {
+            String localName = child.getLocalName();
+            if ("Override".equals(localName) && overrideForMainPart == null
+                    && partName.equals(child.getAttribute("PartName"))) {
+                overrideForMainPart = child.getAttribute("ContentType");
             }
-            String localName = element.getLocalName() == null ? element.getNodeName() : element.getLocalName();
-            if ("Override".equals(localName) && partName.equals(element.getAttribute("PartName"))) {
-                return element.getAttribute("ContentType");
-            }
-            if ("Default".equals(localName) && "xml".equalsIgnoreCase(element.getAttribute("Extension"))) {
-                defaultForXml = element.getAttribute("ContentType");
+            else if ("Default".equals(localName) && defaultForXml == null
+                    && "xml".equalsIgnoreCase(child.getAttribute("Extension"))) {
+                defaultForXml = child.getAttribute("ContentType");
             }
         }
-        return defaultForXml;
+        return overrideForMainPart != null ? overrideForMainPart : defaultForXml;
     }
 
     /**
+     * 判断 {@code _rels/.rels} 是否<b>唯一且无歧义</b>地声明了内部主文档关系。
+     *
+     * <p>判定规则（全部为精确判定）：</p>
+     * <ul>
+     *   <li>根元素必须是 OPC 关系命名空间下的 {@code Relationships}；</li>
+     *   <li>只检查根元素的<b>直属</b>子元素，且子元素必须属于同一命名空间；</li>
+     *   <li>{@code Type} 必须精确等于 officeDocument 关系 URI；</li>
+     *   <li>这样的关系必须<b>恰好一个</b> —— 多个就说明包自相矛盾，无法唯一证明；</li>
+     *   <li>{@code TargetMode} 必须缺失或精确等于 {@code Internal}（大小写、空白变体一律拒绝）；</li>
+     *   <li>{@code Target} 必须区分大小写地精确等于 {@code word/document.xml}
+     *       （容忍单个前导 {@code /}）；不做路径归一化，反斜杠、{@code ../}、query、fragment 都是不同字符串。</li>
+     * </ul>
+     *
      * @param zip 已打开的包
-     * @return {@code _rels/.rels} 中的 officeDocument 关系是否指向 {@code word/document.xml}
+     * @return 是否可唯一、无歧义地证明内部主文档关系
      */
     private static boolean officeDocumentRelationshipPointsToWordDocument(ZipFile zip) throws IOException {
         Document relationships = readPackageXml(zip, PACKAGE_RELATIONSHIPS_PART);
         if (relationships == null) {
             return false;
         }
-        NodeList nodes = relationships.getElementsByTagNameNS("*", "Relationship");
-        for (int index = 0; index < nodes.getLength(); index++) {
-            if (!(nodes.item(index) instanceof Element relationship)) {
+        Element root = relationships.getDocumentElement();
+        if (!isElementInNamespace(root, "Relationships", OPC_RELATIONSHIPS_NAMESPACE)) {
+            return false;
+        }
+
+        int officeDocumentRelationships = 0;
+        for (Element relationship : directChildrenInNamespace(root, OPC_RELATIONSHIPS_NAMESPACE)) {
+            if (!"Relationship".equals(relationship.getLocalName())) {
                 continue;
             }
             if (!OFFICE_DOCUMENT_RELATIONSHIP.equals(relationship.getAttribute("Type"))) {
                 continue;
             }
-            String target = relationship.getAttribute("Target");
-            String normalized = target.startsWith("/") ? target.substring(1) : target;
-            if (WORD_DOCUMENT_PART.equalsIgnoreCase(normalized)) {
-                return true;
+            officeDocumentRelationships++;
+            if (officeDocumentRelationships > 1) {
+                return false;
+            }
+            if (!isInternalRelationship(relationship)) {
+                return false;
+            }
+            if (!WORD_DOCUMENT_PART.equals(stripSingleLeadingSlash(relationship.getAttribute("Target")))) {
+                return false;
             }
         }
-        return false;
+        return officeDocumentRelationships == 1;
+    }
+
+    /**
+     * 关系必须是内部关系：{@code TargetMode} 缺失，或精确等于 {@code Internal}。
+     *
+     * <p>通过遍历属性而不是直接 {@code getAttribute} 来判断「缺失」，这样
+     * {@code TargetMode=""}、{@code TargetMode=" internal "} 与带前缀的同名属性
+     * 都会被识破（它们都不是「缺失」，也都不是精确的 {@code Internal}）。</p>
+     *
+     * @param relationship 关系元素
+     * @return 是否是内部关系
+     */
+    private static boolean isInternalRelationship(Element relationship) {
+        boolean targetModePresent = false;
+        NamedNodeMap attributes = relationship.getAttributes();
+        for (int index = 0; index < attributes.getLength(); index++) {
+            Node attribute = attributes.item(index);
+            if (!TARGET_MODE_ATTRIBUTE.equals(attribute.getLocalName())) {
+                continue;
+            }
+            if (targetModePresent) {
+                // 同一个属性出现两次（含带前缀的变体）：无法无歧义判定
+                return false;
+            }
+            targetModePresent = true;
+            if (attribute.getNamespaceURI() != null && !attribute.getNamespaceURI().isEmpty()) {
+                return false;
+            }
+            if (!TARGET_MODE_INTERNAL.equals(attribute.getNodeValue())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 只容忍「单个前导斜杠」这一种兼容写法；其余字符串一律原样返回（不做任何归一化）。
+     *
+     * @param target 关系目标原始值
+     * @return 去掉单个前导斜杠后的值
+     */
+    private static String stripSingleLeadingSlash(String target) {
+        return target.startsWith("/") ? target.substring(1) : target;
+    }
+
+    /**
+     * @param element  候选元素，可为 {@code null}
+     * @param localName 期望的本地名
+     * @param namespace 期望的命名空间
+     * @return 元素是否精确匹配「命名空间 + 本地名」
+     */
+    private static boolean isElementInNamespace(Element element, String localName, String namespace) {
+        return element != null
+                && namespace.equals(element.getNamespaceURI())
+                && localName.equals(element.getLocalName());
+    }
+
+    /**
+     * @param parent    父元素
+     * @param namespace 只返回该命名空间下的<b>直属</b>子元素
+     * @return 直属子元素列表
+     */
+    private static List<Element> directChildrenInNamespace(Element parent, String namespace) {
+        List<Element> children = new ArrayList<>();
+        NodeList nodes = parent.getChildNodes();
+        for (int index = 0; index < nodes.getLength(); index++) {
+            if (nodes.item(index) instanceof Element element
+                    && namespace.equals(element.getNamespaceURI())) {
+                children.add(element);
+            }
+        }
+        return List.copyOf(children);
     }
 
     /**

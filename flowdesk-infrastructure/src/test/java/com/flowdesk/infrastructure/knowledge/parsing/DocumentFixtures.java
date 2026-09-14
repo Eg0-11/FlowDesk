@@ -357,6 +357,218 @@ final class DocumentFixtures {
     private static final String DOCX_MAIN_CONTENT_TYPE =
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml";
 
+    /** OPC 内容类型部件的正确命名空间。 */
+    static final String OPC_CONTENT_TYPES_NAMESPACE =
+            "http://schemas.openxmlformats.org/package/2006/content-types";
+
+    /** OPC 关系部件的正确命名空间。 */
+    static final String OPC_RELATIONSHIPS_NAMESPACE =
+            "http://schemas.openxmlformats.org/package/2006/relationships";
+
+    // ---------- OPC 关系/内容类型反例夹具（FD-0009-R2） ----------
+
+    /**
+     * 用给定的内容类型部件、关系部件与主文档正文拼一个 OOXML 包。
+     *
+     * @param contentTypesXml {@code [Content_Types].xml} 的完整内容
+     * @param relationshipsXml {@code _rels/.rels} 的完整内容
+     * @param documentXml     {@code word/document.xml} 的完整内容
+     * @return DOCX 形状的字节
+     */
+    static byte[] docxPackage(String contentTypesXml, String relationshipsXml, String documentXml) {
+        return zip(java.util.Map.of(
+                "[Content_Types].xml", contentTypesXml,
+                "_rels/.rels", relationshipsXml,
+                "word/document.xml", documentXml));
+    }
+
+    /**
+     * @return 正确命名空间、正确类型的 {@code [Content_Types].xml}
+     */
+    static String correctContentTypes() {
+        return contentTypes(override("/word/document.xml", DOCX_MAIN_CONTENT_TYPE));
+    }
+
+    /**
+     * @param innerXml 关系元素（可多个）
+     * @return 正确命名空间的 {@code Relationships} 根元素
+     */
+    static String correctRelationships(String innerXml) {
+        return "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+                + "<Relationships xmlns=\"" + OPC_RELATIONSHIPS_NAMESPACE + "\">" + innerXml
+                + "</Relationships>";
+    }
+
+    /**
+     * @param extraAttributes 追加在 Relationship 上的属性（例如 {@code TargetMode="External"}）
+     * @param target          关系目标
+     * @return officeDocument 关系元素
+     */
+    static String officeDocumentRelationship(String extraAttributes, String target) {
+        return "<Relationship Id=\"rId1\" Type=\"" + OFFICE_DOCUMENT_RELATIONSHIP + "\""
+                + (extraAttributes.isEmpty() ? "" : " " + extraAttributes)
+                + " Target=\"" + escapeXml(target) + "\"/>";
+    }
+
+    /**
+     * @param text 段落文本
+     * @return 单段落的 WordprocessingML 正文
+     */
+    static String documentBody(String text) {
+        return "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+                + "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+                + "<w:body><w:p><w:r><w:t>" + escapeXml(text) + "</w:t></w:r></w:p></w:body></w:document>";
+    }
+
+    /**
+     * 一个「officeDocument 关系带指定 TargetMode」的包。
+     *
+     * @param targetModeAttribute {@code TargetMode} 属性原文，例如 {@code TargetMode="External"}
+     * @return DOCX 形状的字节
+     */
+    static byte[] docxWithTargetMode(String targetModeAttribute) {
+        return docxPackage(correctContentTypes(),
+                correctRelationships(officeDocumentRelationship(targetModeAttribute, "word/document.xml")),
+                documentBody("第一段内容"));
+    }
+
+    /**
+     * 一个「officeDocument 关系指向指定 Target」的包（本地仍有小写 {@code word/document.xml}）。
+     *
+     * @param target 关系目标原文
+     * @return DOCX 形状的字节
+     */
+    static byte[] docxWithTarget(String target) {
+        return docxPackage(correctContentTypes(),
+                correctRelationships(officeDocumentRelationship("", target)),
+                documentBody("第一段内容"));
+    }
+
+    /**
+     * 一个「关系根元素位于错误命名空间」的包。
+     *
+     * @return DOCX 形状的字节
+     */
+    static byte[] docxWithWrongRelationshipsNamespace() {
+        return docxPackage(correctContentTypes(),
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+                        + "<Relationships xmlns=\"urn:flowdesk:not-opc\">"
+                        + officeDocumentRelationship("", "word/document.xml") + "</Relationships>",
+                documentBody("第一段内容"));
+    }
+
+    /**
+     * 一个「Relationship 元素位于错误命名空间」的包（根元素正确）。
+     *
+     * @return DOCX 形状的字节
+     */
+    static byte[] docxWithRelationshipInWrongNamespace() {
+        return docxPackage(correctContentTypes(),
+                correctRelationships("<Relationship xmlns=\"urn:flowdesk:not-opc\" Id=\"rId1\" Type=\""
+                        + OFFICE_DOCUMENT_RELATIONSHIP + "\" Target=\"word/document.xml\"/>"),
+                documentBody("第一段内容"));
+    }
+
+    /**
+     * 一个「伪 Relationship 被嵌套在包装元素里」的包（根元素与包装元素都正确）。
+     *
+     * @return DOCX 形状的字节
+     */
+    static byte[] docxWithNestedFakeRelationship() {
+        return docxPackage(correctContentTypes(),
+                correctRelationships("<Wrapper>" + officeDocumentRelationship("", "word/document.xml")
+                        + "</Wrapper>"),
+                documentBody("第一段内容"));
+    }
+
+    /**
+     * 一个「没有任何 officeDocument 关系」的包。
+     *
+     * @return DOCX 形状的字节
+     */
+    static byte[] docxWithoutOfficeDocumentRelationship() {
+        return docxPackage(correctContentTypes(),
+                correctRelationships("<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/"
+                        + "officeDocument/2006/relationships/extended-properties\" Target=\"docProps/app.xml\"/>"),
+                documentBody("第一段内容"));
+    }
+
+    /**
+     * 一个「有两个 officeDocument 关系」的包（自相矛盾，无法唯一证明）。
+     *
+     * @return DOCX 形状的字节
+     */
+    static byte[] docxWithTwoOfficeDocumentRelationships() {
+        return docxPackage(correctContentTypes(),
+                correctRelationships(officeDocumentRelationship("", "word/document.xml")
+                        + officeDocumentRelationship("", "word/document.xml").replace("rId1", "rId2")),
+                documentBody("第一段内容"));
+    }
+
+    /**
+     * 一个「除 officeDocument 之外还有其它关系类型」的包：真实 DOCX 就是这样，必须照常解析。
+     *
+     * @return DOCX 形状的字节
+     */
+    static byte[] docxWithAdditionalRelationshipTypes() {
+        return docxPackage(correctContentTypes(),
+                correctRelationships(officeDocumentRelationship("", "word/document.xml")
+                        + "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/"
+                        + "relationships/extended-properties\" Target=\"docProps/app.xml\"/>"
+                        + "<Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/package/2006/"
+                        + "relationships/metadata/core-properties\" Target=\"docProps/core.xml\"/>"),
+                documentBody("第一段内容"));
+    }
+
+    /**
+     * 一个「内容类型根元素位于错误命名空间」的包。
+     *
+     * @return DOCX 形状的字节
+     */
+    static byte[] docxWithWrongContentTypesNamespace() {
+        return docxPackage("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+                        + "<Types xmlns=\"urn:flowdesk:not-opc\">"
+                        + override("/word/document.xml", DOCX_MAIN_CONTENT_TYPE) + "</Types>",
+                correctRelationships(officeDocumentRelationship("", "word/document.xml")),
+                documentBody("第一段内容"));
+    }
+
+    /**
+     * 一个「Override 元素位于错误命名空间」的包（根元素正确）。
+     *
+     * @return DOCX 形状的字节
+     */
+    static byte[] docxWithContentTypeOverrideInWrongNamespace() {
+        return docxPackage(typesElement("<Override xmlns=\"urn:flowdesk:not-opc\" PartName=\"/word/document.xml\""
+                        + " ContentType=\"" + DOCX_MAIN_CONTENT_TYPE + "\"/>"),
+                correctRelationships(officeDocumentRelationship("", "word/document.xml")),
+                documentBody("第一段内容"));
+    }
+
+    /**
+     * 一个「伪 Override 被嵌套在包装元素里」的包（根元素与包装元素都正确）。
+     *
+     * @return DOCX 形状的字节
+     */
+    static byte[] docxWithNestedFakeContentTypeOverride() {
+        return docxPackage(typesElement("<Wrapper>"
+                        + override("/word/document.xml", DOCX_MAIN_CONTENT_TYPE) + "</Wrapper>"),
+                correctRelationships(officeDocumentRelationship("", "word/document.xml")),
+                documentBody("第一段内容"));
+    }
+
+    /**
+     * 一个「正文非常长」的包，用于验证类型错误优先于提取上限。
+     *
+     * @param contentTypesXml  {@code [Content_Types].xml} 的内容
+     * @param relationshipsXml {@code _rels/.rels} 的内容
+     * @param bodyCharacters   正文字符数
+     * @return DOCX 形状的字节
+     */
+    static byte[] docxPackageWithLongBody(String contentTypesXml, String relationshipsXml, int bodyCharacters) {
+        return docxPackage(contentTypesXml, relationshipsXml, documentBody("长".repeat(bodyCharacters)));
+    }
+
     private static String override(String partName, String contentType) {
         return "<Override PartName=\"" + partName + "\" ContentType=\"" + contentType + "\"/>";
     }

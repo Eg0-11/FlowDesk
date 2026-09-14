@@ -1,36 +1,41 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0008 —— 知识文档领域模型与安全上传链路（RAG 1/6，已完成）**
+> **当前阶段：FD-0009 —— 文档解析与确定性切片（RAG 2/6，已完成；含 R1/R2 两轮修复）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
 > 工单 REST 接口 + ETag 并发协议 + 统一错误契约（FD-0006）、
 > 列表接口 + offset 分页 + 排序白名单 + 条件搜索（FD-0007）、
-> 知识文档上传 + 原始文件存储 + 元数据查询（FD-0008）。
-> 尚未实现：文档解析与切片、Embedding 与向量库、RAG 检索、文档列表/下载/删除、
-> 孤立文件清理任务、游标分页、PostgreSQL 全文检索与 pg_trgm、MCP 能力、Agent Graph、
-> 鉴权与前端。
+> 知识文档上传 + 原始文件存储 + 元数据查询（FD-0008）、
+> 文档解析（PDF/DOCX/Markdown/TXT，含 OOXML 包类型验证与显式关闭 OCR）+
+> 确定性切片 + 解析状态机与原子落库（FD-0009）。
+> 尚未实现：Embedding 与向量库、向量检索与 RAG 检索增强、切片内容的公开读取接口、
+> 文档列表/下载/删除、孤立文件清理任务、`PARSING` 悬挂的恢复扫描、
+> 游标分页、PostgreSQL 全文检索与 pg_trgm、MCP 能力、Agent Graph、鉴权与前端。
 
 ## 一、项目简介
 
 FlowDesk 面向企业 IT 服务与运营场景，规划能力包括：智能化工单流转、知识库运营、RAG 检索增强、
 Tool 调用、MCP 资产/监控服务以及基于 Agent Graph 的自动化编排。
 
-当前仓库已经完成两件事：一是打通的 AI 垂直链路
+当前仓库已经完成四件事：一是打通的 AI 垂直链路
 （**HTTP → 用例 → Agent 编排 → Spring AI ChatClient → DeepSeek（OpenAI 兼容传输）→
 本地只读工具 → 模型汇总 → HTTP 响应**），二是纯 Java 的工单领域核心
-（工单聚合与生命周期状态机），并保留了清晰的模块边界、单向依赖方向与统一的版本基线。
+（工单聚合与生命周期状态机）与完整的工单 REST 链路（ETag 乐观并发、分页与条件搜索），
+三是知识文档的**安全上传链路**（流式落盘、内容键与路径收敛、失败补偿），
+四是文档的**解析与确定性切片**（真实 PDF/DOCX/Markdown/TXT → 纯文本 → 确定性切片 → 原子落库），
+并保留了清晰的模块边界、单向依赖方向与统一的版本基线。
 
 ## 二、模块职责
 
 | 模块 | 职责 | 当前状态 |
 | --- | --- | --- |
 | `flowdesk-shared` | 通用异常、基础类型、工具类 | 仅模块与 `package-info.java` |
-| `flowdesk-domain` | 领域实体、值对象、领域规则（**不依赖 Spring**） | 已实现工单聚合与生命周期状态机（`com.flowdesk.domain.ticket`） |
-| `flowdesk-application` | 用例服务、输入输出端口 | 已实现 AI 用例（`…application.ai`）与工单用例 + 乐观并发契约（`…application.ticket`） |
+| `flowdesk-domain` | 领域实体、值对象、领域规则（**不依赖 Spring**） | 已实现工单聚合与生命周期状态机（`com.flowdesk.domain.ticket`）、知识文档聚合与解析状态机、切片不变量（`com.flowdesk.domain.knowledge`） |
+| `flowdesk-application` | 用例服务、输入输出端口 | 已实现 AI 用例（`…application.ai`）、工单用例 + 乐观并发契约（`…application.ticket`）、知识文档上传/查询/解析用例与端口（`…application.knowledge`） |
 | `flowdesk-agent` | AI 编排：实现 application 的 AI 用例，用 ChatClient 编排提示词与本地工具 | 已实现普通聊天与工具冒烟 |
-| `flowdesk-infrastructure` | 持久化与模型适配器 | 已提供 JDBC 工单存储（`…ticket.persistence.jdbc`）与 DeepSeek 传输适配 |
-| `flowdesk-bootstrap` | FlowDesk 主服务启动模块（Web + Validation + Actuator + AI 接口 + 工单 REST 接口） | 可启动，端口 8080 |
+| `flowdesk-infrastructure` | 持久化与模型适配器 | 已提供 JDBC 工单存储（`…ticket.persistence.jdbc`）、DeepSeek 传输适配，以及知识文档的 JDBC 存储、本地文件系统内容读写、Tika 解析适配器与确定性切片器（`…knowledge.*`） |
+| `flowdesk-bootstrap` | FlowDesk 主服务启动模块（Web + Validation + Actuator + AI 接口 + 工单 REST 接口 + 知识文档 REST 接口） | 可启动，端口 8080 |
 | `flowdesk-mcp-asset` | 独立资产 MCP 服务（Web + Actuator） | 可启动，端口 8091 |
 | `flowdesk-mcp-monitoring` | 独立监控 MCP 服务（Web + Actuator） | 可启动，端口 8092 |
 
@@ -694,7 +699,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0006 | 工单 REST API、ProblemDetail 与 ETag 并发协议 | ✅ 已完成 |
 | FD-0007 | 工单列表、分页、排序与条件搜索 | ✅ 已完成 |
 | FD-0008 | 知识文档领域模型与安全上传链路（RAG 1/6） | ✅ 已完成 |
-| FD-0009 | 文档解析与确定性切片（RAG 2/6） | ✅ 已完成 |
+| FD-0009 | 文档解析与确定性切片（RAG 2/6） | ✅ 已完成（含 R1/R2 两轮修复：OOXML 类型验证、OCR 关闭、提取上限语义、持久化端口防线、OPC 关系证明与 Unicode 流状态） |
 | 后续 | RAG 3/6：Embedding 与向量存储 | 未开始 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm` | 未开始 |
 | 后续 | RAG：向量检索与检索增强生成 | 未开始 |
@@ -708,7 +713,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | 项 | 状态 | 含义 |
 | --- | --- | --- |
 | H2 集成 / HTTP 集成 | ✅ 已执行 | 真实 Spring 上下文、真实 JDBC、真实 Flyway 迁移（V1+V2+V3+V4）、真实并发线程、真实文件系统、真实 multipart 上传，以及真实 PDF/DOCX 解析（夹具按规范现场生成） |
-| 本地 smoke（默认 profile） | ✅ 已执行 | 真实进程 + 真实 HTTP multipart 上传 + 存储目录落盘校验（见 FD-0008 交付报告） |
+| 本地 smoke（默认 profile） | ✅ 已执行 | 真实进程 + 真实 HTTP：multipart 上传、存储目录落盘校验（FD-0008）、文档解析与状态推进、伪装 XLSX/普通 ZIP 被拒（FD-0009 / R1） |
 | PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证** |
 | 真实 DeepSeek | ⚠️ **LIVE_SMOKE=NOT_RUN** | 无 `DEEPSEEK_API_KEY`，**未对真实模型发起过任何请求** |
 
@@ -722,8 +727,10 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 
 设计取舍见 [`docs/adr/0005-knowledge-document-upload-storage.md`](docs/adr/0005-knowledge-document-upload-storage.md)。
 
-本阶段只做「收进来 + 查得到」：**不做**文档解析与切片（由 FD-0009 完成），
-**不做** Embedding、向量库与 RAG 检索，也没有文档列表、下载、删除或版本更新接口。
+本节描述的是 **FD-0008 那一阶段的边界**：只做「收进来 + 查得到」。
+当时的范围里**不包含**文档解析与切片 —— 它们已在 **FD-0009 实现**，见第十六章；
+本节也**不包含** Embedding、向量库与 RAG 检索，并且没有文档列表、下载、删除或版本更新接口。
+换句话说：上传阶段的文档状态停留在 `UPLOADED`，把它推进到 `PARSED` 的接口属于 FD-0009。
 
 ### 15.1 接口表
 
@@ -944,7 +951,7 @@ PARSE_FAILED ──claim──┘        └──fail────▶ PARSE_FAIL
 | 边界 | 做法 |
 | --- | --- |
 | 路径逃逸 | 只接受内容键；字符集白名单 + 解析结果必须在存储根目录内；只读普通文件、**不跟随符号链接** |
-| DOCX 类型混淆 | **ZIP 初筛 + OOXML 包类型验证**：只有「`/word/document.xml` 的生效内容类型是 WordprocessingML **且** `officeDocument` 关系指向该部件 **且** 该部件存在」才当作 DOCX；XLSX / PPTX / DOCM / XPS / 普通 ZIP 一律 `UNSUPPORTED_DOCUMENT_CONTENT` |
+| DOCX 类型混淆 | **ZIP 初筛 + OOXML 包类型验证**（R1 加入，R2 收紧到 OPC 级别）：`[Content_Types].xml` 的根必须是 OPC 内容类型命名空间下的 `Types`，其对 `/word/document.xml` **生效**的内容类型必须是 WordprocessingML；`_rels/.rels` 的根必须是 OPC 关系命名空间下的 `Relationships`，其中必须有**恰好一个** `officeDocument` 关系、且是**内部**关系（`TargetMode` 缺失或精确等于 `Internal`）、`Target` 区分大小写地精确等于 `word/document.xml`（容忍单个前导 `/`）。XLSX / PPTX / DOCM / XPS / 普通 ZIP / 命名空间或层级造假 / 大小写不符一律 `UNSUPPORTED_DOCUMENT_CONTENT` |
 | 伪造格式 | PDF 必须 `%PDF-`、DOCX 必须 `PK\x03\x04`（初筛）；不符 → `UNSUPPORTED_DOCUMENT_CONTENT` |
 | 损坏文档 | 容器读不出来、已声明的主文档部件缺失、正文无法解析 → `CORRUPTED_DOCUMENT`（按异常**类型**映射，不解析异常文本） |
 | 加密文档 | → `ENCRYPTED_DOCUMENT`（测试用现场构造的加密 PDF 真实验证） |
@@ -982,10 +989,12 @@ PARSE_FAILED ──claim──┘        └──fail────▶ PARSE_FAIL
 
 四个属性在**启动期**校验（组合溢出用 `long` 计算），不合法就让应用启动失败。
 
-**提取上限覆盖「最终输出」的每一个 code point**（FD-0009-R1 修正）：
+**提取上限覆盖「最终输出」的每一个 code point**（FD-0009-R1 修正，R2 补齐状态语义）：
 普通字符、`ignorableWhitespace`、块级元素之间自动补的结构换行、跨 SAX 回调与跨 8192 char 解码缓冲区的
 代理对，全部经过同一个计数器；不变量是 `text().codePointCount(0, text().length()) <= 上限`。
-另外，**只有文本开头的 UTF-8 BOM 被丢弃且不占配额**，其它位置的 `U+FEFF` 按普通内容计数；
+另外：**只有输入流的第一个 code point 是 `U+FEFF` 时才被丢弃且不占配额**（第二个 `U+FEFF` 就是普通内容），
+空回调不会消耗「首字符尚未判断」这一状态，结构换行会结束它；
+写入顺序与输入完全一致（先落高代理、再写结构换行、最后是低代理），`text()` 是无副作用的观察；
 超限时在追加越界字符**之前**抛出，不会先拼出完整文本再回头检查。
 
 ### 16.6 数据与错误契约

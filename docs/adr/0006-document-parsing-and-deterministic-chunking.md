@@ -39,11 +39,14 @@ RAG 第 1 步解决了「把文件安全地收进来」。第 2 步要回答的�
    `PARSING` → `PARSED`/`PARSE_FAILED`，并发领取只有一个赢家；
 8. **失败补偿把文档落成 `PARSE_FAILED`**（可重试），补偿失败只作为 suppressed 保留；
 9. **解析是同步完成的**：HTTP 请求返回时切片已经落库，因此接口返回 200 而不是 202；
-10. **DOCX 必须验证到 OOXML 包的真实类型**（FD-0009-R1）：ZIP 初筛 → 有界落盘 →
-    包类型验证（内容类型 + `officeDocument` 关系 + 主文档部件），全部发生在正文提取之前；
+10. **DOCX 必须验证到 OOXML 包的真实类型**（FD-0009-R1 引入，R2 收紧）：ZIP 初筛 → 有界落盘 →
+    包类型验证（OPC 命名空间 + 直属子元素 + 恰好一个内部 `officeDocument` 关系 +
+    区分大小写的 `word/document.xml` 目标），全部发生在正文提取之前；
 11. **PDF 显式 `NO_OCR`**（FD-0009-R1）：解析行为不随部署环境是否安装 Tesseract 而改变；
-12. **提取上限覆盖最终输出的每一个 code point**（FD-0009-R1）：所有写入路径共用同一个
-    计数器，开头 BOM 不占配额，超限在追加越界字符前中断；
+12. **提取上限覆盖最终输出的每一个 code point**（FD-0009-R1 引入，R2 补齐状态语义）：
+    所有写入路径共用同一个计数器；只有输入流的**第一个** code point 是 `U+FEFF` 时才丢弃且不占配额；
+    空回调不消耗首字符状态、结构换行会结束它；写入顺序与输入一致；`text()` 是**无副作用**的观察；
+    超限在追加越界字符前中断；
 13. **完成解析端口与通用 update 都有防御性校验**（FD-0009-R1）：切片归属/序号/非空与
     状态转换矩阵都在数据库边界上强制，非法输入以既有稳定错误码拒绝且零写入。
 
@@ -71,7 +74,7 @@ RAG 第 1 步解决了「把文件安全地收进来」。第 2 步要回答的�
   不符即 `UNSUPPORTED_DOCUMENT_CONTENT`，而不是含糊的「解析失败」；
   而在 DOCX 上，这个「显式处理」还必须深入到 OOXML 包的真实类型，见下一节。
 
-### DOCX 必须验证到「OOXML 包的真实类型」（FD-0009-R1 修复）
+### DOCX 必须验证到「OOXML 包的真实类型」（FD-0009-R1 修复，R2 收紧到 OPC 级别）
 
 **问题**：FD-0009 只检查了 ZIP 文件头（`PK\x03\x04`），但 Tika 的 `OOXMLParser` 同时支持
 DOCX / XLSX / PPTX / XPS 等包，并且**按包自身的内容类型**选择子解析器。
@@ -84,16 +87,34 @@ DOCX / XLSX / PPTX / XPS 等包，并且**按包自身的内容类型**选择子
 1. **ZIP 初筛**：文件头不是 `PK\x03\x04` → `UNSUPPORTED_DOCUMENT_CONTENT`；
 2. **有界落盘**：固定 8 KiB 缓冲区把内容流式写入受控临时文件（**不**把输入读进堆），
    `finally` 中删除；调用方的 `InputStream` 始终由调用方关闭；
-3. **包类型验证**：`[Content_Types].xml` 中 `/word/document.xml` 的**生效**内容类型
-   （Override 优先于 Default，与 OPC 规则一致）必须是 WordprocessingML 主文档类型；
-   `_rels/.rels` 的 `officeDocument` 关系必须指向 `word/document.xml`；该部件必须存在。
+3. **包类型验证（R2 收紧）**：
+   - `[Content_Types].xml` 的**根元素**必须是 OPC 内容类型命名空间
+     （`…/package/2006/content-types`）下的 `Types`；`Default`/`Override` 必须是该根元素的
+     **直属同命名空间**子元素；`/word/document.xml` 的**生效**内容类型
+     （Override 优先于 Default，与 OPC 规则一致）必须是 WordprocessingML 主文档类型；
+   - `_rels/.rels` 的**根元素**必须是 OPC 关系命名空间
+     （`…/package/2006/relationships`）下的 `Relationships`；只检查它的**直属同命名空间**
+     `Relationship`；其中 `Type` 精确等于 officeDocument URI 的关系必须**恰好一个**；
+   - 该关系必须是**内部**关系：`TargetMode` **缺失**或**精确等于** `Internal`
+     （`External`、空值、空白变体、大小写变体一律拒绝）；
+   - `Target` 必须**区分大小写**地精确等于 `word/document.xml`（容忍单个前导 `/`）；
+     **不做任何路径归一化** —— `WORD/DOCUMENT.XML`、`./word/document.xml`、
+     `word/../word/document.xml`、反斜杠、query、fragment 都是不同字符串，一律拒绝；
+   - 最后 `word/document.xml` 部件必须存在。
+
+**为什么「找名字叫 Relationship 的元素」不够**（R1 的实现只做到这一步）：
+关系可以被标成 `TargetMode="External"`（指向包外资源）、可以放在别的命名空间、
+可以被嵌在包装元素里（OPC 只认根元素的直属子元素）、也可以用大小写不同的 `Target`
+指向别的部件（部件名区分大小写）。这些包在 R1 的实现下都会被**放过**并成功解析；
+R2 把它们全部判为 `UNSUPPORTED_DOCUMENT_CONTENT`，而合法的三种写法
+（`TargetMode` 缺失、`TargetMode="Internal"`、单个前导 `/`）照常解析。
 
 **判定职责的划分**（这样「类型不符」与「内部损坏」才是两个可操作的结论）：
 
 | 情形 | 结论 |
 | --- | --- |
 | XLSX / PPTX / DOCM / XPS / 普通 ZIP（内容类型不是 WordprocessingML） | `UNSUPPORTED_DOCUMENT_CONTENT` |
-| 内容类型声称 DOCX，但 `officeDocument` 关系指向别的部件（双面包） | `UNSUPPORTED_DOCUMENT_CONTENT` |
+| 内容类型或关系部件的命名空间/层级造假、外部关系、目标大小写不符、多义关系 | `UNSUPPORTED_DOCUMENT_CONTENT` |
 | ZIP 容器本身读不出来（PK 头 + 坏数据） | `CORRUPTED_DOCUMENT` |
 | 已声明 DOCX，但 `word/document.xml` 缺失或正文无法解析 | `CORRUPTED_DOCUMENT` |
 | `[Content_Types].xml` 解压后超过 1 MiB（无法据此证明它是 DOCX） | `UNSUPPORTED_DOCUMENT_CONTENT` |
@@ -189,13 +210,13 @@ Tika 标准包里的 OCR 模块制品可以留在依赖树中（它是标准包�
 | 边界 | 做法 |
 | --- | --- |
 | 路径逃逸 | 只接受内容键；字符集白名单 + 解析结果必须仍在存储根目录内；**只读普通文件且不跟随符号链接** |
-| DOCX 类型混淆 | ZIP 初筛 + OOXML 包类型验证（内容类型 + `officeDocument` 关系 + 主文档部件存在）；只看包内容 |
+| DOCX 类型混淆 | ZIP 初筛 + OPC 级包类型验证（命名空间 + 直属子元素 + 恰好一个**内部** officeDocument 关系 + 区分大小写的 `word/document.xml` 目标）；只看包内容 |
 | 伪造格式 | 解析前校验文件头；不符即 `UNSUPPORTED_DOCUMENT_CONTENT` |
 | 损坏文档 | 按异常**类型**映射为 `CORRUPTED_DOCUMENT`，不解析异常消息文本 |
 | 加密文档 | `EncryptedDocumentException` / PDFBox `InvalidPasswordException` / POI `EncryptedDocumentException` → `ENCRYPTED_DOCUMENT` |
 | OCR | PDF 固定 `OCR_STRATEGY.NO_OCR`，不依赖机器上是否安装 Tesseract |
 | 外部实体（XXE） | 解析只用本地解析器；包元数据用禁用 DOCTYPE/外部实体的安全 XML 解析器；测试用「引用本地文件的 DOCX」验证内容绝不进入提取文本 |
-| 资源耗尽 | 提取文本按 **code point** 限量，**所有写入路径**（字符、结构换行、跨回调/跨缓冲区代理对）共用同一计数器，超限在追加越界字符前中断；只读包元数据前 1 MiB；落盘用固定缓冲区（无 `readAllBytes`）；切片数量另有上限 |
+| 资源耗尽 | 提取文本按 **code point** 限量，**所有写入路径**（字符、结构换行、跨回调/跨缓冲区代理对）共用同一计数器，超限在追加越界字符前中断；只有首个 `U+FEFF` 不占配额；只读包元数据前 1 MiB；落盘用固定缓冲区（无 `readAllBytes`）；切片数量另有上限 |
 | 非法 UTF-8 | 文本格式用显式 `CodingErrorAction.REPORT` 的严格解码器；默认的替换行为会把损坏内容静默变成 `U+FFFD` |
 | 信息泄漏 | 响应里没有原文、切片内容、内容键、路径、解析器名称或异常文本；失败 `detail` 一律固定文案 |
 
