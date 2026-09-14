@@ -11,8 +11,19 @@ import java.io.InputStream;
  * 与 Servlet 容器配置都是<b>声明</b>，可能缺失、可能是错的，也可能是恶意构造的。
  * 唯一可靠的判断依据是一路读过来真正拿到了多少字节，所以限制必须落在读取路径上。</p>
  *
- * <p>超限时立刻抛出（而不是读完再判断）：调用方因此可以马上停止，
- * 不会为了一个注定被拒绝的请求把几百兆数据读完。</p>
+ * <h2>「最多只多读一个字节」</h2>
+ * <p>只在下游抛出异常是不够的：如果批量读取把调用方请求的长度（例如 1 MiB）原样透传给底层流，
+ * 那么「超限」被发现之前，底层已经被读掉了一大截 —— 对 5 字节上限的请求可以从网络/磁盘上拖走 100 字节，
+ * 攻击者只要反复发超大请求就能持续消耗 I/O 与磁盘临时空间。</p>
+ * <p>因此每次批量读取传给底层的长度都被收敛为 {@code remaining + 1}：</p>
+ * <ul>
+ *   <li>{@code remaining} 是「距离上限还差多少字节」；</li>
+ *   <li>多出的那 <b>1</b> 个字节是必要的：内容长度<b>恰好等于上限</b>时必须能读到 EOF，
+ *       否则会把合法内容误判为超限；</li>
+ *   <li>于是累计消费量最多是 {@code maxBytes + 1}，超过即抛错并停止读取。</li>
+ * </ul>
+ *
+ * <p>{@code skip} 同样受此约束，不能靠一次大跨度跳过绕开限制。</p>
  */
 public final class SizeLimitedInputStream extends FilterInputStream {
 
@@ -47,7 +58,16 @@ public final class SizeLimitedInputStream extends FilterInputStream {
 
     @Override
     public int read(byte[] buffer, int offset, int length) throws IOException {
-        int read = this.in.read(buffer, offset, length);
+        if (length == 0) {
+            return 0;
+        }
+        int allowed = (int) Math.min(length, readAllowance());
+        if (allowed == 0) {
+            // 已经超限过（或上限为 0 的退化情况）：一次都不再读，直接按超限处理
+            this.onExceeded.onLimitExceeded(this.maxBytes);
+            return 0;
+        }
+        int read = this.in.read(buffer, offset, allowed);
         if (read > 0) {
             count(read);
         }
@@ -56,8 +76,16 @@ public final class SizeLimitedInputStream extends FilterInputStream {
 
     @Override
     public long skip(long count) throws IOException {
-        long skipped = this.in.skip(count);
-        if (skipped > 0) {
+        if (count <= 0L) {
+            return 0L;
+        }
+        long allowed = Math.min(count, readAllowance());
+        if (allowed <= 0L) {
+            this.onExceeded.onLimitExceeded(this.maxBytes);
+            return 0L;
+        }
+        long skipped = this.in.skip(allowed);
+        if (skipped > 0L) {
             count(skipped);
         }
         return skipped;
@@ -73,6 +101,23 @@ public final class SizeLimitedInputStream extends FilterInputStream {
      */
     public long bytesRead() {
         return this.bytesRead;
+    }
+
+    /**
+     * 本次批量读取/跳过最多允许消费的字节数：{@code remaining + 1}。
+     *
+     * <p>{@code remaining + 1} 在 {@code maxBytes == Long.MAX_VALUE} 时会溢出，
+     * 因此显式做了边界处理；{@code remaining} 为负（已超限）时返回 0。</p>
+     */
+    private long readAllowance() {
+        long remaining = this.maxBytes - this.bytesRead;
+        if (remaining < 0L) {
+            return 0L;
+        }
+        if (remaining == Long.MAX_VALUE) {
+            return Long.MAX_VALUE;
+        }
+        return remaining + 1L;
     }
 
     private void count(long delta) {

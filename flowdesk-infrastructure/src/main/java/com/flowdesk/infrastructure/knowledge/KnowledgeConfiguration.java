@@ -9,6 +9,7 @@ import com.flowdesk.infrastructure.knowledge.storage.LocalFileSystemKnowledgeCon
 import com.flowdesk.infrastructure.knowledge.support.SystemKnowledgeTimeProvider;
 import com.flowdesk.infrastructure.knowledge.support.UuidKnowledgeDocumentIdGenerator;
 import java.time.Clock;
+import org.springframework.boot.autoconfigure.web.servlet.MultipartProperties;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -33,6 +34,23 @@ import org.springframework.jdbc.core.simple.JdbcClient;
 @Configuration(proxyBeanMethods = false)
 @EnableConfigurationProperties({ KnowledgeUploadProperties.class, KnowledgeStorageProperties.class })
 public class KnowledgeConfiguration {
+
+    /**
+     * 启动期校验两个上传上限不会冲突。
+     *
+     * <p>Bean 在装配阶段创建，因此配置冲突（例如应用上限 25MB 但容器上限仍是 20MB）
+     * 会让应用<b>启动失败</b>，而不是在生产里表现为「配了 25MB 却传不上去」。</p>
+     *
+     * @param upload    应用层上传配置
+     * @param multipart Spring Boot 的 multipart 配置（含默认值）
+     * @return 校验通过标记
+     */
+    @Bean
+    public Boolean knowledgeUploadLimitConsistency(KnowledgeUploadProperties upload,
+            MultipartProperties multipart) {
+
+        return KnowledgeUploadLimitValidator.validateOrFail(upload, multipart);
+    }
 
     /**
      * @param jdbcClient JDBC 客户端

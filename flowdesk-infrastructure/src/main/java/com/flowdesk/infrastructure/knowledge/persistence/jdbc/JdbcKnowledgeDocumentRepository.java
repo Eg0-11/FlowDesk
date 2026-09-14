@@ -11,6 +11,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.Objects;
 import java.util.Optional;
+import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.simple.JdbcClient;
 
@@ -65,6 +66,12 @@ public final class JdbcKnowledgeDocumentRepository implements KnowledgeDocumentR
                     KnowledgeApplicationErrorCode.KNOWLEDGE_DOCUMENT_ALREADY_EXISTS,
                     "文档标识或内容键已存在", ex);
         }
+        catch (DataAccessException ex) {
+            // 端口契约要求所有失败都以应用层错误码暴露：其它数据库异常同样要转换，
+            // 且保留原异常作为 cause（只用于服务端诊断，绝不进入响应）
+            throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.METADATA_STORAGE_FAILURE,
+                    "元数据写入失败", ex);
+        }
         return new VersionedKnowledgeDocument(document, 0L);
     }
 
@@ -72,10 +79,21 @@ public final class JdbcKnowledgeDocumentRepository implements KnowledgeDocumentR
     public Optional<VersionedKnowledgeDocument> findById(KnowledgeDocumentId documentId) {
         Objects.requireNonNull(documentId, "documentId 不能为 null");
 
-        return this.jdbcClient.sql(KnowledgeDocumentSql.SELECT_BY_ID)
-                .param(1, documentId.value())
-                .query(KnowledgeDocumentRowMapper::mapRow)
-                .optional();
+        try {
+            return this.jdbcClient.sql(KnowledgeDocumentSql.SELECT_BY_ID)
+                    .param(1, documentId.value())
+                    .query(KnowledgeDocumentRowMapper::mapRow)
+                    .optional();
+        }
+        catch (KnowledgeApplicationException ex) {
+            // RowMapper 已经判定「快照不自洽」（INVALID_PERSISTED_DOCUMENT），不能被下面的
+            // 通用映射覆盖成「元数据存储失败」—— 两者都映射 500，但诊断含义完全不同
+            throw ex;
+        }
+        catch (DataAccessException ex) {
+            throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.METADATA_STORAGE_FAILURE,
+                    "元数据读取失败", ex);
+        }
     }
 
     private static OffsetDateTime toOffsetDateTime(Instant instant) {

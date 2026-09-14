@@ -66,6 +66,14 @@ public final class SignatureValidatingInputStream extends FilterInputStream {
         return false;
     }
 
+    /**
+     * 跳过必须经过本类的 {@code read}，否则调用方可以 skip 掉整个文件来绕过文件头校验。
+     */
+    @Override
+    public long skip(long count) throws IOException {
+        return ValidatedSkips.skip(this, count);
+    }
+
     private void ensureValidated() throws IOException {
         if (this.validated) {
             return;

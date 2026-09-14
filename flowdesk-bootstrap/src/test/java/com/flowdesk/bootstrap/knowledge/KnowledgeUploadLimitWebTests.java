@@ -63,6 +63,23 @@ class KnowledgeUploadLimitWebTests {
     }
 
     @Test
+    void applicationLimitIsReachableUpToItsConfiguredValue() {
+        // 1023 字节：刚好落在应用上限（1KB）之内，必须成功 —— 这证明容器上限（4KB）
+        // 没有把真正的天花板压到应用上限以下（即不存在「配置改了但不可达」的静默漂移）
+        ResponseEntity<String> withinLimit = upload("边界内", "within.txt", repeat("a", 1023));
+        assertThat(withinLimit.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(withinLimit.getBody()).contains("\"sizeBytes\":1023");
+
+        // 1025 字节：只超过 1KB 一个字节，容器不会拦（4KB 上限），必须由应用层精确拦下
+        ResponseEntity<String> justOver = upload("边界外", "just-over.txt", repeat("a", 1025));
+        assertThat(justOver.getStatusCode()).isEqualTo(HttpStatus.PAYLOAD_TOO_LARGE);
+        assertThat(justOver.getBody())
+                .as("应用层必须真正按配置值生效，而不是被容器提前或延后")
+                .contains("\"code\":\"DOCUMENT_TOO_LARGE\"");
+        assertThat(countDocuments()).as("只有边界内那次留下了元数据").isEqualTo(1L);
+    }
+
+    @Test
     void smallUploadSucceedsAndIsReadable() {
         ResponseEntity<String> created = upload("小文件", "small.txt", repeat("a", 512));
 

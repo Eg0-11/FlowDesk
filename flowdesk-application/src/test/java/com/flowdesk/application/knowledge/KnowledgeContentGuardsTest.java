@@ -148,6 +148,148 @@ class KnowledgeContentGuardsTest {
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
+    // ---------- 限流：最多只多读一个字节（FD-0008-R1） ----------
+
+    @Test
+    void bulkReadConsumesAtMostOneByteBeyondTheLimit() {
+        // 复现验收场景：上限 5 字节，调用方一次请求 1024 字节
+        ConsumingInputStream delegate = new ConsumingInputStream(100);
+        SizeLimitedInputStream limited = new SizeLimitedInputStream(delegate, 5L, limit -> {
+            throw new KnowledgeApplicationException(
+                    KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE, "超限");
+        });
+
+        byte[] buffer = new byte[1024];
+        assertApplicationError(() -> limited.read(buffer, 0, 1024),
+                KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE);
+
+        assertThat(delegate.consumed())
+                .as("上限 5、单次请求 1024：底层累计消费必须 ≤ 上限 + 1")
+                .isEqualTo(6L);
+    }
+
+    @Test
+    void exactlyTheLimitIsStillAccepted() throws IOException {
+        ConsumingInputStream delegate = new ConsumingInputStream(10);
+        SizeLimitedInputStream limited = new SizeLimitedInputStream(delegate, 10L, limit -> {
+            throw new KnowledgeApplicationException(
+                    KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE, "超限");
+        });
+
+        assertThat(readAll(limited)).as("恰好等于上限必须合法（不得弱化该规则）").hasSize(10);
+        assertThat(delegate.consumed()).isEqualTo(10L);
+        assertThat(limited.bytesRead()).isEqualTo(10L);
+    }
+
+    @Test
+    void oneByteBeyondTheLimitConsumesExactlyLimitPlusOne() {
+        ConsumingInputStream delegate = new ConsumingInputStream(100);
+        SizeLimitedInputStream limited = new SizeLimitedInputStream(delegate, 5L, limit -> {
+            throw new KnowledgeApplicationException(
+                    KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE, "超限");
+        });
+
+        assertApplicationError(() -> readAll(limited), KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE);
+
+        assertThat(delegate.consumed()).as("max + 1 字节时不得再往前拖数据").isEqualTo(6L);
+    }
+
+    @Test
+    void repeatedBulkReadsStayBounded() {
+        ConsumingInputStream delegate = new ConsumingInputStream(10_000);
+        SizeLimitedInputStream limited = new SizeLimitedInputStream(delegate, 5L, limit -> {
+            throw new KnowledgeApplicationException(
+                    KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE, "超限");
+        });
+        byte[] buffer = new byte[4096];
+
+        // 第一次批量读就会被拦截；即便调用方捕获异常后继续读，也不得再消费底层数据
+        for (int attempt = 0; attempt < 5; attempt++) {
+            assertApplicationError(() -> limited.read(buffer, 0, 4096),
+                    KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE);
+        }
+
+        assertThat(delegate.consumed()).isEqualTo(6L);
+    }
+
+    @Test
+    void skipCannotBypassTheLimit() {
+        ConsumingInputStream delegate = new ConsumingInputStream(10_000);
+        SizeLimitedInputStream limited = new SizeLimitedInputStream(delegate, 5L, limit -> {
+            throw new KnowledgeApplicationException(
+                    KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE, "超限");
+        });
+
+        assertApplicationError(() -> limited.skip(9000L), KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE);
+
+        assertThat(delegate.consumed()).as("skip 同样受 remaining + 1 约束").isEqualTo(6L);
+    }
+
+    @Test
+    void signatureValidationCannotBeSkipped() {
+        byte[] expected = "%PDF-".getBytes(StandardCharsets.US_ASCII);
+
+        try (SignatureValidatingInputStream stream = new SignatureValidatingInputStream(
+                new java.io.ByteArrayInputStream(TEXT_CONTENT), expected, () -> {
+                    throw new KnowledgeApplicationException(
+                            KnowledgeApplicationErrorCode.UNSUPPORTED_DOCUMENT_FORMAT, "签名不匹配");
+                })) {
+            assertApplicationError(() -> stream.skip(TEXT_CONTENT.length),
+                    KnowledgeApplicationErrorCode.UNSUPPORTED_DOCUMENT_FORMAT);
+        }
+        catch (IOException ex) {
+            throw new AssertionError(ex);
+        }
+    }
+
+    @Test
+    void utf8ValidationCannotBeSkipped() {
+        byte[] invalid = { (byte) 0xC3, (byte) 0x28, 0x41, 0x42 };
+
+        try (Utf8ValidatingInputStream stream = new Utf8ValidatingInputStream(
+                new java.io.ByteArrayInputStream(invalid), reason -> {
+                    throw new KnowledgeApplicationException(
+                            KnowledgeApplicationErrorCode.UNSUPPORTED_DOCUMENT_FORMAT, reason);
+                })) {
+            assertApplicationError(() -> stream.skip(invalid.length),
+                    KnowledgeApplicationErrorCode.UNSUPPORTED_DOCUMENT_FORMAT);
+        }
+        catch (IOException ex) {
+            throw new AssertionError(ex);
+        }
+    }
+
+    @Test
+    void nulCheckCannotBeSkipped() {
+        byte[] withNul = { 'a', 0x00, 'b', 'c' };
+
+        try (Utf8ValidatingInputStream stream = new Utf8ValidatingInputStream(
+                new java.io.ByteArrayInputStream(withNul), reason -> {
+                    throw new KnowledgeApplicationException(
+                            KnowledgeApplicationErrorCode.UNSUPPORTED_DOCUMENT_FORMAT, reason);
+                })) {
+            assertApplicationError(() -> stream.skip(withNul.length),
+                    KnowledgeApplicationErrorCode.UNSUPPORTED_DOCUMENT_FORMAT);
+        }
+        catch (IOException ex) {
+            throw new AssertionError(ex);
+        }
+    }
+
+    @Test
+    void validatedSkipStillReturnsTheSkippedCountOnValidContent() throws IOException {
+        byte[] content = "0123456789".getBytes(StandardCharsets.UTF_8);
+
+        try (SignatureValidatingInputStream stream = new SignatureValidatingInputStream(
+                new java.io.ByteArrayInputStream(content), "012".getBytes(StandardCharsets.US_ASCII),
+                () -> {
+                    throw new IllegalStateException("不应触发");
+                })) {
+            assertThat(stream.skip(4L)).isEqualTo(4L);
+            assertThat(readAll(stream)).containsExactly('4', '5', '6', '7', '8', '9');
+        }
+    }
+
     // ---------- 文件头 ----------
 
     @Test
@@ -350,6 +492,58 @@ class KnowledgeContentGuardsTest {
             collected.write(buffer, 0, read);
         }
         return collected.toByteArray();
+    }
+
+    /**
+     * 记录<b>底层实际被消费字节数</b>的输入流。
+     *
+     * <p>限流测试不能只断言「抛了异常」：真正的缺陷是「异常抛出之前已经从底层拖走了多少数据」，
+     * 因此必须能观察到消费量。</p>
+     */
+    private static final class ConsumingInputStream extends InputStream {
+
+        private final long available;
+
+        private long consumed;
+
+        ConsumingInputStream(long available) {
+            this.available = available;
+        }
+
+        long consumed() {
+            return this.consumed;
+        }
+
+        @Override
+        public int read() {
+            if (this.consumed >= this.available) {
+                return -1;
+            }
+            this.consumed++;
+            return 'x';
+        }
+
+        @Override
+        public int read(byte[] buffer, int offset, int length) {
+            if (length == 0) {
+                return 0;
+            }
+            long remaining = this.available - this.consumed;
+            if (remaining <= 0L) {
+                return -1;
+            }
+            int count = (int) Math.min(length, remaining);
+            Arrays.fill(buffer, offset, offset + count, (byte) 'x');
+            this.consumed += count;
+            return count;
+        }
+
+        @Override
+        public long skip(long count) {
+            long skipped = Math.min(count, this.available - this.consumed);
+            this.consumed += Math.max(skipped, 0L);
+            return Math.max(skipped, 0L);
+        }
     }
 
     /**

@@ -37,5 +37,13 @@ public enum KnowledgeApplicationErrorCode {
     CONTENT_STORAGE_FAILURE,
 
     /** 元数据存储失败（数据库写入或读取失败）。 */
-    METADATA_STORAGE_FAILURE
+    METADATA_STORAGE_FAILURE,
+
+    /**
+     * 端口返回值违反自身契约，或内部依赖在调用时失败（服务端内部问题）。
+     *
+     * <p>与 {@code INVALID_*} 系错误码分开是<b>必须</b>的：来自存储端口或时间端口的不一致
+     * 绝不能落进领域异常的 400 映射里 —— 那是「调用方输入有问题」，而这一类是「服务端自己有问题」。</p>
+     */
+    KNOWLEDGE_INTERNAL_ERROR
 }

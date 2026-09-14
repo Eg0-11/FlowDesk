@@ -82,6 +82,14 @@ public final class Utf8ValidatingInputStream extends FilterInputStream {
         return false;
     }
 
+    /**
+     * 跳过必须经过本类的 {@code read}，否则调用方可以 skip 掉内容来绕过 UTF-8 与 NUL 校验。
+     */
+    @Override
+    public long skip(long count) throws IOException {
+        return ValidatedSkips.skip(this, count);
+    }
+
     private void validate(byte[] buffer, int offset, int length) {
         for (int index = offset; index < offset + length; index++) {
             if (buffer[index] == 0x00) {

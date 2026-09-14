@@ -58,7 +58,7 @@ public class KnowledgeExceptionHandler {
                     FlowDeskProblems.CODE_KNOWLEDGE_DOCUMENT_NOT_FOUND, "文档不存在",
                     "指定知识文档不存在", request);
             case KNOWLEDGE_DOCUMENT_ALREADY_EXISTS, INVALID_PERSISTED_DOCUMENT, CONTENT_STORAGE_FAILURE,
-                    METADATA_STORAGE_FAILURE -> problem(HttpStatus.INTERNAL_SERVER_ERROR,
+                    METADATA_STORAGE_FAILURE, KNOWLEDGE_INTERNAL_ERROR -> problem(HttpStatus.INTERNAL_SERVER_ERROR,
                     FlowDeskProblems.CODE_INTERNAL_SERVER_ERROR, "服务端错误",
                     "服务暂时不可用，请稍后重试", request);
         };

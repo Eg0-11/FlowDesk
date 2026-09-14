@@ -304,6 +304,76 @@ class JdbcKnowledgeDocumentRepositoryIntegrationTest {
                 .isInstanceOf(DataIntegrityViolationException.class);
     }
 
+    // ---------- ⑤ 数据库故障映射（FD-0008-R1） ----------
+
+    @Test
+    void insertMapsAnyDatabaseFailureToMetadataStorageFailure() {
+        JdbcKnowledgeDocumentRepository broken = brokenRepository();
+
+        KnowledgeApplicationException thrown = (KnowledgeApplicationException) org.assertj.core.api.Assertions
+                .catchThrowable(() -> broken.insert(document(randomId(), "a", "a.txt",
+                        sha256Hex("a".getBytes(StandardCharsets.UTF_8)), "key-a")));
+
+        assertThat(thrown.errorCode()).isEqualTo(KnowledgeApplicationErrorCode.METADATA_STORAGE_FAILURE);
+        assertThat(thrown.getCause()).as("必须保留原异常作为 cause 供服务端诊断")
+                .isInstanceOf(org.springframework.dao.DataAccessException.class);
+        assertThat(thrown.getMessage())
+                .as("对外文案不得包含 SQL、表名、驱动或路径")
+                .doesNotContain("SELECT").doesNotContain("INSERT")
+                .doesNotContain("knowledge_documents").doesNotContain("jdbc").doesNotContain("h2");
+    }
+
+    @Test
+    void findByIdMapsAnyDatabaseFailureToMetadataStorageFailure() {
+        JdbcKnowledgeDocumentRepository broken = brokenRepository();
+
+        KnowledgeApplicationException thrown = (KnowledgeApplicationException) org.assertj.core.api.Assertions
+                .catchThrowable(() -> broken.findById(randomId()));
+
+        assertThat(thrown.errorCode()).isEqualTo(KnowledgeApplicationErrorCode.METADATA_STORAGE_FAILURE);
+        assertThat(thrown.getCause()).isInstanceOf(org.springframework.dao.DataAccessException.class);
+        assertThat(thrown.getMessage()).doesNotContain("knowledge_documents").doesNotContain("jdbc");
+    }
+
+    @Test
+    void duplicateKeyStaysMappedToAlreadyExistsRatherThanStorageFailure() {
+        KnowledgeDocument document = insertSample();
+
+        KnowledgeApplicationException thrown = (KnowledgeApplicationException) org.assertj.core.api.Assertions
+                .catchThrowable(() -> repository.insert(document));
+
+        assertThat(thrown.errorCode())
+                .as("重复键必须保持自己的语义，不能被通用映射吞掉")
+                .isEqualTo(KnowledgeApplicationErrorCode.KNOWLEDGE_DOCUMENT_ALREADY_EXISTS);
+    }
+
+    @Test
+    void rowMapperFailureIsNotOverwrittenByTheGenericDatabaseMapping() {
+        KnowledgeDocument document = insertSample();
+        jdbcClient.sql("UPDATE knowledge_documents SET sha256 = ? WHERE id = ?")
+                .param(1, "z".repeat(64)).param(2, document.id().value()).update();
+
+        KnowledgeApplicationException thrown = (KnowledgeApplicationException) org.assertj.core.api.Assertions
+                .catchThrowable(() -> repository.findById(document.id()));
+
+        assertThat(thrown.errorCode())
+                .as("快照不自洽必须保持自己的错误码，而不是被当成数据库访问失败")
+                .isEqualTo(KnowledgeApplicationErrorCode.INVALID_PERSISTED_DOCUMENT);
+    }
+
+    /**
+     * 指向一个<b>没有建表</b>的独立 H2 数据库：用真实数据库故障驱动异常映射。
+     */
+    private static JdbcKnowledgeDocumentRepository brokenRepository() {
+        JdbcDataSource empty = new JdbcDataSource();
+        empty.setURL("jdbc:h2:mem:flowdesk_knowledge_broken_it"
+                + ";MODE=PostgreSQL;DB_CLOSE_DELAY=-1;DATABASE_TO_LOWER=TRUE");
+        empty.setUser("sa");
+        empty.setPassword("");
+        // 刻意不执行 Flyway：knowledge_documents 表不存在，任何访问都会失败
+        return new JdbcKnowledgeDocumentRepository(JdbcClient.create(empty));
+    }
+
     // ---------- 辅助 ----------
 
     private static void assertDatabaseRejects(String sql) {

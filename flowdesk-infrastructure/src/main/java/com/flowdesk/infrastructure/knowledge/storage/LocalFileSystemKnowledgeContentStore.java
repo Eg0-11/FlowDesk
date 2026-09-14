@@ -10,7 +10,8 @@ import com.flowdesk.domain.knowledge.Sha256Digest;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -56,6 +57,9 @@ public final class LocalFileSystemKnowledgeContentStore implements KnowledgeDocu
     /** 内容键前缀：由文档标识派生，但不与公共标识逐字相同。 */
     private static final String CONTENT_KEY_PREFIX = "kdoc-";
 
+    /** 退化发布路径使用的占位锁文件后缀。 */
+    private static final String CLAIM_SUFFIX = ".claim";
+
     /** 内容键允许的字符集：足够表达 UUID，同时排除路径分隔符与点号开头的相对路径。 */
     private static final Pattern SAFE_CONTENT_KEY = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._-]{0,254}");
 
@@ -90,40 +94,48 @@ public final class LocalFileSystemKnowledgeContentStore implements KnowledgeDocu
         String contentKey = generateContentKey(documentId);
         Path target = resolveWithinRoot(this.documentsRoot, contentKey);
         Path tempFile = null;
-        boolean moved = false;
 
         try {
             Files.createDirectories(this.documentsRoot);
             Files.createDirectories(this.tempRoot);
-            if (Files.exists(target)) {
-                throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.CONTENT_STORAGE_FAILURE,
-                        "目标内容已存在，拒绝覆盖");
-            }
 
             tempFile = Files.createTempFile(this.tempRoot, "upload-", ".part");
             CopyResult copied = copy(source, tempFile);
             if (copied.sizeBytes() == 0L) {
-                // 空内容在移动之前就拒绝：否则会先落一个空对象，再回头删
+                // 空内容在发布之前就拒绝：否则会先落一个空对象，再回头删
                 throw new KnowledgeApplicationException(
                         KnowledgeApplicationErrorCode.EMPTY_DOCUMENT_CONTENT, "上传内容为空");
             }
 
-            moveIntoPlace(tempFile, target);
-            moved = true;
+            publish(tempFile, target, contentKey);
 
-            return new StoredContent(contentKey, copied.sizeBytes(), Sha256Digest.of(copied.hexDigest()));
+            // 从这里开始，目标对象确定由本次调用发布
+            try {
+                return new StoredContent(contentKey, copied.sizeBytes(), Sha256Digest.of(copied.hexDigest()));
+            }
+            catch (RuntimeException ex) {
+                // 已发布但结果无法构造：删掉本次刚发布的对象，避免留下无引用的孤立文件。
+                // 这里的删除范围严格限定在「本次调用刚发布的对象」上，不会碰到别人的对象
+                deleteQuietly(target);
+                throw ex;
+            }
         }
         catch (KnowledgeApplicationException ex) {
             throw ex;
+        }
+        catch (FileAlreadyExistsException ex) {
+            // 目标已存在（并发的另一个发布者先到，或历史遗留对象）：拒绝覆盖，且绝不动它
+            throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.CONTENT_STORAGE_FAILURE,
+                    "目标内容已存在，拒绝覆盖", ex);
         }
         catch (IOException ex) {
             throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.CONTENT_STORAGE_FAILURE,
                     "内容存储失败", ex);
         }
         finally {
-            if (!moved) {
-                deleteQuietly(tempFile);
-            }
+            // 临时文件绝不留在磁盘上：发布成功时它已被链接/移动走（删除是幂等的），
+            // 发布失败时它就是需要清理的半截文件
+            deleteQuietly(tempFile);
         }
     }
 
@@ -206,17 +218,87 @@ public final class LocalFileSystemKnowledgeContentStore implements KnowledgeDocu
     }
 
     /**
-     * 把临时文件移到最终位置。
+     * 把临时文件发布到最终位置：<b>原子、且「目标存在即失败」</b>。
      *
-     * <p>优先 {@code ATOMIC_MOVE}；文件系统不支持时降级为同目录内的普通移动
-     * （同一目录内的重命名在实践中同样是原子的），但<b>始终不覆盖</b>已有对象。</p>
+     * <p>不能只靠「先 exists 再 move」：两个针对同一个文档标识的并发上传可能同时看到目标不存在，
+     * 然后后一个把前一个覆盖掉 —— 前一个的元数据就会指向被替换过的内容（甚至被失败方的补偿删除掉）。</p>
+     *
+     * <h3>首选：硬链接（原子 create-if-absent，且内容一次性可见）</h3>
+     * <p>{@link Files#createLink(Path, Path)} 对应 POSIX 的 {@code link(2)} 与 Windows 的
+     * {@code CreateHardLink}：它<b>在目标已存在时原子地失败</b>，<b>永不替换</b>已有目标，
+     * 并且目标一出现就指向完整的临时文件内容 —— 三个要求一次满足。
+     * 临时文件与目标必须位于同一文件系统（本适配器把临时目录放在存储根目录下，正是为此）。</p>
+     *
+     * <h3>退化：CREATE_NEW 占位锁 + ATOMIC_MOVE</h3>
+     * <p>某些文件系统（FAT/exFAT、部分网络文件系统、权限受限环境）不支持硬链接。
+     * 此时退化为「先原子占位、再检查、再原子移动」：{@link Files#createFile(Path, FileAttribute[])}
+     * 使用 {@code CREATE_NEW} 语义（POSIX 的 {@code O_CREAT|O_EXCL}、Windows 的 {@code CREATE_NEW}），
+     * 在几乎所有文件系统上都是原子的，因此它能把「检查目标是否存在 + 移动」变成一个
+     * <b>互斥临界区</b>：同一存储根目录下的任何两个发布者都不可能同时进入。</p>
+     *
+     * <p>剩余边界：如果<b>本服务之外</b>的进程往存储根目录里写同名对象，退化路径无法察觉。
+     * 存储根目录是服务私有的、内容键由服务端生成，因此这属于部署边界而非代码缺陷，
+     * 已在 ADR 0005 中记录。</p>
+     *
+     * @param tempFile 已写满且校验通过的临时文件
+     * @param target   最终对象路径
+     * @param contentKey 内容键（用于生成占位锁文件名）
+     * @throws IOException 目标已存在或发布失败
      */
-    private static void moveIntoPlace(Path tempFile, Path target) throws IOException {
+    private void publish(Path tempFile, Path target, String contentKey) throws IOException {
         try {
+            Files.createLink(target, tempFile);
+            deleteQuietly(tempFile);
+            return;
+        }
+        catch (FileAlreadyExistsException ex) {
+            // 目标已存在：直接失败，绝不覆盖，也绝不动别人的对象
+            throw ex;
+        }
+        catch (UnsupportedOperationException ex) {
+            publishWithClaim(tempFile, target, contentKey);
+        }
+        catch (FileSystemException ex) {
+            // 例如「操作不受支持」「跨设备」：退化到占位锁路径；若那里也失败，异常会照常向上抛
+            publishWithClaim(tempFile, target, contentKey);
+        }
+    }
+
+    /**
+     * 退化发布路径：{@code CREATE_NEW} 占位锁保证互斥，临界区内检查目标并原子移动。
+     *
+     * <p>包级可见是<b>有意</b>的：集成测试需要在不支持硬链接的假设下单独验证这条路径同样是
+     * 「存在即失败、永不覆盖」。</p>
+     *
+     * @param tempFile   已写满的临时文件
+     * @param target     最终对象路径
+     * @param contentKey 内容键
+     * @throws IOException 目标已存在（含占位锁被他人持有）或移动失败
+     */
+    void publishWithClaim(Path tempFile, Path target, String contentKey) throws IOException {
+        Path claim = this.tempRoot.resolve(contentKey + CLAIM_SUFFIX);
+        boolean claimed = false;
+        try {
+            Files.createFile(claim);
+            claimed = true;
+        }
+        catch (FileAlreadyExistsException ex) {
+            // 另一个发布者正在发布同一个目标：本次必然失败，且不得触碰它
+            throw new FileAlreadyExistsException(target.toString(), null,
+                    "另一个发布者正在发布同一个内容键，拒绝并发覆盖");
+        }
+
+        try {
+            if (Files.exists(target)) {
+                throw new FileAlreadyExistsException(target.toString(), null,
+                        "目标内容已存在，拒绝覆盖");
+            }
             Files.move(tempFile, target, StandardCopyOption.ATOMIC_MOVE);
         }
-        catch (AtomicMoveNotSupportedException ex) {
-            Files.move(tempFile, target);
+        finally {
+            if (claimed) {
+                deleteQuietly(claim);
+            }
         }
     }
 
