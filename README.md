@@ -772,19 +772,20 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 
 ### 15.3 大小限制与流式处理
 
-上传涉及**两个**必须一起调整的配置项：
+上传涉及**两层限制、三个配置属性**（应用层一个、容器层两个）：
 
-| 配置 | 默认值 | 作用 |
-| --- | --- | --- |
-| `flowdesk.knowledge.upload.max-size` | `20MB` | **应用层有效上限**：按实际读取到的字节数判断 |
-| `spring.servlet.multipart.max-file-size` | `20MB` | 容器侧早期拒绝（在进入 Controller 之前） |
-| `spring.servlet.multipart.max-request-size` | `22MB` | 整个 multipart 请求上限，必须能容纳文件 + 边框与其它字段 |
+| 层 | 配置 | 默认值 | 作用 |
+| --- | --- | --- | --- |
+| 应用层 | `flowdesk.knowledge.upload.max-size` | `20MB` | **有效上限**：按实际读取到的字节数判断 |
+| 容器层 | `spring.servlet.multipart.max-file-size` | `20MB` | 早期拒绝单个文件（在进入 Controller 之前） |
+| 容器层 | `spring.servlet.multipart.max-request-size` | `22MB` | 早期拒绝整个 multipart 请求，必须能容纳文件 + 边框与其它字段 |
 
-**两个上限不允许冲突：应用启动时会强制校验**（`KnowledgeUploadLimitValidator`）：
+**三个属性不允许冲突：应用启动时会强制校验**（`KnowledgeUploadLimitValidator`）：
 
 - `max-file-size >= upload.max-size`，否则应用上限不可达（典型漂移：应用改成 25MB 而容器仍是 20MB，
   21MB 的上传会被容器提前拒绝，配置看起来「改成功了」却永远传不上去）；
 - `max-request-size >= max-file-size + 1KB`，否则连「恰好达到文件上限」的请求都会被容器拒绝；
+- 三者都必须为正；余量比较使用安全减法，因此接近 `Long.MAX_VALUE` 的配置也不会因为加法回绕而误判通过；
 - 冲突时**启动失败并给出明确文案**，而不是在生产流量里表现为「明明配了 25MB 却传不上去」。
 
 容器上限**大于**应用上限是允许的（应用层仍会精确拦住），因此不要求两者相等 —— 只要求容器不是更小的那个。

@@ -52,18 +52,33 @@ public final class KnowledgeUploadLimitValidator {
         Objects.requireNonNull(containerFileLimit, "containerFileLimit 不能为 null");
         Objects.requireNonNull(containerRequestLimit, "containerRequestLimit 不能为 null");
 
-        if (applicationLimit.toBytes() <= 0L) {
+        long applicationBytes = applicationLimit.toBytes();
+        long fileBytes = containerFileLimit.toBytes();
+        long requestBytes = containerRequestLimit.toBytes();
+
+        if (applicationBytes <= 0L) {
             throw new IllegalStateException("flowdesk.knowledge.upload.max-size 必须为正");
         }
-        if (containerFileLimit.toBytes() <= 0L) {
+        if (fileBytes <= 0L) {
             throw new IllegalStateException("spring.servlet.multipart.max-file-size 必须为正");
         }
-        if (containerFileLimit.toBytes() < applicationLimit.toBytes()) {
+        if (requestBytes <= 0L) {
+            throw new IllegalStateException("spring.servlet.multipart.max-request-size 必须为正");
+        }
+        if (fileBytes < applicationBytes) {
             throw new IllegalStateException("上传上限配置冲突：spring.servlet.multipart.max-file-size ("
                     + containerFileLimit + ") 小于 flowdesk.knowledge.upload.max-size (" + applicationLimit
                     + ")，应用上限将永远不可达；请把容器上限调整为不小于应用上限");
         }
-        if (containerRequestLimit.toBytes() < containerFileLimit.toBytes() + MULTIPART_OVERHEAD.toBytes()) {
+
+        // 余量比较必须避免「fileBytes + overhead」这种可能回绕成负数的加法：
+        // 先确认请求上限不小于文件上限，再用安全减法比较差值，Long.MAX_VALUE 边界也不会误判
+        if (requestBytes < fileBytes) {
+            throw new IllegalStateException("上传上限配置冲突：spring.servlet.multipart.max-request-size ("
+                    + containerRequestLimit + ") 小于 max-file-size (" + containerFileLimit + ")");
+        }
+        long headroom = requestBytes - fileBytes;
+        if (headroom < MULTIPART_OVERHEAD.toBytes()) {
             throw new IllegalStateException("上传上限配置冲突：spring.servlet.multipart.max-request-size ("
                     + containerRequestLimit + ") 不足以容纳 max-file-size (" + containerFileLimit
                     + ") 加上 multipart 元数据（至少 " + MULTIPART_OVERHEAD + "）；请调大 max-request-size");

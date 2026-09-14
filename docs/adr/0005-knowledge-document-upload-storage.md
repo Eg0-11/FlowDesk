@@ -33,7 +33,7 @@ RAG 链路的第一步不是解析，而是**把一个文件安全地收进来**
 7. **上传时序固定**，且**文件复制期间不持有数据库事务**：内容发布 → 元数据单条 INSERT；
 8. **补偿按三个阶段划分**（见下表），元数据写入失败时补偿删除内容，补偿失败只作为 suppressed 保留；
 9. 文档只有 `UPLOADED` 一个状态，本阶段不可变、无更新入口；
-10. **上传上限由两个配置项共同表达，且启动时强制校验不冲突**（应用上限与容器上限）。
+10. **上传上限由「应用层 + 容器层」两层限制、三个配置属性共同表达，且启动时强制校验不冲突**。
 
 ## 理由
 
@@ -146,19 +146,21 @@ RAG 链路的第一步不是解析，而是**把一个文件安全地收进来**
 - 退化路径的残留边界：若<b>本服务之外</b>的进程往存储根目录写同名对象，退化路径无法察觉；
   存储根目录是服务私有且内容键由服务端生成，属于部署边界，已在此记录。
 
-## 上传上限：两个配置项 + 启动期校验
+## 上传上限：两层限制、三个配置属性 + 启动期校验
 
-| 配置 | 默认值 | 角色 |
-| --- | --- | --- |
-| `flowdesk.knowledge.upload.max-size` | `20MB` | **应用层有效上限**（按实际读取字节数判断） |
-| `spring.servlet.multipart.max-file-size` | `20MB` | 容器侧早期拒绝 |
-| `spring.servlet.multipart.max-request-size` | `22MB` | 整个 multipart 请求上限 |
+| 层 | 配置 | 默认值 | 角色 |
+| --- | --- | --- | --- |
+| 应用层 | `flowdesk.knowledge.upload.max-size` | `20MB` | **有效上限**（按实际读取字节数判断） |
+| 容器层 | `spring.servlet.multipart.max-file-size` | `20MB` | 早期拒绝单个文件 |
+| 容器层 | `spring.servlet.multipart.max-request-size` | `22MB` | 早期拒绝整个 multipart 请求 |
 
-两者是独立配置项，因此存在**静默漂移**：只把应用上限改成 25MB 而容器仍是 20MB，
+三个属性是独立配置项，因此存在**静默漂移**：只把应用上限改成 25MB 而容器文件上限仍是 20MB，
 21MB 的上传会被容器提前拒绝 —— 配置看起来生效了，实际不可达。
-`KnowledgeUploadLimitValidator` 在装配阶段强制校验 `max-file-size >= upload.max-size`
-且 `max-request-size >= max-file-size + 1KB`，冲突时**应用启动失败**。
+`KnowledgeUploadLimitValidator` 在装配阶段强制校验三者都为正、`max-file-size >= upload.max-size`、
+以及 `max-request-size >= max-file-size + 1KB`，冲突时**应用启动失败**。
 容器上限大于应用上限是允许的（应用层仍会精确拦截），因此不要求两者相等。
+余量比较使用**安全减法**（先确认请求上限不小于文件上限，再比较差值），
+避免 `fileLimit + overhead` 在接近 `Long.MAX_VALUE` 时回绕成负数而误判通过。
 
 ## 影响
 

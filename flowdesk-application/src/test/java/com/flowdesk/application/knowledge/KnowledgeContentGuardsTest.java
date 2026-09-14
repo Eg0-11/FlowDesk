@@ -225,6 +225,124 @@ class KnowledgeContentGuardsTest {
         assertThat(delegate.consumed()).as("skip 同样受 remaining + 1 约束").isEqualTo(6L);
     }
 
+    // ---------- 限流：超限终态（FD-0008-R2） ----------
+
+    @Test
+    void repeatedSingleByteReadsStayBoundedAfterLimitExceeded() throws IOException {
+        ConsumingInputStream delegate = new ConsumingInputStream(100);
+        SizeLimitedInputStream limited = new SizeLimitedInputStream(delegate, 5L, limit -> {
+            throw new KnowledgeApplicationException(
+                    KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE, "超限");
+        });
+
+        int failures = 0;
+        for (int attempt = 0; attempt < 10; attempt++) {
+            try {
+                if (limited.read() < 0) {
+                    throw new AssertionError("第 " + attempt + " 次单字节读取不应得到 EOF");
+                }
+                if (attempt >= 5) {
+                    throw new AssertionError("第 " + attempt + " 次单字节读取本应超限");
+                }
+            }
+            catch (KnowledgeApplicationException ex) {
+                assertThat(ex.errorCode()).isEqualTo(KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE);
+                failures++;
+            }
+        }
+
+        assertThat(failures).as("第 6 次起必须持续失败").isEqualTo(5);
+        assertThat(delegate.consumed()).as("max=5 时底层消费量必须恒为 6").isEqualTo(6L);
+        assertThat(limited.bytesRead()).isEqualTo(6L);
+        assertThat(limited.exceeded()).isTrue();
+    }
+
+    @Test
+    void singleByteThenBulkAndSkipStayTerminal() throws IOException {
+        ConsumingInputStream delegate = new ConsumingInputStream(10_000);
+        SizeLimitedInputStream limited = new SizeLimitedInputStream(delegate, 5L, limit -> {
+            throw new KnowledgeApplicationException(
+                    KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE, "超限");
+        });
+        byte[] buffer = new byte[64];
+
+        // 先读到超限：前 5 次成功，第 6 次触发终态
+        for (int index = 0; index < 5; index++) {
+            assertThat(limited.read()).isNotNegative();
+        }
+        assertApplicationError(limited::read, KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE);
+        assertThat(delegate.consumed()).isEqualTo(6L);
+
+        // 超限后混用三种读取方式：都必须立即失败，且不再访问底层
+        for (int attempt = 0; attempt < 5; attempt++) {
+            assertApplicationError(limited::read, KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE);
+            assertApplicationError(() -> limited.read(buffer, 0, 64),
+                    KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE);
+            assertApplicationError(() -> limited.skip(10L),
+                    KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE);
+        }
+
+        assertThat(delegate.consumed()).as("终态下底层消费量不得再增长").isEqualTo(6L);
+        assertThat(limited.bytesRead()).isEqualTo(6L);
+    }
+
+    @Test
+    void bulkFailureThenSingleByteReadDoesNotConsumeMore() {
+        ConsumingInputStream delegate = new ConsumingInputStream(10_000);
+        SizeLimitedInputStream limited = new SizeLimitedInputStream(delegate, 5L, limit -> {
+            throw new KnowledgeApplicationException(
+                    KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE, "超限");
+        });
+        byte[] buffer = new byte[1024];
+
+        assertApplicationError(() -> limited.read(buffer, 0, 1024),
+                KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE);
+        assertThat(delegate.consumed()).isEqualTo(6L);
+
+        assertApplicationError(limited::read, KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE);
+
+        assertThat(delegate.consumed()).as("批量失败之后单字节读取也不得消费底层").isEqualTo(6L);
+        assertThat(limited.bytesRead()).isEqualTo(6L);
+    }
+
+    @Test
+    void exactlyTheLimitUsingSingleByteReadsIsAccepted() throws IOException {
+        ConsumingInputStream delegate = new ConsumingInputStream(5);
+        SizeLimitedInputStream limited = new SizeLimitedInputStream(delegate, 5L, limit -> {
+            throw new KnowledgeApplicationException(
+                    KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE, "超限");
+        });
+
+        for (int index = 0; index < 5; index++) {
+            assertThat(limited.read()).as("第 %d 个字节必须可读", index + 1).isNotNegative();
+        }
+        assertThat(limited.read()).as("恰好等于上限后应当观察到 EOF 而不是超限").isEqualTo(-1);
+        assertThat(limited.exceeded()).isFalse();
+        assertThat(delegate.consumed()).isEqualTo(5L);
+        assertThat(limited.bytesRead()).isEqualTo(5L);
+    }
+
+    @Test
+    void zeroLengthOperationsNeverCountAndNeverFailEvenAfterExceeding() throws IOException {
+        ConsumingInputStream delegate = new ConsumingInputStream(100);
+        SizeLimitedInputStream limited = new SizeLimitedInputStream(delegate, 5L, limit -> {
+            throw new KnowledgeApplicationException(
+                    KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE, "超限");
+        });
+
+        assertThat(limited.read(new byte[4], 0, 0)).isZero();
+        assertThat(limited.skip(0L)).isZero();
+
+        // 8 字节请求在上限 5 下会一次读到第 6 个字节（探测字节）并触发终态
+        assertApplicationError(() -> limited.read(new byte[8], 0, 8),
+                KnowledgeApplicationErrorCode.DOCUMENT_TOO_LARGE);
+        assertThat(delegate.consumed()).isEqualTo(6L);
+
+        // InputStream 的约定：零长度读取返回 0 且不访问底层；它不改变也不受终态影响
+        assertThat(limited.read(new byte[4], 0, 0)).isZero();
+        assertThat(delegate.consumed()).isEqualTo(6L);
+    }
+
     @Test
     void signatureValidationCannotBeSkipped() {
         byte[] expected = "%PDF-".getBytes(StandardCharsets.US_ASCII);
@@ -287,6 +405,90 @@ class KnowledgeContentGuardsTest {
                 })) {
             assertThat(stream.skip(4L)).isEqualTo(4L);
             assertThat(readAll(stream)).containsExactly('4', '5', '6', '7', '8', '9');
+        }
+    }
+
+    // ---------- UTF-8 skip 的 EOF 校验（FD-0008-R2） ----------
+
+    @Test
+    void skipExactlyTruncatedUtf8InputRejectsAtEof() {
+        // 0xC3 是缺少后续字节的 UTF-8 前导字节：只有观察到 EOF 才能确认非法
+        byte[] truncated = { (byte) 0xC3 };
+
+        try (Utf8ValidatingInputStream stream = new Utf8ValidatingInputStream(
+                new java.io.ByteArrayInputStream(truncated), reason -> {
+                    throw new KnowledgeApplicationException(
+                            KnowledgeApplicationErrorCode.UNSUPPORTED_DOCUMENT_FORMAT, reason);
+                })) {
+            assertApplicationError(() -> stream.skip(1L),
+                    KnowledgeApplicationErrorCode.UNSUPPORTED_DOCUMENT_FORMAT);
+        }
+        catch (IOException ex) {
+            throw new AssertionError(ex);
+        }
+    }
+
+    @Test
+    void skipEndingInsideValidMultibyteCharacterPreservesRemainingBytes() throws IOException {
+        byte[] chinese = "中".getBytes(StandardCharsets.UTF_8);
+        byte[] content = new byte[chinese.length + 1];
+        System.arraycopy(chinese, 0, content, 0, chinese.length);
+        content[chinese.length] = 'x';
+
+        try (Utf8ValidatingInputStream stream = new Utf8ValidatingInputStream(
+                new java.io.ByteArrayInputStream(content), reason -> {
+                    throw new IllegalStateException("不应触发：" + reason);
+                })) {
+            assertThat(stream.skip(1L)).as("跳过多字节字符的第一个字节是合法的").isEqualTo(1L);
+
+            byte[] remaining = readAll(stream);
+            byte[] expected = java.util.Arrays.copyOfRange(content, 1, content.length);
+            assertThat(remaining).as("剩余字节必须与源完全一致").isEqualTo(expected);
+        }
+    }
+
+    @Test
+    void validUtf8SkipMakesProgressWithoutLosingOrDuplicatingBytes() throws IOException {
+        byte[] content = "abcdefghij".getBytes(StandardCharsets.UTF_8);
+
+        try (Utf8ValidatingInputStream stream = new Utf8ValidatingInputStream(
+                new java.io.ByteArrayInputStream(content), reason -> {
+                    throw new IllegalStateException("不应触发：" + reason);
+                })) {
+            assertThat(stream.skip(4L)).as("合法流上的 skip 必须真正前进").isEqualTo(4L);
+            assertThat(readAll(stream)).containsExactly('e', 'f', 'g', 'h', 'i', 'j');
+        }
+    }
+
+    @Test
+    void skipFollowedByMixedSingleAndBulkReadsPreservesOriginalByteSequence() throws IOException {
+        byte[] content = "中文字符与 ASCII 混合 abcdef".getBytes(StandardCharsets.UTF_8);
+
+        try (Utf8ValidatingInputStream stream = new Utf8ValidatingInputStream(
+                new java.io.ByteArrayInputStream(content), reason -> {
+                    throw new IllegalStateException("不应触发：" + reason);
+                })) {
+            assertThat(stream.skip(3L)).isEqualTo(3L);
+
+            byte[] collected = new byte[content.length];
+            int position = 0;
+            // 混合单字节与批量读取
+            collected[position++] = (byte) stream.read();
+            position += stream.read(collected, position, 5);
+            collected[position++] = (byte) stream.read();
+            position += stream.read(collected, position, collected.length - position);
+            while (position < collected.length) {
+                int read = stream.read(collected, position, collected.length - position);
+                if (read < 0) {
+                    break;
+                }
+                position += read;
+            }
+
+            byte[] expected = java.util.Arrays.copyOfRange(content, 3, content.length);
+            assertThat(java.util.Arrays.copyOf(collected, position))
+                    .as("跳过之后的字节必须原样、不重不漏地读出")
+                    .isEqualTo(expected);
         }
     }
 

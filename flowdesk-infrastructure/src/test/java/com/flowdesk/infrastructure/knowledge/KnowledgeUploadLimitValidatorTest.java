@@ -82,6 +82,53 @@ class KnowledgeUploadLimitValidatorTest {
                 DataSize.ofMegabytes(2))).isInstanceOf(NullPointerException.class);
     }
 
+    // ---------- 溢出边界（FD-0008-R2） ----------
+
+    @Test
+    void rejectsNonPositiveRequestLimit() {
+        assertThatThrownBy(() -> KnowledgeUploadLimitValidator.validate(DataSize.ofMegabytes(1),
+                DataSize.ofMegabytes(20), DataSize.ofBytes(0)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("max-request-size")
+                .hasMessageContaining("必须为正");
+    }
+
+    @Test
+    void rejectsRequestLimitWhenRequiredOverheadWouldOverflow() {
+        // 旧实现用 fileLimit + overhead 判断：Long.MAX_VALUE + 1KB 会回绕成负数，
+        // 于是「请求上限等于文件上限」这种明显冲突反而被接受
+        assertThatThrownBy(() -> KnowledgeUploadLimitValidator.validate(DataSize.ofMegabytes(1),
+                DataSize.ofBytes(Long.MAX_VALUE), DataSize.ofBytes(Long.MAX_VALUE)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("max-request-size");
+
+        // 只差 1 个字节的余量同样冲突，且不得因为加法回绕而通过
+        assertThatThrownBy(() -> KnowledgeUploadLimitValidator.validate(DataSize.ofMegabytes(1),
+                DataSize.ofBytes(Long.MAX_VALUE - 1L), DataSize.ofBytes(Long.MAX_VALUE)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("max-request-size");
+    }
+
+    @Test
+    void rejectsLongMaxFileAndRequestLimitsBecauseNoOverheadFits() {
+        assertThatThrownBy(() -> KnowledgeUploadLimitValidator.validate(DataSize.ofBytes(Long.MAX_VALUE),
+                DataSize.ofBytes(Long.MAX_VALUE), DataSize.ofBytes(Long.MAX_VALUE)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("max-request-size");
+
+        // 应用上限同样是 Long.MAX_VALUE 时，first check（file >= app）通过，仍然必须在余量检查处拒绝
+        assertThatThrownBy(() -> KnowledgeUploadLimitValidator.validate(DataSize.ofMegabytes(20),
+                DataSize.ofBytes(Long.MAX_VALUE), DataSize.ofBytes(Long.MAX_VALUE)))
+                .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void acceptsHugeButConsistentLimits() {
+        // 余量足够时，接近 Long.MAX_VALUE 的配置也必须被接受（无回绕误判）
+        KnowledgeUploadLimitValidator.validate(DataSize.ofMegabytes(1),
+                DataSize.ofBytes(Long.MAX_VALUE - 2048L), DataSize.ofBytes(Long.MAX_VALUE));
+    }
+
     @Test
     void defaultConfigurationSatisfiesTheValidator() {
         // 与 application.yml 中的默认值保持一致：20MB / 20MB / 22MB

@@ -1,6 +1,5 @@
 package com.flowdesk.application.knowledge.port.out;
 
-import com.flowdesk.domain.knowledge.KnowledgeDocument;
 import com.flowdesk.domain.knowledge.Sha256Digest;
 import java.util.Objects;
 
@@ -14,17 +13,16 @@ import java.util.Objects;
  * <h2>构造即校验</h2>
  * <p>这是「成功结果」的类型，不允许适配器构造出一个自相矛盾的成功：</p>
  * <ul>
- *   <li>{@code contentKey} 非空、无首尾空白、不含路径分隔符或控制字符
- *       （它会被用于拼路径，因此「安全」是它的定义的一部分）、长度不超过
- *       {@link KnowledgeDocument#MAX_CONTENT_KEY_LENGTH}；</li>
+ *   <li>{@code contentKey} 非空、无首尾空白、<b>不含路径分隔符或控制字符</b>
+ *       （它会被用于拼路径，因此「可以安全地当作路径片段」是它的定义的一部分）；</li>
  *   <li>{@code sizeBytes > 0}；</li>
  *   <li>{@code sha256} 非空。</li>
  * </ul>
  *
- * <p>这一层保证的是<b>端口契约</b>：键可以安全地用作路径片段、大小为正、摘要存在。
- * 领域聚合仍会用自己的不变量再判一次（例如内容键的长度上限来自领域常量），
- * 因此端口返回值依然可能被领域拒绝 —— 服务端必须把这种情况当成内部错误处理，
- * 而不是当成调用方输入错误。</p>
+ * <p><b>长度上限不在这里校验</b>：端口层只保证「键可以安全地用作路径片段」，
+ * 「键最长多少」是<b>领域聚合的不变量</b>（{@code KnowledgeDocument}）。这个分工是刻意的
+ * —— 端口与领域各管自己那一层，端口返回值因此<b>仍可能被领域拒绝</b>，
+ * 服务端必须把这种情况当成内部错误处理（补偿删除 + 500），而不是当成调用方输入错误。</p>
  *
  * @param contentKey 不透明的内容键（由适配器生成，绝不来自原始文件名）
  * @param sizeBytes  实际写入的字节数，必须大于 0

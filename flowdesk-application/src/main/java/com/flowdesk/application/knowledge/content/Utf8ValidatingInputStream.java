@@ -34,6 +34,9 @@ public final class Utf8ValidatingInputStream extends FilterInputStream {
     /** 解码出的字符缓冲区大小。 */
     private static final int CHAR_BUFFER_SIZE = 4096;
 
+    /** 跳过时使用的临时缓冲区大小。 */
+    private static final int SCRATCH_SIZE = 4096;
+
     private final CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
             .onMalformedInput(CodingErrorAction.REPORT)
             .onUnmappableCharacter(CodingErrorAction.REPORT);
@@ -47,6 +50,14 @@ public final class Utf8ValidatingInputStream extends FilterInputStream {
     private boolean hasPending;
 
     private boolean finished;
+
+    /**
+     * 前瞻到的一个字节（{@code -1} 表示没有）。
+     *
+     * <p>它已经过校验（NUL 检查 + 解码），因此在后续 {@code read} 中必须<b>原样、恰好一次</b>
+     * 交还调用方，并且不再重复喂给解码器。</p>
+     */
+    private int lookahead = -1;
 
     /**
      * @param delegate      被包装的流
@@ -66,6 +77,15 @@ public final class Utf8ValidatingInputStream extends FilterInputStream {
 
     @Override
     public int read(byte[] buffer, int offset, int length) throws IOException {
+        if (length == 0) {
+            return 0;
+        }
+        if (this.lookahead >= 0) {
+            // 前瞻字节优先交还：它已经校验过，且只能交还一次
+            buffer[offset] = (byte) this.lookahead;
+            this.lookahead = -1;
+            return 1;
+        }
         int read = this.in.read(buffer, offset, length);
         if (read > 0) {
             validate(buffer, offset, read);
@@ -84,10 +104,47 @@ public final class Utf8ValidatingInputStream extends FilterInputStream {
 
     /**
      * 跳过必须经过本类的 {@code read}，否则调用方可以 skip 掉内容来绕过 UTF-8 与 NUL 校验。
+     *
+     * <p>这里还需要处理一个更隐蔽的漏洞：如果恰好跳过「请求的字节数」就停下，
+     * 那么被跳过内容的<b>末尾截断序列</b>永远不会被检查 —— 例如只含一个字节 {@code 0xC3}
+     * 的流调用 {@code skip(1)} 会「成功」，而它其实是一个缺少后续字节的非法 UTF-8 前导字节。</p>
+     *
+     * <p>做法是在跳完之后做一次<b>单字节前瞻</b>（不依赖 {@code available()}）：
+     * 若前瞻发现 EOF，解码器就会在这里完成 {@code endOfInput} 与 {@code flush}，
+     * 截断序列随之被判定为非法；若前瞻拿到一个字节，则把它存起来交给后续 {@code read}
+     * （原样、恰好一次、不重复解码）。</p>
      */
     @Override
     public long skip(long count) throws IOException {
-        return ValidatedSkips.skip(this, count);
+        if (count <= 0L) {
+            return 0L;
+        }
+        byte[] scratch = new byte[(int) Math.min(count, SCRATCH_SIZE)];
+        long skipped = 0L;
+        while (skipped < count) {
+            int read = read(scratch, 0, (int) Math.min(scratch.length, count - skipped));
+            if (read < 0) {
+                // 真实 EOF：read 内部已经完成 endOfInput/flush，截断序列会在此抛错
+                return skipped;
+            }
+            skipped += read;
+        }
+        probeEndOfInput();
+        return skipped;
+    }
+
+    /**
+     * 单字节前瞻：只用于在「恰好跳完」时确认是否已经到达真实 EOF。
+     */
+    private void probeEndOfInput() throws IOException {
+        if (this.lookahead >= 0 || this.finished) {
+            return;
+        }
+        byte[] single = new byte[1];
+        int read = read(single, 0, 1);
+        if (read > 0) {
+            this.lookahead = single[0] & 0xFF;
+        }
     }
 
     private void validate(byte[] buffer, int offset, int length) {

@@ -24,6 +24,21 @@ import java.io.InputStream;
  * </ul>
  *
  * <p>{@code skip} 同样受此约束，不能靠一次大跨度跳过绕开限制。</p>
+ *
+ * <h2>超限是<b>终态</b></h2>
+ * <p>「抛错」本身不够：调用方可以捕获异常后继续调用 {@code read()}，如果每次调用都先去底层读一个字节，
+ * 那么重试 10 次就会从底层拖走 10 个字节 —— 上限形同虚设。因此第一次读到第 {@code max + 1} 个字节时：</p>
+ * <ol>
+ *   <li>消费掉那唯一的探测字节；</li>
+ *   <li><b>先把流置为永久超限</b>，再触发回调（回调抛异常也不会丢失终态）；</li>
+ *   <li>此后 {@code read()}、{@code read(byte[], int, int)}、{@code skip(long)} 一律立即失败，
+ *       <b>绝不再访问底层流</b>。</li>
+ * </ol>
+ * <p>于是底层消费量与 {@link #bytesRead()} 都<b>不可能超过 {@code max + 1}</b>，
+ * 无论调用方如何重试或混用三种读取方式。</p>
+ *
+ * <p>零长度的 {@code read(buffer, off, 0)} 与 {@code skip(0)} 按 {@link InputStream} 的约定返回 0：
+ * 它们本来就不访问底层，也不改变任何状态，因此不受终态影响。</p>
  */
 public final class SizeLimitedInputStream extends FilterInputStream {
 
@@ -32,6 +47,8 @@ public final class SizeLimitedInputStream extends FilterInputStream {
     private final ByteLimitExceededCallback onExceeded;
 
     private long bytesRead;
+
+    private boolean exceeded;
 
     /**
      * @param delegate   被包装的流
@@ -49,9 +66,12 @@ public final class SizeLimitedInputStream extends FilterInputStream {
 
     @Override
     public int read() throws IOException {
+        if (this.exceeded) {
+            failBecauseExceeded();
+        }
         int value = this.in.read();
         if (value >= 0) {
-            count(1);
+            record(1);
         }
         return value;
     }
@@ -61,15 +81,13 @@ public final class SizeLimitedInputStream extends FilterInputStream {
         if (length == 0) {
             return 0;
         }
-        int allowed = (int) Math.min(length, readAllowance());
-        if (allowed == 0) {
-            // 已经超限过（或上限为 0 的退化情况）：一次都不再读，直接按超限处理
-            this.onExceeded.onLimitExceeded(this.maxBytes);
-            return 0;
+        if (this.exceeded) {
+            failBecauseExceeded();
         }
+        int allowed = (int) Math.min(length, readAllowance());
         int read = this.in.read(buffer, offset, allowed);
         if (read > 0) {
-            count(read);
+            record(read);
         }
         return read;
     }
@@ -79,14 +97,13 @@ public final class SizeLimitedInputStream extends FilterInputStream {
         if (count <= 0L) {
             return 0L;
         }
-        long allowed = Math.min(count, readAllowance());
-        if (allowed <= 0L) {
-            this.onExceeded.onLimitExceeded(this.maxBytes);
-            return 0L;
+        if (this.exceeded) {
+            failBecauseExceeded();
         }
+        long allowed = Math.min(count, readAllowance());
         long skipped = this.in.skip(allowed);
         if (skipped > 0L) {
-            count(skipped);
+            record(skipped);
         }
         return skipped;
     }
@@ -96,11 +113,24 @@ public final class SizeLimitedInputStream extends FilterInputStream {
         return false;
     }
 
+    @Override
+    public synchronized void reset() throws IOException {
+        // 不支持 mark/reset：reset 必须失败，绝不能把限流计数倒回去
+        throw new IOException("mark/reset 不受支持");
+    }
+
     /**
-     * @return 到目前为止实际读取到的字节数
+     * @return 到目前为止实际读取到的字节数，永不超过 {@code maxBytes + 1}
      */
     public long bytesRead() {
         return this.bytesRead;
+    }
+
+    /**
+     * @return 是否已经进入永久超限状态
+     */
+    public boolean exceeded() {
+        return this.exceeded;
     }
 
     /**
@@ -120,11 +150,17 @@ public final class SizeLimitedInputStream extends FilterInputStream {
         return remaining + 1L;
     }
 
-    private void count(long delta) {
+    private void record(long delta) {
         this.bytesRead += delta;
         if (this.bytesRead > this.maxBytes) {
+            // 先置终态再回调：回调抛异常时终态必须已经生效
+            this.exceeded = true;
             this.onExceeded.onLimitExceeded(this.maxBytes);
         }
+    }
+
+    private void failBecauseExceeded() {
+        this.onExceeded.onLimitExceeded(this.maxBytes);
     }
 
     /**
