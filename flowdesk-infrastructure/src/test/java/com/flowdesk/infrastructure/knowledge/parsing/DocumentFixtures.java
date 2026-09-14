@@ -109,8 +109,7 @@ final class DocumentFixtures {
     /**
      * @param text 页面上的文本（只能包含 ASCII：夹具用的是标准 Type1 字体）
      * @return 结构完整、xref 偏移正确的单页 PDF
-     */
-    static byte[] pdf(String text) {
+     */    static byte[] pdf(String text) {
         StringBuilder pdf = new StringBuilder();
         List<Integer> offsets = new ArrayList<>();
 
@@ -213,6 +212,171 @@ final class DocumentFixtures {
         result[2] = (byte) 0xBF;
         System.arraycopy(body, 0, result, 3, body.length);
         return result;
+    }
+
+    // ---------- 类型混淆夹具（FD-0009-R1） ----------
+
+    /**
+     * 一个真实的 XLSX（SpreadsheetML）OOXML 包：内容类型、关系、工作簿、工作表齐备，
+     * 单元格里放一个哨兵文本。
+     *
+     * <p>它不是「用 DOCX 的壳装 Excel 数据」，而是一份<b>货真价实的电子表格包</b> ——
+     * 因此可以被 Tika 的 {@code OOXMLParser} 按自身类型正常解析（见类型混淆测试）。</p>
+     *
+     * @param cellText 单元格文本
+     * @return XLSX 字节
+     */
+    static byte[] xlsx(String cellText) {
+        return zip(java.util.Map.of(
+                "[Content_Types].xml", contentTypes(
+                        override("/xl/workbook.xml",
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"),
+                        override("/xl/worksheets/sheet1.xml",
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml")),
+                "_rels/.rels", relationships(OFFICE_DOCUMENT_RELATIONSHIP, "xl/workbook.xml"),
+                "xl/workbook.xml", "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+                        + "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+                        + "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+                        + "<sheets><sheet name=\"Sheet1\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>",
+                "xl/_rels/workbook.xml.rels", relationships(
+                        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet",
+                        "worksheets/sheet1.xml"),
+                "xl/worksheets/sheet1.xml", "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+                        + "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+                        + "<sheetData><row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>"
+                        + escapeXml(cellText) + "</t></is></c></row></sheetData></worksheet>"));
+    }
+
+    /**
+     * 一个真实的 PPTX（PresentationML）OOXML 包。
+     *
+     * @param slideText 幻灯片文本
+     * @return PPTX 字节
+     */
+    static byte[] pptx(String slideText) {
+        return zip(java.util.Map.of(
+                "[Content_Types].xml", contentTypes(
+                        override("/ppt/presentation.xml",
+                                "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"),
+                        override("/ppt/slides/slide1.xml",
+                                "application/vnd.openxmlformats-officedocument.presentationml.slide+xml")),
+                "_rels/.rels", relationships(OFFICE_DOCUMENT_RELATIONSHIP, "ppt/presentation.xml"),
+                "ppt/presentation.xml", "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+                        + "<p:presentation xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" "
+                        + "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+                        + "<p:sldIdLst><p:sldId id=\"256\" r:id=\"rId1\"/></p:sldIdLst></p:presentation>",
+                "ppt/_rels/presentation.xml.rels", relationships(
+                        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide",
+                        "slides/slide1.xml"),
+                "ppt/slides/slide1.xml", "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+                        + "<p:sld xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" "
+                        + "xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\">"
+                        + "<p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>"
+                        + escapeXml(slideText) + "</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"));
+    }
+
+    /**
+     * @return 一个结构合法、但与 OOXML 无关的普通 ZIP（只有几个文本文件）
+     */
+    static byte[] plainZip() {
+        return zip(java.util.Map.of(
+                "readme.txt", "这不是一个 Office 文档",
+                "notes/inner.txt", "PLAIN_ZIP_CONTENT"));
+    }
+
+    /**
+     * 「声明是 DOCX、内部却坏了」的包：内容类型与关系都指向 WordprocessingML，
+     * 但被声明的主文档部件在包里根本不存在。
+     *
+     * @return DOCX 字节
+     */
+    static byte[] docxDeclaringWordButMissingItsMainPart() {
+        return zip(java.util.Map.of(
+                "[Content_Types].xml", contentTypes(
+                        override("/word/document.xml", DOCX_MAIN_CONTENT_TYPE)),
+                "_rels/.rels", relationships(OFFICE_DOCUMENT_RELATIONSHIP, "word/document.xml"),
+                "docProps/app.xml", "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+                        + "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/"
+                        + "extended-properties\"><Application>FlowDesk</Application></Properties>"));
+    }
+
+    /**
+     * 「声明是 DOCX、主文档部件却是垃圾 XML」的包。
+     *
+     * @return DOCX 字节
+     */
+    static byte[] docxDeclaringWordButWithGarbageBody() {
+        return zip(java.util.Map.of(
+                "[Content_Types].xml", contentTypes(
+                        override("/word/document.xml", DOCX_MAIN_CONTENT_TYPE)),
+                "_rels/.rels", relationships(OFFICE_DOCUMENT_RELATIONSHIP, "word/document.xml"),
+                "word/document.xml", "<w:document><w:body><w:p>没有闭合的标签"));
+    }
+
+    /**
+     * 「内容类型说是 DOCX、关系却指向 Excel 工作簿」的双面包：
+     * 用于验证包类型验证不只看内容类型，还要求 {@code officeDocument} 关系指向 {@code word/document.xml}。
+     *
+     * @return DOCX 字节（内容类型声明为 DOCX）
+     */
+    static byte[] docxDeclaringWordButRelatingToWorkbook() {
+        return zip(java.util.Map.of(
+                "[Content_Types].xml", contentTypes(
+                        override("/word/document.xml", DOCX_MAIN_CONTENT_TYPE),
+                        override("/xl/workbook.xml",
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml")),
+                "_rels/.rels", relationships(OFFICE_DOCUMENT_RELATIONSHIP, "xl/workbook.xml"),
+                "word/document.xml", "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+                        + "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+                        + "<w:body><w:p><w:r><w:t>看起来像 Word</w:t></w:r></w:p></w:body></w:document>"));
+    }
+
+    /**
+     * 一个 {@code [Content_Types].xml} 解压后远超元数据读取上限的包
+     * （压缩后很小，用于验证「验证阶段不会无界读取」）。
+     *
+     * @return DOCX 形状的字节
+     */
+    static byte[] docxWithOversizedContentTypesPart() {
+        // 1 MiB 上限 + 余量：用可压缩的注释填充，避免测试本身占用大量磁盘
+        String padding = "-".repeat(1_200_000);
+        String contentTypes = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<!-- "
+                + padding + " -->\n" + typesElement(
+                        override("/word/document.xml", DOCX_MAIN_CONTENT_TYPE));
+        return zip(java.util.Map.of(
+                "[Content_Types].xml", contentTypes,
+                "_rels/.rels", relationships(OFFICE_DOCUMENT_RELATIONSHIP, "word/document.xml"),
+                "word/document.xml", "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+                        + "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+                        + "<w:body><w:p><w:r><w:t>内容</w:t></w:r></w:p></w:body></w:document>"));
+    }
+
+    private static final String OFFICE_DOCUMENT_RELATIONSHIP =
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument";
+
+    private static final String DOCX_MAIN_CONTENT_TYPE =
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml";
+
+    private static String override(String partName, String contentType) {
+        return "<Override PartName=\"" + partName + "\" ContentType=\"" + contentType + "\"/>";
+    }
+
+    private static String contentTypes(String... overrides) {
+        return "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" + typesElement(overrides);
+    }
+
+    private static String typesElement(String... overrides) {
+        return "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+                + "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package."
+                + "relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+                + String.join("", overrides) + "</Types>";
+    }
+
+    private static String relationships(String relationshipType, String target) {
+        return "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+                + "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+                + "<Relationship Id=\"rId1\" Type=\"" + relationshipType + "\" Target=\"" + target + "\"/>"
+                + "</Relationships>";
     }
 
     /**

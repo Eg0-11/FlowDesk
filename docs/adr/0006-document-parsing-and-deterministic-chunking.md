@@ -38,7 +38,14 @@ RAG 第 1 步解决了「把文件安全地收进来」。第 2 步要回答的�
 7. **状态机用 CAS（行锁 + 带版本条件的 UPDATE）**：`UPLOADED`/`PARSE_FAILED` →
    `PARSING` → `PARSED`/`PARSE_FAILED`，并发领取只有一个赢家；
 8. **失败补偿把文档落成 `PARSE_FAILED`**（可重试），补偿失败只作为 suppressed 保留；
-9. **解析是同步完成的**：HTTP 请求返回时切片已经落库，因此接口返回 200 而不是 202。
+9. **解析是同步完成的**：HTTP 请求返回时切片已经落库，因此接口返回 200 而不是 202；
+10. **DOCX 必须验证到 OOXML 包的真实类型**（FD-0009-R1）：ZIP 初筛 → 有界落盘 →
+    包类型验证（内容类型 + `officeDocument` 关系 + 主文档部件），全部发生在正文提取之前；
+11. **PDF 显式 `NO_OCR`**（FD-0009-R1）：解析行为不随部署环境是否安装 Tesseract 而改变；
+12. **提取上限覆盖最终输出的每一个 code point**（FD-0009-R1）：所有写入路径共用同一个
+    计数器，开头 BOM 不占配额，超限在追加越界字符前中断；
+13. **完成解析端口与通用 update 都有防御性校验**（FD-0009-R1）：切片归属/序号/非空与
+    状态转换矩阵都在数据库边界上强制，非法输入以既有稳定错误码拒绝且零写入。
 
 ## 理由
 
@@ -59,11 +66,53 @@ RAG 第 1 步解决了「把文件安全地收进来」。第 2 步要回答的�
   结果已经落库。解析阶段再探测一次，只会得到「同一份文件两条结论」这类难以排查的分歧：
   例如某个 `.docx` 上传时按 ZIP 容器收下，解析时被探测成别的 OOXML 类型。
 - **探测本身是攻击面。** 让解析库根据内容挑选解析器，等于把「用哪个解析器的决定权」
-  交给文件内容；显式指定解析器后，攻击者只能影响「同一个解析器怎么处理坏输入」，
-  而不能让它去执行一条我们没预期的解析路径。
-- **代价是「声明与内容不符」必须显式处理**：解析前先校验文件头
-  （PDF 必须 `%PDF-`、DOCX 必须是 ZIP），不符即 `UNSUPPORTED_DOCUMENT_CONTENT`，
-  而不是含糊的「解析失败」。
+  交给文件内容。
+- **代价是「声明与内容不符」必须显式处理**：PDF 必须 `%PDF-`、DOCX 必须是 ZIP 容器，
+  不符即 `UNSUPPORTED_DOCUMENT_CONTENT`，而不是含糊的「解析失败」；
+  而在 DOCX 上，这个「显式处理」还必须深入到 OOXML 包的真实类型，见下一节。
+
+### DOCX 必须验证到「OOXML 包的真实类型」（FD-0009-R1 修复）
+
+**问题**：FD-0009 只检查了 ZIP 文件头（`PK\x03\x04`），但 Tika 的 `OOXMLParser` 同时支持
+DOCX / XLSX / PPTX / XPS 等包，并且**按包自身的内容类型**选择子解析器。
+于是「一份真实的 XLSX 改个扩展名」就能被当作 DOCX 收下，并提取出单元格文本 ——
+这是实打实的类型混淆：调用方声明 DOCX，服务端却按电子表格处理，
+解析结果、切片与后续检索内容全部来自错误的数据源。
+
+**修复后的判定链**（只看包内容，且发生在正文提取之前）：
+
+1. **ZIP 初筛**：文件头不是 `PK\x03\x04` → `UNSUPPORTED_DOCUMENT_CONTENT`；
+2. **有界落盘**：固定 8 KiB 缓冲区把内容流式写入受控临时文件（**不**把输入读进堆），
+   `finally` 中删除；调用方的 `InputStream` 始终由调用方关闭；
+3. **包类型验证**：`[Content_Types].xml` 中 `/word/document.xml` 的**生效**内容类型
+   （Override 优先于 Default，与 OPC 规则一致）必须是 WordprocessingML 主文档类型；
+   `_rels/.rels` 的 `officeDocument` 关系必须指向 `word/document.xml`；该部件必须存在。
+
+**判定职责的划分**（这样「类型不符」与「内部损坏」才是两个可操作的结论）：
+
+| 情形 | 结论 |
+| --- | --- |
+| XLSX / PPTX / DOCM / XPS / 普通 ZIP（内容类型不是 WordprocessingML） | `UNSUPPORTED_DOCUMENT_CONTENT` |
+| 内容类型声称 DOCX，但 `officeDocument` 关系指向别的部件（双面包） | `UNSUPPORTED_DOCUMENT_CONTENT` |
+| ZIP 容器本身读不出来（PK 头 + 坏数据） | `CORRUPTED_DOCUMENT` |
+| 已声明 DOCX，但 `word/document.xml` 缺失或正文无法解析 | `CORRUPTED_DOCUMENT` |
+| `[Content_Types].xml` 解压后超过 1 MiB（无法据此证明它是 DOCX） | `UNSUPPORTED_DOCUMENT_CONTENT` |
+
+**为什么不再往 `Metadata.CONTENT_TYPE` 里写「它是 DOCX」**：那只是调用方的**声明**，
+不是对内容的**验证**；`OOXMLParser` 也根本不依赖它来分派。
+用声明冒充验证正是这次类型混淆得以发生的原因，因此现在完全不依赖它。
+包元数据用「禁用 DOCTYPE 与外部实体」的安全 XML 解析器读取，读取量有上限。
+
+### PDF 显式关闭 OCR（FD-0009-R1 修复）
+
+`PDFParser` 的默认 OCR 策略是 `AUTO`：**机器上装了 Tesseract 时会自动走 OCR**。
+这带来三个问题：解析结果不再是「PDF 里已有的文本」而是「图像识别结果」；
+耗时与 CPU/内存消耗取决于部署环境；同一份文档在不同机器上会产出不同切片。
+因此适配器在构造时显式固定 `PDFParserConfig.OCR_STRATEGY.NO_OCR`，
+构造之后**不再修改**这份共享配置（解析过程只读）。
+测试同时锁定「适配器构造」与「生产 Bean 装配」两条路径上的最终策略值。
+Tika 标准包里的 OCR 模块制品可以留在依赖树中（它是标准包的一部分），
+但运行时不会进入 OCR 路径。
 
 ### 为什么按 code point 而不是 char 切片
 
@@ -140,13 +189,25 @@ RAG 第 1 步解决了「把文件安全地收进来」。第 2 步要回答的�
 | 边界 | 做法 |
 | --- | --- |
 | 路径逃逸 | 只接受内容键；字符集白名单 + 解析结果必须仍在存储根目录内；**只读普通文件且不跟随符号链接** |
+| DOCX 类型混淆 | ZIP 初筛 + OOXML 包类型验证（内容类型 + `officeDocument` 关系 + 主文档部件存在）；只看包内容 |
 | 伪造格式 | 解析前校验文件头；不符即 `UNSUPPORTED_DOCUMENT_CONTENT` |
 | 损坏文档 | 按异常**类型**映射为 `CORRUPTED_DOCUMENT`，不解析异常消息文本 |
 | 加密文档 | `EncryptedDocumentException` / PDFBox `InvalidPasswordException` / POI `EncryptedDocumentException` → `ENCRYPTED_DOCUMENT` |
-| 外部实体（XXE） | 解析只用本地解析器，Tika/POI 默认不解析外部实体；测试用「引用本地文件的 DOCX」验证内容绝不进入提取文本 |
-| 资源耗尽 | 提取文本按 **code point** 限量，超限**立即中断**（自定义 SAX `ContentHandler`，不先构造完整字符串）；切片数量另有上限 |
+| OCR | PDF 固定 `OCR_STRATEGY.NO_OCR`，不依赖机器上是否安装 Tesseract |
+| 外部实体（XXE） | 解析只用本地解析器；包元数据用禁用 DOCTYPE/外部实体的安全 XML 解析器；测试用「引用本地文件的 DOCX」验证内容绝不进入提取文本 |
+| 资源耗尽 | 提取文本按 **code point** 限量，**所有写入路径**（字符、结构换行、跨回调/跨缓冲区代理对）共用同一计数器，超限在追加越界字符前中断；只读包元数据前 1 MiB；落盘用固定缓冲区（无 `readAllBytes`）；切片数量另有上限 |
 | 非法 UTF-8 | 文本格式用显式 `CodingErrorAction.REPORT` 的严格解码器；默认的替换行为会把损坏内容静默变成 `U+FFFD` |
 | 信息泄漏 | 响应里没有原文、切片内容、内容键、路径、解析器名称或异常文本；失败 `detail` 一律固定文案 |
+
+## 日志依赖（FD-0009-R1 修复）
+
+Tika 的传递依赖里同时存在三份 `org/apache/commons/logging/LogFactory.class`：
+`spring-jcl`（Spring 自带）、`commons-logging`（Tika 标准包声明）、`jcl-over-slf4j`（Tika 某模块引入）。
+三者并存时，**由类加载顺序随机决定**用哪一份实现 —— 这不是「都汇入 SLF4J」，
+而是「谁先被加载谁生效」。因此基础设施模块把后两者显式排除，
+只保留 `spring-jcl`（它本身就转发到 SLF4J）；SLF4J 的唯一 provider 仍是 Logback，
+`log4j-core` 不在依赖树中（只有 `log4j-api` + `log4j-to-slf4j` 桥接）。
+排除后 Tika / PDFBox / POI 的解析测试全部照常通过。
 
 ## 已知边界（如实记录）
 
@@ -172,7 +233,8 @@ RAG 第 1 步解决了「把文件安全地收进来」。第 2 步要回答的�
 
 代价：多了一个第三方解析依赖族（Tika + POI + PDFBox）；同步解析占用请求线程；
 `PARSING` 悬挂需要人工介入；解析文本的规范化与切片参数一旦调整，
-历史切片与新切片会不一致（**这是「重新解析」而不是「迁移」**，本任务不做重新切片的批量任务）。
+历史切片与新切片会不一致（**这是「重新解析」而不是「迁移」**，本任务不做重新切片的批量任务）；
+DOCX 解析需要先落盘一份临时文件（多一次 I/O），这是「先验证类型再提取正文」的必要代价。
 
 ## 重新评估条件
 

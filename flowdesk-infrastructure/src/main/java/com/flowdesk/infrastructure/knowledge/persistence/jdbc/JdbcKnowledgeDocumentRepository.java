@@ -6,6 +6,7 @@ import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentRepository;
 import com.flowdesk.application.knowledge.port.out.VersionedKnowledgeDocument;
 import com.flowdesk.domain.knowledge.KnowledgeDocument;
 import com.flowdesk.domain.knowledge.KnowledgeDocumentId;
+import com.flowdesk.domain.knowledge.KnowledgeDocumentStatus;
 import java.sql.Types;
 import java.time.Instant;
 import java.time.OffsetDateTime;
@@ -23,15 +24,29 @@ import org.springframework.transaction.support.TransactionOperations;
  * <h2>插入</h2>
  * <p>版本固定写 0，单条语句即可完成（上传流程只在文件已经落盘之后做这一次短写入）。</p>
  *
- * <h2>更新（compare-and-set，FD-0009）</h2>
+ * <h2>更新（compare-and-set，FD-0009 / FD-0009-R1）</h2>
  * <p>解析状态机依赖 CAS，因此更新不是「先查后改」而是：</p>
  * <ol>
  *   <li>{@code SELECT version, status ... FOR UPDATE} 锁定目标行 —— 不存在则 {@code NOT_FOUND}；</li>
  *   <li>当前版本必须等于 {@code expectedVersion}，否则 {@code VERSION_CONFLICT}（不产生任何写入）；</li>
+ *   <li><b>锁定后读到的状态必须允许这一步转换</b>（见下表），否则
+ *       {@code KNOWLEDGE_DOCUMENT_NOT_PARSABLE}（同样不产生任何写入）；</li>
  *   <li>{@code UPDATE ... WHERE id = ? AND version = ?} 影响行数必须严格等于 1，并把版本加 1；</li>
  *   <li>在同一事务内重新读取并返回独立聚合。</li>
  * </ol>
- * <p>行锁 + 条件更新共同保证：并发领取解析时只有一个请求成功，另一个必然拿到版本冲突。</p>
+ *
+ * <h3>允许通过本方法落库的单步转换（FD-0009-R1 收紧）</h3>
+ * <table border="1">
+ *   <caption>通用 update 的状态矩阵</caption>
+ *   <tr><th>锁定后读到的状态</th><th>允许写入的目标状态</th></tr>
+ *   <tr><td>{@code UPLOADED}</td><td>{@code PARSING}（领取解析）</td></tr>
+ *   <tr><td>{@code PARSE_FAILED}</td><td>{@code PARSING}（修复后重试）</td></tr>
+ *   <tr><td>{@code PARSING}</td><td>{@code PARSE_FAILED}（失败补偿）</td></tr>
+ *   <tr><td>{@code PARSED}</td><td><b>无</b> —— 只能由
+ *       {@code KnowledgeDocumentChunkStore.completeParsing} 的原子端口落库</td></tr>
+ * </table>
+ * <p>把转换矩阵放在<b>适配器</b>里，是为了让「跳过中间状态」「把两次版本递增合并成一次」
+ * 这类绕过状态机的写入在数据库边界上就不可能发生 —— 即使将来有别的调用方拿到这个端口。</p>
  *
  * <p>本类不记录日志，因此不会把标题、文件名或本地路径写进日志。</p>
  */
@@ -136,6 +151,11 @@ public final class JdbcKnowledgeDocumentRepository implements KnowledgeDocumentR
                     KnowledgeApplicationErrorCode.KNOWLEDGE_DOCUMENT_VERSION_CONFLICT,
                     "文档版本不匹配");
         }
+        if (!isAllowedTransition(current.status(), document.status())) {            // 版本相同但转换非法：用现有的稳定状态错误拒绝，不新增公开错误契约、不产生任何写入
+            throw new KnowledgeApplicationException(
+                    KnowledgeApplicationErrorCode.KNOWLEDGE_DOCUMENT_NOT_PARSABLE,
+                    "当前状态不允许该状态转换");
+        }
 
         int affected = this.jdbcClient.sql(KnowledgeDocumentSql.CAS_UPDATE_STATUS)
                 .param(1, document.status().name())
@@ -159,6 +179,24 @@ public final class JdbcKnowledgeDocumentRepository implements KnowledgeDocumentR
 
     private static OffsetDateTime toOffsetDateTime(Instant instant) {
         return instant == null ? null : OffsetDateTime.ofInstant(instant, ZoneOffset.UTC);
+    }
+
+    /**
+     * 通用 update 允许的单步状态转换。
+     *
+     * <p>{@code PARSED} 不在任何「允许写入的目标」里：它只能由
+     * {@code completeParsing} 的原子端口在一次事务中连同切片一起落库。</p>
+     *
+     * @param currentStatus 锁定后读到的当前状态名
+     * @param targetStatus  调用方希望写入的状态
+     * @return 是否允许
+     */
+    private static boolean isAllowedTransition(String currentStatus, KnowledgeDocumentStatus targetStatus) {
+        return switch (currentStatus) {
+            case "UPLOADED", "PARSE_FAILED" -> targetStatus == KnowledgeDocumentStatus.PARSING;
+            case "PARSING" -> targetStatus == KnowledgeDocumentStatus.PARSE_FAILED;
+            default -> false;
+        };
     }
 
     /**

@@ -295,6 +295,54 @@ class KnowledgeParseApiIntegrationTest {
                 .contains(KnowledgeParseFixtures.PDF_TEXT);
     }
 
+    @Test
+    void aSpreadsheetDisguisedAsDocxIsRejectedWith422AndLeavesTheDocumentRetryable() throws Exception {
+        // 上传阶段只能看到 ZIP 文件头，因此这份 XLSX 会被当作 DOCX 收下；
+        // 真正的类型验证发生在解析阶段，并且必须早于正文提取
+        JsonNode uploaded = upload("季度运维报告", "report.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                KnowledgeParseFixtures.xlsx("SPREADSHEET_SECRET"));
+
+        MvcResult result = parse(uploaded.path("id").asText(), "\"0\"")
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.code").value("DOCUMENT_PARSE_FAILED"))
+                .andExpect(jsonPath("$.failureCode").value("UNSUPPORTED_DOCUMENT_CONTENT"))
+                .andReturn();
+
+        assertThat(result.getResponse().getContentAsString(StandardCharsets.UTF_8))
+                .as("拒绝理由与响应体都不能泄漏电子表格内容")
+                .doesNotContain("SPREADSHEET_SECRET")
+                .doesNotContain("sheetData")
+                .doesNotContain("xl/");
+
+        assertThat(statusOf(uploaded.path("id").asText())).isEqualTo("PARSE_FAILED");
+        assertThat(failureCodeOf(uploaded.path("id").asText())).isEqualTo("UNSUPPORTED_DOCUMENT_CONTENT");
+        assertThat(versionOf(uploaded.path("id").asText())).as("领取 +1、补偿 +1").isEqualTo(2L);
+        assertThat(chunkCountOf(uploaded.path("id").asText())).isZero();
+    }
+
+    @Test
+    void aSpreadsheetDisguisedAsDocxCanBeRetriedAfterFixingTheStoredObject() throws Exception {
+        JsonNode uploaded = upload("季度运维报告", "report.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                KnowledgeParseFixtures.xlsx("SPREADSHEET_SECRET"));
+        parse(uploaded.path("id").asText(), "\"0\"").andExpect(status().isUnprocessableEntity());
+
+        // 换成一份真正的 DOCX（内容键不变，只替换对象内容）
+        String contentKey = this.jdbcClient.sql("SELECT content_key FROM knowledge_documents WHERE id = ?")
+                .param(1, uploaded.path("id").asText()).query(String.class).single();
+        Files.write(STORAGE_ROOT.resolve("documents").resolve(contentKey), KnowledgeParseFixtures.docx());
+
+        parse(uploaded.path("id").asText(), "\"2\"")
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("PARSED"));
+
+        assertThat(String.join("\n", storedChunkContents(uploaded.path("id").asText())))
+                .contains(KnowledgeParseFixtures.DOCX_FIRST_PARAGRAPH);
+        assertThat(failureCodeOf(uploaded.path("id").asText())).isNull();
+    }
+
     // ---------- ④ 不泄漏内部信息 ----------
 
     @Test

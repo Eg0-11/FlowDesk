@@ -69,7 +69,7 @@ flowdesk-mcp-monitoring     ← 只依赖 flowdesk-shared
 | Spring AI Alibaba | 1.1.2.2（**仅导入 BOM**，其 Agent Framework 留待后续阶段） |
 | Spring AI Alibaba Extensions | 1.1.2.2（**仅导入 BOM**） |
 | DeepSeek 传输 | OpenAI 兼容 Chat Completions（`spring-ai-starter-model-openai`，见 [ADR 0001](docs/adr/0001-deepseek-openai-compatible-transport.md)） |
-| Apache Tika | 3.3.2（`tika-core` + `tika-parsers-standard-package`，版本由根 pom 的 `tika.version` 单点锁定；**不使用 `tika-app`**） |
+| Apache Tika | 3.3.2（`tika-core` + `tika-parsers-standard-package`，版本由根 pom 的 `tika.version` 单点锁定；**不使用 `tika-app`**；已排除 `commons-logging` 与 `jcl-over-slf4j`，只保留 Spring 自带的 `spring-jcl`，见 [ADR 0006](docs/adr/0006-document-parsing-and-deterministic-chunking.md)） |
 | JUnit | JUnit 5（由 `spring-boot-starter-test` 统一提供） |
 | 编码 | UTF-8（源码与报告输出） |
 
@@ -922,21 +922,44 @@ PARSE_FAILED ──claim──┘        └──fail────▶ PARSE_FAIL
 - 事务边界属于适配器，应用层不认识事务；JDBC 异常在适配器内被映射为
   `METADATA_STORAGE_FAILURE`，不向应用层泄漏 Spring/JDBC 类型。
 
+**完成解析的入参防线**（在开启事务与执行任何 SQL **之前**）：聚合必须是 `PARSED`、
+切片列表非空且不含 `null`、每个切片的 `documentId` 必须等于目标文档、
+`chunkIndex` 必须从 0 严格连续递增；非法输入以既有的稳定内部错误 `KNOWLEDGE_INTERNAL_ERROR`
+拒绝，**不静默纠正、零写入**（测试用「语句计数数据源」断言一条 SQL 都没下发）。
+
+**通用 `update` 的状态矩阵**（FD-0009-R1 收紧，避免绕过状态机）：
+
+| 数据库中的当前状态 | 允许写入 | 说明 |
+| --- | --- | --- |
+| `UPLOADED` | `PARSING` | 领取解析 |
+| `PARSE_FAILED` | `PARSING` | 修复后重试 |
+| `PARSING` | `PARSE_FAILED` | 失败补偿 |
+| `PARSED` | **无** | 只能由 `completeParsing` 原子端口落库 |
+
+版本不匹配仍是 412 `KNOWLEDGE_DOCUMENT_VERSION_CONFLICT`；版本相同但转换非法用现有的
+409 状态错误拒绝（未新增任何公开错误码）。
+
 ### 16.4 解析安全边界
 
 | 边界 | 做法 |
 | --- | --- |
 | 路径逃逸 | 只接受内容键；字符集白名单 + 解析结果必须在存储根目录内；只读普通文件、**不跟随符号链接** |
-| 伪造格式 | 解析前校验文件头（PDF `%PDF-`、DOCX ZIP），不符 → `UNSUPPORTED_DOCUMENT_CONTENT` |
-| 损坏文档 | 按异常**类型**映射为 `CORRUPTED_DOCUMENT`（不解析异常文本） |
+| DOCX 类型混淆 | **ZIP 初筛 + OOXML 包类型验证**：只有「`/word/document.xml` 的生效内容类型是 WordprocessingML **且** `officeDocument` 关系指向该部件 **且** 该部件存在」才当作 DOCX；XLSX / PPTX / DOCM / XPS / 普通 ZIP 一律 `UNSUPPORTED_DOCUMENT_CONTENT` |
+| 伪造格式 | PDF 必须 `%PDF-`、DOCX 必须 `PK\x03\x04`（初筛）；不符 → `UNSUPPORTED_DOCUMENT_CONTENT` |
+| 损坏文档 | 容器读不出来、已声明的主文档部件缺失、正文无法解析 → `CORRUPTED_DOCUMENT`（按异常**类型**映射，不解析异常文本） |
 | 加密文档 | → `ENCRYPTED_DOCUMENT`（测试用现场构造的加密 PDF 真实验证） |
-| XXE / 外部实体 | 用「正文引用本地文件的 DOCX」验证：解析要么安全失败，要么提取不到任何本地文件内容 |
-| 资源耗尽 | 提取文本按 **code point** 限量（默认 1,000,000），超限**立即中断**；切片数量上限 5000 |
+| OCR | PDF 显式配置 **`OCR_STRATEGY.NO_OCR`**：不依赖机器上是否安装 Tesseract，解析结果与资源消耗不随部署环境变化；构造后不再修改这份共享配置 |
+| XXE / 外部实体 | 只用本地解析器；包元数据用「禁用 DOCTYPE 与外部实体」的安全 XML 解析器；测试用「正文引用本地文件的 DOCX」验证本地文件内容绝不进入提取文本 |
+| 资源耗尽 | 提取文本按 **code point** 限量（默认 1,000,000），超限**立即中断**；切片数量上限 5000；DOCX 类型验证最多读包元数据的前 1 MiB，落盘用固定 8 KiB 缓冲（**全程没有 `readAllBytes`**） |
 | 非法 UTF-8 | 文本格式用 `CodingErrorAction.REPORT` 的严格解码器（默认的替换行为会静默产生 `U+FFFD`） |
 | 信息泄漏 | 响应里没有原文、切片内容、内容键、路径、解析器名称或异常文本 |
 
 - 解析器由**数据库里保存的格式**直接指定（PDF → PDFBox、DOCX → POI OOXML），不做二次探测；
+- **类型判定只依据包内容**：不使用原始文件名、扩展名或客户端声明的 Content-Type，
+  也不靠往 Tika `Metadata` 里写一个「它是 DOCX」的声明来充当验证；
 - Markdown/Text 不经过解析框架：严格 UTF-8 解码 + 去掉 BOM；
+- DOCX 路径会先把内容流式写入一份受控临时文件（固定缓冲区，`finally` 删除），
+  这样才能在**正文提取之前**完成包类型验证；调用方的流始终由调用方关闭；
 - 解析器**不关闭**调用方的流（`nonClosing` 包装），流的生命周期由应用服务负责。
 
 ### 16.5 规范化、切片算法与参数
@@ -958,6 +981,12 @@ PARSE_FAILED ──claim──┘        └──fail────▶ PARSE_FAIL
 | `flowdesk.knowledge.chunking.max-extracted-code-points` | `1000000` | 提取文本上限，解析中一旦超过立即中断 |
 
 四个属性在**启动期**校验（组合溢出用 `long` 计算），不合法就让应用启动失败。
+
+**提取上限覆盖「最终输出」的每一个 code point**（FD-0009-R1 修正）：
+普通字符、`ignorableWhitespace`、块级元素之间自动补的结构换行、跨 SAX 回调与跨 8192 char 解码缓冲区的
+代理对，全部经过同一个计数器；不变量是 `text().codePointCount(0, text().length()) <= 上限`。
+另外，**只有文本开头的 UTF-8 BOM 被丢弃且不占配额**，其它位置的 `U+FEFF` 按普通内容计数；
+超限时在追加越界字符**之前**抛出，不会先拼出完整文本再回头检查。
 
 ### 16.6 数据与错误契约
 

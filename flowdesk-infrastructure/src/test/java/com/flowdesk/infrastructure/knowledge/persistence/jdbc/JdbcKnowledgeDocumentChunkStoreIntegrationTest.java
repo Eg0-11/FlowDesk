@@ -9,6 +9,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.flowdesk.application.knowledge.KnowledgeApplicationErrorCode;
+import com.flowdesk.application.knowledge.KnowledgeApplicationException;
 import com.flowdesk.application.knowledge.port.out.VersionedKnowledgeDocument;
 import com.flowdesk.domain.knowledge.KnowledgeDocument;
 import com.flowdesk.domain.knowledge.KnowledgeDocumentChunk;
@@ -177,20 +178,17 @@ class JdbcKnowledgeDocumentChunkStoreIntegrationTest {
         long claimed = claim(fixture.repository(), document, 0L);
         document.markParsed(UPLOADED_AT.plusSeconds(2));
 
-        // 第二片的序号与第一片相同：主键冲突必然发生在「已删旧切片、插入一片」之后
-        KnowledgeDocumentChunk first = chunk(document.id(), 0, "第一片");
-        KnowledgeDocumentChunk duplicate = chunk(document.id(), 0, "重复序号");
+        // 用「第二条 INSERT 语句必定失败」的数据源：第一片已经插入之后才炸，
+        // 因此这条用例证明的是「中途失败会整体回滚」，而不是前置校验
+        fixture.resetStatements();
+        fixture.failOnStatement(4);
 
         assertThatThrownBy(() -> fixture.chunkStore().completeParsing(document, claimed,
-                List.of(first, duplicate)))
-                .as("主键冲突必须以稳定的应用层错误码暴露，而不是泄漏 Spring 的 JDBC 异常")
-                .isInstanceOf(com.flowdesk.application.knowledge.KnowledgeApplicationException.class)
-                .extracting(thrown -> ((com.flowdesk.application.knowledge.KnowledgeApplicationException) thrown)
-                        .errorCode())
+                chunks(document.id(), "第一片", "第二片")))
+                .as("写入失败必须以稳定的应用层错误码暴露，而不是泄漏 Spring 的 JDBC 异常")
+                .isInstanceOf(KnowledgeApplicationException.class)
+                .extracting(thrown -> ((KnowledgeApplicationException) thrown).errorCode())
                 .isEqualTo(KnowledgeApplicationErrorCode.METADATA_STORAGE_FAILURE);
-        assertThat(org.assertj.core.api.Assertions.catchThrowable(() -> fixture.chunkStore()
-                .completeParsing(document, claimed, List.of(first, duplicate))))
-                .hasCauseInstanceOf(DataIntegrityViolationException.class);
 
         assertThat(statusOf(document.id()))
                 .as("失败必须整体回滚：文档不能变成 PARSED")
@@ -199,6 +197,97 @@ class JdbcKnowledgeDocumentChunkStoreIntegrationTest {
         assertThat(fixture.chunkStore().countChunks(document.id()))
                 .as("已插入的第一片必须一起回滚")
                 .isZero();
+    }
+
+    // ---------- ③.1 完成解析的入参防线（FD-0009-R1） ----------
+
+    @Test
+    void completeParsingRejectsAnEmptyChunkList() {
+        assertGuarded("key-guard-empty", documentId -> List.of(), "完成解析不接受空切片列表");
+    }
+
+    @Test
+    void completeParsingRejectsNullElements() {
+        assertGuarded("key-guard-null",
+                documentId -> java.util.Arrays.asList(chunkFor(documentId, 0, "第一片"), null),
+                "切片列表中不能包含 null");
+    }
+
+    @Test
+    void completeParsingRejectsChunksBelongingToAnotherDocument() {
+        assertGuarded("key-guard-owner",
+                documentId -> List.of(chunkFor(documentId, 0, "第一片"),
+                        chunkFor(randomId(), 1, "别人的切片")),
+                "切片归属的文档与目标文档不一致");
+    }
+
+    @Test
+    void completeParsingRejectsGappedChunkIndexes() {
+        assertGuarded("key-guard-gap",
+                documentId -> List.of(chunkFor(documentId, 0, "第一片"), chunkFor(documentId, 2, "跳号了")),
+                "切片序号必须从 0 开始严格连续递增");
+    }
+
+    @Test
+    void completeParsingRejectsOutOfOrderChunkIndexes() {
+        assertGuarded("key-guard-order",
+                documentId -> List.of(chunkFor(documentId, 1, "第二片"), chunkFor(documentId, 0, "第一片")),
+                "切片序号必须从 0 开始严格连续递增");
+    }
+
+    @Test
+    void completeParsingRejectsADocumentThatIsNotMarkedParsed() {
+        KnowledgeDocument document = insertUploaded(fixture.repository(), "key-guard-status");
+        long claimed = claim(fixture.repository(), document, 0L);
+        // 聚合仍是 PARSING：完成端口只接受 PARSED 的聚合
+        fixture.resetStatements();
+
+        assertApplicationError(() -> fixture.chunkStore().completeParsing(document, claimed,
+                chunks(document.id(), "不该落库")),
+                KnowledgeApplicationErrorCode.KNOWLEDGE_INTERNAL_ERROR);
+
+        assertThat(fixture.statementsExecuted()).isZero();
+        assertThat(statusOf(document.id())).isEqualTo("PARSING");
+        assertThat(versionOf(document.id())).isEqualTo(1L);
+        assertThat(fixture.chunkStore().countChunks(document.id())).isZero();
+    }
+
+    /**
+     * 断言非法切片输入被稳定错误拒绝，且<b>一条 SQL 都没有下发</b>。
+     *
+     * @param contentKey      内容键
+     * @param illegalChunks   以目标文档标识构造非法切片列表的函数
+     * @param expectedMessage 期望的内部错误说明
+     */
+    private void assertGuarded(String contentKey,
+            java.util.function.Function<KnowledgeDocumentId, List<KnowledgeDocumentChunk>> illegalChunks,
+            String expectedMessage) {
+
+        KnowledgeDocument document = insertUploaded(fixture.repository(), contentKey);
+        long claimed = claim(fixture.repository(), document, 0L);
+        document.markParsed(UPLOADED_AT.plusSeconds(2));
+        List<KnowledgeDocumentChunk> prepared = illegalChunks.apply(document.id());
+
+        fixture.resetStatements();
+        KnowledgeApplicationException thrown = (KnowledgeApplicationException) org.assertj.core.api.Assertions
+                .catchThrowable(() -> fixture.chunkStore().completeParsing(document, claimed, prepared));
+
+        assertThat(thrown.errorCode()).isEqualTo(KnowledgeApplicationErrorCode.KNOWLEDGE_INTERNAL_ERROR);
+        assertThat(thrown.getMessage()).isEqualTo(expectedMessage);
+        assertThat(fixture.statementsExecuted())
+                .as("前置校验必须发生在开启事务与执行 SQL 之前")
+                .isZero();
+        assertThat(statusOf(document.id())).isEqualTo("PARSING");
+        assertThat(versionOf(document.id())).isEqualTo(1L);
+        assertThat(fixture.chunkStore().countChunks(document.id()))
+                .as("非法输入不得产生任何切片").isZero();
+    }
+
+    private static KnowledgeDocumentChunk chunkFor(KnowledgeDocumentId documentId, int index, String content) {
+        return new KnowledgeDocumentChunk(documentId, index, content,
+                content.codePointCount(0, content.length()),
+                Sha256Digest.of(KnowledgeTestContent.sha256Hex(content.getBytes(StandardCharsets.UTF_8))),
+                Instant.parse("2026-05-01T10:00:05Z"));
     }
 
     @Test

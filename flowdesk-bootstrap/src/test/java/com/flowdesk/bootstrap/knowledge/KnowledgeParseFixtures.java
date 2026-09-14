@@ -98,6 +98,44 @@ final class KnowledgeParseFixtures {
         return "%PDF-1.7\nthis is not a pdf body at all\n".getBytes(StandardCharsets.US_ASCII);
     }
 
+    /**
+     * 一份真实的 XLSX（SpreadsheetML）OOXML 包：内容类型、关系、工作簿与工作表齐备。
+     *
+     * <p>它的 ZIP 文件头是 {@code PK\x03\x04}，因此能通过上传阶段「DOCX 必须是 ZIP 容器」
+     * 的校验；但包本身是电子表格，必须在<b>解析阶段</b>被类型验证拒绝（FD-0009-R1）。</p>
+     *
+     * @param cellText 单元格文本
+     * @return XLSX 字节
+     */
+    static byte[] xlsx(String cellText) {
+        String contentTypes = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+                + "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+                + "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package."
+                + "relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+                + "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-"
+                + "officedocument.spreadsheetml.sheet.main+xml\"/>"
+                + "<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd."
+                + "openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/></Types>";
+        String relationships = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+                + "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+                + "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/"
+                + "relationships/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>";
+        String workbook = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+                + "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+                + "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+                + "<sheets><sheet name=\"Sheet1\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>";
+        String sheet = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+                + "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+                + "<sheetData><row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>" + cellText
+                + "</t></is></c></row></sheetData></worksheet>";
+
+        return zip(Map.of(
+                "[Content_Types].xml", contentTypes,
+                "_rels/.rels", relationships,
+                "xl/workbook.xml", workbook,
+                "xl/worksheets/sheet1.xml", sheet));
+    }
+
     private static byte[] zip(Map<String, String> entries) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         try (ZipOutputStream zip = new ZipOutputStream(out, StandardCharsets.UTF_8)) {

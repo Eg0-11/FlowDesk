@@ -69,14 +69,40 @@
       - tika-core：Tika 门面与元数据 API；
       - tika-parsers-standard-package：标准解析器包（PDF 走 PDFBox、DOCX 走 POI）。
       刻意不使用 tika-app：那是给命令行用的胖 jar，会带入大量无关依赖。
+
+      日志依赖排除（FD-0009-R1）：Tika 会连带引入两份 JCL 实现 ——
+      commons-logging 与 jcl-over-slf4j；它们与 Spring 自带的 spring-jcl 都提供
+      org/apache/commons/logging/LogFactory.class，最终由类加载顺序随机决定用哪一份。
+      这里把前两个排除掉，只保留 spring-jcl（它自己就转发到 SLF4J），
+      于是 SLF4J 的唯一 provider 仍是 Logback，不存在第二套日志后端。
     -->
     <dependency>
       <groupId>org.apache.tika</groupId>
       <artifactId>tika-core</artifactId>
+      <exclusions>
+        <exclusion>
+          <groupId>commons-logging</groupId>
+          <artifactId>commons-logging</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>org.slf4j</groupId>
+          <artifactId>jcl-over-slf4j</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
     <dependency>
       <groupId>org.apache.tika</groupId>
       <artifactId>tika-parsers-standard-package</artifactId>
+      <exclusions>
+        <exclusion>
+          <groupId>commons-logging</groupId>
+          <artifactId>commons-logging</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>org.slf4j</groupId>
+          <artifactId>jcl-over-slf4j</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
   </dependencies>
 </project>

@@ -48,13 +48,16 @@ final class KnowledgePersistenceTestSupport {
                 .load()
                 .migrate();
 
-        JdbcClient jdbcClient = JdbcClient.create(dataSource);
-        TransactionTemplate transactions = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
+        // 迁移用真实数据源；此后所有 JDBC 都经由语句拦截层，便于观测「是否下发了 SQL」
+        StatementInterceptingDataSource intercepting = new StatementInterceptingDataSource(dataSource);
+        JdbcClient jdbcClient = JdbcClient.create(intercepting);
+        TransactionTemplate transactions = new TransactionTemplate(
+                new DataSourceTransactionManager(intercepting));
         JdbcKnowledgeDocumentRepository repository = new JdbcKnowledgeDocumentRepository(jdbcClient, transactions);
         JdbcKnowledgeDocumentChunkStore chunkStore = new JdbcKnowledgeDocumentChunkStore(jdbcClient, transactions,
                 repository);
 
-        return new Fixture(jdbcClient, transactions, repository, chunkStore);
+        return new Fixture(jdbcClient, transactions, repository, chunkStore, intercepting);
     }
 
     /**
@@ -134,8 +137,29 @@ final class KnowledgePersistenceTestSupport {
      * @param transactions 事务模板
      * @param repository   元数据仓储
      * @param chunkStore   切片存储
+     * @param statements   语句拦截层（用于断言「零写入」与定点制造写入失败）
      */
     record Fixture(JdbcClient jdbcClient, TransactionTemplate transactions,
-            JdbcKnowledgeDocumentRepository repository, JdbcKnowledgeDocumentChunkStore chunkStore) {
+            JdbcKnowledgeDocumentRepository repository, JdbcKnowledgeDocumentChunkStore chunkStore,
+            StatementInterceptingDataSource statements) {
+
+        /** @return 自上次复位以来下发的语句数 */
+        int statementsExecuted() {
+            return this.statements.statementsExecuted();
+        }
+
+        /** 复位语句计数（在「被测操作」之前调用）。 */
+        void resetStatements() {
+            this.statements.resetStatements();
+        }
+
+        /**
+         * 让第 N 条语句失败。
+         *
+         * @param statementNumber 从 1 开始；0 表示关闭
+         */
+        void failOnStatement(int statementNumber) {
+            this.statements.failOnStatement(statementNumber);
+        }
     }
 }

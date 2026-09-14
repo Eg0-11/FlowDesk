@@ -31,6 +31,12 @@ import org.springframework.transaction.support.TransactionOperations;
  * <p>单条多值 INSERT 的语句长度会随切片数线性增长（切片上限数千），
  * 既可能撞上数据库的参数上限，也让 SQL 拼装变复杂。这里用批处理风格的循环插入，
  * 事务保证整体性；切片数上限由配置约束，不会无限增长。</p>
+ *
+ * <h2>入参防线（FD-0009-R1）</h2>
+ * <p>端口在开启事务之前就会拒绝：非 {@code PARSED} 的文档、空切片列表、列表中的 {@code null}、
+ * 归属错误（{@code chunk.documentId} 与文档不一致）以及不连续/乱序的 {@code chunkIndex}。
+ * 尤其是「归属错误」：插入时使用的是文档自己的标识，若不做校验，一份属于别的文档的切片
+ * 会被<b>静默改写</b>成当前文档的切片 —— 数据看起来正常，来源却已经错了。</p>
  */
 public final class JdbcKnowledgeDocumentChunkStore implements KnowledgeDocumentChunkStore {
 
@@ -60,6 +66,12 @@ public final class JdbcKnowledgeDocumentChunkStore implements KnowledgeDocumentC
         Objects.requireNonNull(parsedDocument, "parsedDocument 不能为 null");
         Objects.requireNonNull(chunks, "chunks 不能为 null");
 
+        // 防御性校验：全部发生在开启事务与执行任何 SQL 之前（FD-0009-R1）。
+        // 端口是应用层与数据库之间唯一的入口，因此「不该出现在这里的东西」必须在这里被挡住，
+        // 而不是靠调用方自觉 —— 静默纠正（忽略错误归属的切片、按位置重排序号）会让数据
+        // 看起来正确、实际上已经错了。
+        requireParsedDocumentAndChunks(parsedDocument, chunks);
+
         KnowledgeDocumentId documentId = parsedDocument.id();
 
         try {
@@ -75,6 +87,44 @@ public final class JdbcKnowledgeDocumentChunkStore implements KnowledgeDocumentC
             throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.METADATA_STORAGE_FAILURE,
                     "解析结果写入失败", ex);
         }
+    }
+
+    /**
+     * 完成解析前的防御性校验。
+     *
+     * <p>拒绝的情形：文档不是 {@code PARSED}、切片列表为空、包含 {@code null}、
+     * 切片归属的文档与目标文档不一致、序号不是从 0 开始严格连续递增。
+     * 非法输入以既有的稳定内部错误码 {@code KNOWLEDGE_INTERNAL_ERROR} 拒绝，
+     * 不静默纠正，也不产生任何数据库写入。</p>
+     *
+     * @param parsedDocument 待落库的文档聚合
+     * @param chunks         待写入的切片（按序号升序）
+     */
+    private static void requireParsedDocumentAndChunks(KnowledgeDocument parsedDocument,
+            List<KnowledgeDocumentChunk> chunks) {
+
+        if (parsedDocument.status() != KnowledgeDocumentStatus.PARSED) {
+            throw internalError("完成解析只接受 PARSED 状态的文档");
+        }
+        if (chunks.isEmpty()) {
+            throw internalError("完成解析不接受空切片列表");
+        }
+        for (int index = 0; index < chunks.size(); index++) {
+            KnowledgeDocumentChunk chunk = chunks.get(index);
+            if (chunk == null) {
+                throw internalError("切片列表中不能包含 null");
+            }
+            if (!parsedDocument.id().equals(chunk.documentId())) {
+                throw internalError("切片归属的文档与目标文档不一致");
+            }
+            if (chunk.chunkIndex() != index) {
+                throw internalError("切片序号必须从 0 开始严格连续递增");
+            }
+        }
+    }
+
+    private static KnowledgeApplicationException internalError(String message) {
+        return new KnowledgeApplicationException(KnowledgeApplicationErrorCode.KNOWLEDGE_INTERNAL_ERROR, message);
     }
 
     private VersionedKnowledgeDocument completeWithinTransaction(KnowledgeDocument parsedDocument,

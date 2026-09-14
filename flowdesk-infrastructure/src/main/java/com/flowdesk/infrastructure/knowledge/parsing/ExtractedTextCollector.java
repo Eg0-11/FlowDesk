@@ -5,84 +5,46 @@ import org.xml.sax.SAXException;
 import org.xml.sax.helpers.DefaultHandler;
 
 /**
- * 按 <b>Unicode code point</b> 限量收集解析出的文本。
+ * 按 <b>Unicode code point</b> 限量收集解析出的文本（PDF/DOCX 路径）。
  *
  * <p>为什么不能用 Tika 自带的 {@code WriteOutContentHandler}：它按 {@code char}（UTF-16 单元）
  * 计数，而本项目的上限以 code point 计 —— 一个 emoji 会被算成 2，含大量 emoji 的文档会被误判超限。</p>
  *
+ * <p>实际计数与代理对处理全在 {@link CodePointLimitedTextBuilder} 里，本类只负责把 SAX 事件
+ * 翻译成「写入字符」与「写入结构换行」两种操作：<b>每一个进入最终文本的字符都必须经过
+ * 那个写入器</b>，包括块级元素之间自动补的换行（FD-0009-R1 之前这里漏计过）。</p>
+ *
  * <p>超限时抛 {@link ExtractionLimitExceededException}（非受检）直接中断解析：
  * 这是「立即终止」的实现方式 —— <b>不允许</b>先把文本无限拼出来再回头检查长度。</p>
- *
- * <p>代理对跨 {@code characters} 回调被切断的情况也要处理：高代理留在缓冲区末尾、
- * 低代理在下一次回调开头，必须只算<b>一个</b> code point 且拼回原样。</p>
  */
 final class ExtractedTextCollector extends DefaultHandler {
 
-    private final int maxCodePoints;
-
-    private final StringBuilder text = new StringBuilder();
-
-    private int codePoints;
-
-    private boolean pendingHighSurrogate;
+    private final CodePointLimitedTextBuilder builder;
 
     ExtractedTextCollector(int maxCodePoints) {
-        this.maxCodePoints = maxCodePoints;
+        this.builder = new CodePointLimitedTextBuilder(maxCodePoints);
     }
 
     @Override
     public void characters(char[] chunk, int start, int length) {
-        int index = start;
-        int end = start + length;
-
-        if (this.pendingHighSurrogate) {
-            this.pendingHighSurrogate = false;
-            if (index < end && Character.isLowSurrogate(chunk[index])) {
-                // 与上一个高代理组成一个 code point：那一轮已经计过数，这里只补回字符
-                this.text.append(chunk[index]);
-                index++;
-            }
-        }
-
-        while (index < end) {
-            char current = chunk[index];
-            if (Character.isHighSurrogate(current) && index + 1 < end
-                    && Character.isLowSurrogate(chunk[index + 1])) {
-                countOne();
-                this.text.append(current).append(chunk[index + 1]);
-                index += 2;
-                continue;
-            }
-            if (Character.isHighSurrogate(current) && index + 1 == end) {
-                countOne();
-                this.text.append(current);
-                this.pendingHighSurrogate = true;
-                index++;
-                continue;
-            }
-            countOne();
-            this.text.append(current);
-            index++;
-        }
+        this.builder.append(chunk, start, length);
     }
 
     @Override
     public void ignorableWhitespace(char[] chunk, int start, int length) {
-        characters(chunk, start, length);
+        // 可忽略空白同样会进入输出，因此走同一条限量路径
+        this.builder.append(chunk, start, length);
     }
 
     @Override
     public void startElement(String uri, String localName, String qName, Attributes attributes)
             throws SAXException {
 
-        // 块级元素之间补一个换行：否则 PDF/Word 的段落会被拼成一整行，段落边界信息就丢了
-        if (!this.text.isEmpty() && !endsWithNewline() && isBlockElement(localName, qName)) {
-            this.text.append('\n');
+        // 块级元素之间补一个换行：否则 PDF/Word 的段落会被拼成一整行，段落边界信息就丢了。
+        // 这个换行也是输出的一部分，因此同样占用配额（并在超限时当场抛出）。
+        if (!this.builder.isEmpty() && this.builder.lastChar() != '\n' && isBlockElement(localName, qName)) {
+            this.builder.appendStructuralNewline();
         }
-    }
-
-    private boolean endsWithNewline() {
-        return this.text.length() > 0 && this.text.charAt(this.text.length() - 1) == '\n';
     }
 
     private static boolean isBlockElement(String localName, String qName) {
@@ -96,29 +58,17 @@ final class ExtractedTextCollector extends DefaultHandler {
                 || lower.equals("h4") || lower.equals("h5") || lower.equals("h6");
     }
 
-    private void countOne() {
-        this.codePoints++;
-        if (this.codePoints > this.maxCodePoints) {
-            throw new ExtractionLimitExceededException(this.maxCodePoints);
-        }
-    }
-
     /**
-     * @return 收集到的文本
+     * @return 收集到的文本；其 code point 数必然不超过构造时的上限
      */
     String text() {
-        return this.text.toString();
+        return this.builder.text();
     }
 
     /**
-     * 提取文本超过配置上限。
+     * @return 已计入配额的 code point 总数（供测试断言不变量）
      */
-    static final class ExtractionLimitExceededException extends RuntimeException {
-
-        private static final long serialVersionUID = 1L;
-
-        ExtractionLimitExceededException(int maxCodePoints) {
-            super("提取文本超过上限 " + maxCodePoints + " code points");
-        }
+    int codePointCount() {
+        return this.builder.codePointCount();
     }
 }
