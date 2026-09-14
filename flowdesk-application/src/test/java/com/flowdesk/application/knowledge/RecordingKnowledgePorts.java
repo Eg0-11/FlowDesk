@@ -309,6 +309,13 @@ final class RecordingKnowledgePorts {
         KnowledgeDocument lastUpdated() {
             return this.lastUpdated;
         }
+
+        /**
+         * @return 仓储当前持有的文档快照（含版本），从未写入过时返回 {@code null}
+         */
+        VersionedKnowledgeDocument found() {
+            return this.found;
+        }
     }
 
     /**

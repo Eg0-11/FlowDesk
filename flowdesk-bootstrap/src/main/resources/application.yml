@@ -33,12 +33,23 @@ spring:
   # OpenAI starter 在类路径上时，除 chat 之外还会自动装配 embedding / image /
   # audio(speech, transcription) / moderation，它们同样要求 API Key，
   # 因此这里必须一并关闭，否则默认 profile 会启动失败。
+  #
+  # FD-0010 起 DashScope starter 也在类路径上：它的自动配置全部使用
+  # matchIfMissing=true 的 @ConditionalOnProperty，因此「什么都不配」是关不掉的 ——
+  # 默认环境必须显式把 dashscope 总开关与各能力都写成 false/none，
+  # 否则会创建出要求 API Key 的 DashScope Bean，默认 profile 直接启动失败。
   ai:
+    dashscope:
+      # 总开关：默认关闭 DashScope 的全部能力（chat / embedding / image / audio / video / rerank / agent）
+      enabled: false
+      agent: false
     model:
       chat: none
       embedding: none
       image: none
       moderation: none
+      video: none
+      rerank: none
       audio:
         speech: none
         transcription: none
@@ -74,3 +85,18 @@ flowdesk:
       max-chunks: 5000
       # 提取文本的 code point 上限：解析过程中一旦超过就立即中断读取，防止 ZIP 炸弹式的超大文本。
       max-extracted-code-points: 1000000
+    embedding:
+      # 文档切片向量化（FD-0010）：默认<b>关闭</b>。
+      #
+      # 关闭意味着：不创建 EmbeddingModel、不发生任何网络请求、也不需要任何 API Key；
+      # 索引接口返回 503 KNOWLEDGE_EMBEDDING_DISABLED，且不会读取或修改任何文档。
+      # 真实链路需要 --spring.profiles.active=postgres,dashscope-embedding，
+      # 并且数据源必须是 PostgreSQL（pgvector 只存在于 PostgreSQL）。
+      enabled: false
+      # provider 与 model 会随向量一起持久化：后续检索阶段据此判断向量由哪个模型生成。
+      provider: dashscope
+      model: text-embedding-v4
+      # 维度与 vector(1024) 列、领域不变量三者必须一致。
+      dimensions: 1024
+      # 单批切片数：上游 Embedding 接口对一次请求的输入条数有上限。
+      batch-size: 10

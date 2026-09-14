@@ -46,13 +46,17 @@ class KnowledgeDocumentTest {
     }
 
     @Test
-    void theStatusSetIsExactlyTheParseLifecycle() {
-        // FD-0009 起文档有完整的解析状态机：状态只有这四个，多一个都意味着契约被悄悄改动
+    void theStatusSetIsExactlyTheTwoLifecycles() {
+        // FD-0009 加入解析状态机、FD-0010 加入索引状态机：状态只有这七个，
+        // 多一个都意味着对外契约被悄悄改动
         assertThat(KnowledgeDocumentStatus.values()).containsExactly(
                 KnowledgeDocumentStatus.UPLOADED,
                 KnowledgeDocumentStatus.PARSING,
                 KnowledgeDocumentStatus.PARSED,
-                KnowledgeDocumentStatus.PARSE_FAILED);
+                KnowledgeDocumentStatus.PARSE_FAILED,
+                KnowledgeDocumentStatus.INDEXING,
+                KnowledgeDocumentStatus.INDEXED,
+                KnowledgeDocumentStatus.INDEX_FAILED);
     }
 
     @Test
@@ -157,7 +161,7 @@ class KnowledgeDocumentTest {
 
         assertThatThrownBy(() -> KnowledgeDocument.restore(ID, TITLE, sentinel, DocumentFormat.TEXT, "text/plain",
                 10L, Sha256Digest.of(DIGEST), CONTENT_KEY, KnowledgeDocumentStatus.UPLOADED, NOW, NOW,
-                null, null, null))
+                null, null, null, null, null, null, null, null))
                 .isInstanceOf(KnowledgeDomainException.class)
                 .hasMessageNotContaining(sentinel)
                 .hasMessageContaining(KnowledgeErrorCode.INVALID_ORIGINAL_FILENAME.name());
@@ -272,8 +276,20 @@ class KnowledgeDocumentTest {
             Instant createdAt, Instant updatedAt, Instant parsedAt, Instant parseFailedAt,
             KnowledgeParseFailureCode failureCode) {
 
+        return restore(format, fileName, mediaType, sizeBytes, digest, contentKey, status, createdAt,
+                updatedAt, parsedAt, parseFailedAt, failureCode, null, null, null, null, null);
+    }
+
+    private static KnowledgeDocument restore(DocumentFormat format, String fileName, String mediaType,
+            long sizeBytes, Sha256Digest digest, String contentKey, KnowledgeDocumentStatus status,
+            Instant createdAt, Instant updatedAt, Instant parsedAt, Instant parseFailedAt,
+            KnowledgeParseFailureCode failureCode, Instant indexStartedAt, Instant indexedAt,
+            Instant indexFailedAt, KnowledgeIndexFailureCode indexFailureCode,
+            EmbeddingDescriptor embedding) {
+
         return KnowledgeDocument.restore(ID, TITLE, fileName, format, mediaType, sizeBytes, digest, contentKey,
-                status, createdAt, updatedAt, parsedAt, parseFailedAt, failureCode);
+                status, createdAt, updatedAt, parsedAt, parseFailedAt, failureCode, indexStartedAt, indexedAt,
+                indexFailedAt, indexFailureCode, embedding);
     }
 
     private static void assertRestoreRejected(DocumentFormat format, String fileName, String mediaType,

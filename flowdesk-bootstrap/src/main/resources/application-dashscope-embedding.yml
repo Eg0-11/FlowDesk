@@ -1,0 +1,64 @@
+# DashScope Embedding profile（FD-0010）：用阿里云百炼的 text-embedding-v4 生成切片向量。
+#
+# 使用方式（完整生产组合）：
+#   $env:DASHSCOPE_API_KEY = '<key>'
+#   $env:FLOWDESK_DB_URL = 'jdbc:postgresql://localhost:5432/flowdesk'
+#   $env:FLOWDESK_DB_USERNAME = '<user>'
+#   $env:FLOWDESK_DB_PASSWORD = '<password>'
+#   java -jar flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar \
+#        --spring.profiles.active=postgres,deepseek,dashscope-embedding
+#
+# 三条环境边界（见 ADR 0007）：
+#   1. 默认（H2，不启用 embedding）：可启动，索引接口 503，向量表不存在；
+#   2. 只启用本 profile 但不是 PostgreSQL：<b>启动失败</b>（pgvector 只存在于 PostgreSQL，
+#      静默退回 H2 或内存向量库会让「以为索引成功了」变成假象）；
+#   3. postgres + pgvector + 本 profile：真实索引链路可用。
+#
+# 仓库中不保存任何真实 API Key。
+spring:
+  config:
+    activate:
+      on-profile: dashscope-embedding
+  ai:
+    dashscope:
+      # 总开关：DashScope 各能力的自动配置都挂在这个开关上
+      enabled: true
+      # 连接与超时：有界超时，避免请求无限期挂住（占着请求线程与数据库连接池的等待）
+      api-key: ${DASHSCOPE_API_KEY}
+      read-timeout: 30000
+      # 只需要 embedding：其余能力显式关闭，避免创建出用不到、还需要 Key 的 Bean。
+      # 注意 chat 不设为 none —— 那会覆盖 deepseek profile 的 chat=openai 并使组合 profile 失效；
+      # DashScope chat 通过「spring.ai.model.chat 不等于 dashscope」天然关闭（默认 none / deepseek profile 为 openai）。
+      agent: false
+      embedding:
+        options:
+          model: text-embedding-v4
+          # 维度必须与 vector(1024) 列和领域不变量一致
+          dimensions: 1024
+    model:
+      embedding: dashscope
+      image: none
+      moderation: none
+      video: none
+      rerank: none
+      audio:
+        speech: none
+        transcription: none
+    # 有界重试：Spring AI 默认 max-attempts=10、multiplier=5，累计退避可达数分钟，
+    # 会让上游故障迟迟无法以 502 返回。这里收窄为「最多 3 次尝试、总退避约 1.5 秒」。
+    retry:
+      max-attempts: 3
+      backoff:
+        initial-interval: 500ms
+        multiplier: 2
+        max-interval: 2000ms
+
+flowdesk:
+  knowledge:
+    embedding:
+      # 打开真实向量化：此时启动期校验会要求 PostgreSQL 数据源与可用的 EmbeddingModel
+      enabled: true
+      provider: dashscope
+      model: text-embedding-v4
+      dimensions: 1024
+      batch-size: 10

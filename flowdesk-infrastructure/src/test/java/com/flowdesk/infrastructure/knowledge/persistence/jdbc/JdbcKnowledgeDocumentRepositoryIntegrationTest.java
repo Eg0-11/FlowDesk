@@ -75,10 +75,11 @@ class JdbcKnowledgeDocumentRepositoryIntegrationTest {
     // ---------- ① 迁移 ----------
 
     @Test
-    void flywayAppliesAllFourMigrations() {
+    void flywayAppliesAllFiveGenericMigrations() {
         assertThat(migrateResult.migrationsExecuted)
-                .as("V1 工单表 + V2 搜索索引 + V3 知识文档表 + V4 解析字段与切片表")
-                .isEqualTo(4);
+                .as("V1 工单表 + V2 搜索索引 + V3 知识文档表 + V4 解析字段与切片表 + V5 索引生命周期字段")
+                .as("H2 只执行通用目录 db/migration；V6（pgvector）只在 PostgreSQL 上执行")
+                .isEqualTo(5);
     }
 
     @Test

@@ -160,15 +160,11 @@ public final class JdbcKnowledgeDocumentChunkStore implements KnowledgeDocumentC
         }
 
         // ③ 更新文档状态（CAS：id + version 同时匹配）
-        int affected = this.jdbcClient.sql(KnowledgeDocumentSql.CAS_UPDATE_STATUS)
-                .param(1, parsedDocument.status().name())
-                .param(2, toOffsetDateTime(parsedDocument.updatedAt()))
-                .param(3, toOffsetDateTime(parsedDocument.parsedAt()), Types.TIMESTAMP_WITH_TIMEZONE)
-                .param(4, toOffsetDateTime(parsedDocument.parseFailedAt()), Types.TIMESTAMP_WITH_TIMEZONE)
-                .param(5, parsedDocument.parseFailureCode() == null
-                        ? null : parsedDocument.parseFailureCode().name(), Types.VARCHAR)
-                .param(6, documentId.value())
-                .param(7, expectedVersion)
+        //    生命周期字段统一由 bindLifecycleFields 绑定：解析与索引两个适配器共用同一份绑定逻辑
+        int affected = KnowledgeDocumentSql.bindLifecycleFields(
+                this.jdbcClient.sql(KnowledgeDocumentSql.CAS_UPDATE_STATUS), parsedDocument)
+                .param(13, documentId.value())
+                .param(14, expectedVersion)
                 .update();
         if (affected != 1) {
             throw new KnowledgeApplicationException(

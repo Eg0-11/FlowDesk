@@ -19,7 +19,7 @@ package com.flowdesk.infrastructure.knowledge.parsing;
  *   <li><b>只有输入流的第一个 code point 才可能是 BOM</b>：它是 {@code U+FEFF} 时丢弃且不占配额；
  *       第二个 {@code U+FEFF} 就是普通内容，正常计数；</li>
  *   <li><b>{@link #text()} 是无副作用的观察</b>：它不改变待配对状态，可重复调用，
- *       且不会把「尚未配对的低代理」提前排除在外。</li>
+ *       且不会把「尚未配对的高代理」提前排除在外。</li>
  * </ul>
  *
  * <p>本类非线程安全：每次解析各自创建一个实例。</p>

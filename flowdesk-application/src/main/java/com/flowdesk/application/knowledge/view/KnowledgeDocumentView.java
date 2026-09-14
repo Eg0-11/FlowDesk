@@ -26,6 +26,11 @@ import java.util.UUID;
  * @param version          版本号；新上传为 0
  * @param createdAt        创建时间
  * @param updatedAt        更新时间
+ * @param parsedAt         解析完成时间；未解析完成时为 {@code null}
+ * @param indexedAt        索引完成时间；未索引完成时为 {@code null}
+ * @param embeddingProvider 向量服务提供方；未进入索引流程时为 {@code null}
+ * @param embeddingModel   向量模型标识；未进入索引流程时为 {@code null}
+ * @param embeddingDimensions 向量维度；未进入索引流程时为 {@code null}
  */
 public record KnowledgeDocumentView(UUID id,
                                     String title,
@@ -37,7 +42,12 @@ public record KnowledgeDocumentView(UUID id,
                                     KnowledgeDocumentStatus status,
                                     long version,
                                     Instant createdAt,
-                                    Instant updatedAt) {
+                                    Instant updatedAt,
+                                    Instant parsedAt,
+                                    Instant indexedAt,
+                                    String embeddingProvider,
+                                    String embeddingModel,
+                                    Integer embeddingDimensions) {
 
     /**
      * @param document 文档聚合
@@ -56,6 +66,11 @@ public record KnowledgeDocumentView(UUID id,
                 document.status(),
                 version,
                 document.createdAt(),
-                document.updatedAt());
+                document.updatedAt(),
+                document.parsedAt(),
+                document.indexedAt(),
+                document.embeddingProvider(),
+                document.embeddingModel(),
+                document.embeddingDimensions());
     }
 }

@@ -233,7 +233,8 @@ public final class KnowledgeDocumentParsingService implements ParseKnowledgeDocu
                 document.originalFilename().value(), document.format(), document.mediaType(),
                 document.sizeBytes(), document.sha256(), document.contentKey(),
                 KnowledgeDocumentStatus.PARSING, document.createdAt(), document.updatedAt(),
-                null, null, null);
+                null, null, null,
+                null, null, null, null, null);
     }
 
     private static KnowledgeParseFailureCode failureCodeOf(RuntimeException failure) {

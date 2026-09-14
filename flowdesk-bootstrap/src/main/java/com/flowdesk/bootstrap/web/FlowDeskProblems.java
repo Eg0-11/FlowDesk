@@ -85,6 +85,15 @@ public final class FlowDeskProblems {
     /** 知识文档当前状态不允许解析（已在解析中、或已经解析完成）。 */
     public static final String CODE_KNOWLEDGE_DOCUMENT_NOT_PARSABLE = "KNOWLEDGE_DOCUMENT_NOT_PARSABLE";
 
+    /** 知识文档当前状态不允许索引（尚未解析、已在索引中、或已经索引完成）。 */
+    public static final String CODE_KNOWLEDGE_DOCUMENT_NOT_INDEXABLE = "KNOWLEDGE_DOCUMENT_NOT_INDEXABLE";
+
+    /** 当前环境未启用文档向量化：索引接口不可用，且不会读取或修改任何文档。 */
+    public static final String CODE_KNOWLEDGE_EMBEDDING_DISABLED = "KNOWLEDGE_EMBEDDING_DISABLED";
+
+    /** 上游向量服务失败：超时、限流、5xx、连接失败等。 */
+    public static final String CODE_EMBEDDING_PROVIDER_ERROR = "EMBEDDING_PROVIDER_ERROR";
+
     /** 文档无法解析：内容损坏、加密、与声明格式不符，或提取不到文本。 */
     public static final String CODE_DOCUMENT_PARSE_FAILED = "DOCUMENT_PARSE_FAILED";
 

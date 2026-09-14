@@ -6,9 +6,11 @@ import java.time.Instant;
  * 知识文档聚合根。
  *
  * <p>文档的元数据（标识、格式、摘要、内容键等）在创建后<b>不可变</b>，
- * 唯一会变的是<b>解析状态机</b>相关的字段；而它们只能通过
- * {@link #markParsing(Instant)}、{@link #markParsed(Instant)}、{@link #markParseFailed}
- * 三个领域行为改变。本类没有任何 setter，上层也无法直接拼装状态。</p>
+ * 唯一会变的是<b>解析状态机与索引状态机</b>相关的字段；而它们只能通过
+ * {@link #markParsing(Instant)}、{@link #markParsed(Instant)}、{@link #markParseFailed}、
+ * {@link #markIndexing(EmbeddingDescriptor, Instant)}、{@link #markIndexed(Instant)}、
+ * {@link #markIndexFailed(KnowledgeIndexFailureCode, Instant)} 六个领域行为改变。
+ * 本类没有任何 setter，上层也无法直接拼装状态。</p>
  *
  * <h2>核心不变量</h2>
  * <ul>
@@ -38,10 +40,31 @@ import java.time.Instant;
  * <pre>
  * UPLOADED ──markParsing──▶ PARSING ──markParsed──────▶ PARSED
  * PARSE_FAILED ──markParsing──┘        └──markParseFailed──▶ PARSE_FAILED
+ *
+ * PARSED ──markIndexing──▶ INDEXING ──markIndexed──────────▶ INDEXED
+ * INDEX_FAILED ──markIndexing──┘      └──markIndexFailed────▶ INDEX_FAILED
  * </pre>
- * <p>Controller 与 JDBC 适配器<b>没有</b>直接拼装状态的入口：它们只能调用这三个方法，
- * 非法转换（重复领取、重复解析、对非 PARSING 状态完成）由聚合拒绝。
+ * <p>Controller 与 JDBC 适配器<b>没有</b>直接拼装状态的入口：它们只能调用这六个方法，
+ * 非法转换（重复领取、重复解析、重复索引、对非 PARSING 状态完成）由聚合拒绝。
  * 每次转换都会把 {@code updatedAt} 前移，因此 {@code version} 递增与状态变化一一对应。</p>
+ *
+ * <h2>字段与状态的严格配对</h2>
+ * <p>解析字段与索引字段都必须与状态一致，不允许「状态与字段各说各话」的快照：</p>
+ * <table border="1">
+ *   <caption>生命周期字段矩阵</caption>
+ *   <tr><th>状态</th><th>解析字段</th><th>索引字段</th></tr>
+ *   <tr><td>{@code UPLOADED} / {@code PARSING}</td><td>全部为空</td><td>全部为空</td></tr>
+ *   <tr><td>{@code PARSED}</td><td>{@code parsedAt}</td><td>全部为空</td></tr>
+ *   <tr><td>{@code PARSE_FAILED}</td><td>{@code parseFailedAt} + 失败码</td><td>全部为空</td></tr>
+ *   <tr><td>{@code INDEXING}</td><td>{@code parsedAt}</td>
+ *       <td>{@code indexStartedAt} + provider/model/dimensions</td></tr>
+ *   <tr><td>{@code INDEXED}</td><td>{@code parsedAt}</td>
+ *       <td>索引中字段 + {@code indexedAt}</td></tr>
+ *   <tr><td>{@code INDEX_FAILED}</td><td>{@code parsedAt}</td>
+ *       <td>索引中字段 + {@code indexFailedAt} + 失败码</td></tr>
+ * </table>
+ * <p>时间链同样有约束：{@code createdAt <= parsedAt <= indexStartedAt <= indexedAt/indexFailedAt <= updatedAt}，
+ * 相等时间合法，倒流一律拒绝。</p>
  */
 public final class KnowledgeDocument {
 
@@ -79,6 +102,22 @@ public final class KnowledgeDocument {
 
     private KnowledgeParseFailureCode parseFailureCode;
 
+    private Instant indexStartedAt;
+
+    private Instant indexedAt;
+
+    private Instant indexFailedAt;
+
+    private KnowledgeIndexFailureCode indexFailureCode;
+
+    /**
+     * 生成当前向量所用的模型描述符；只有进入过索引流程的状态才非空。
+     *
+     * <p>provider / model / dimensions 三者是一个整体：要么都存在，要么都不存在，
+     * 因此用一个可空值对象表示，而不是三个各自可空的字段。</p>
+     */
+    private EmbeddingDescriptor embedding;
+
     private KnowledgeDocument(KnowledgeDocumentId id,
                               DocumentTitle title,
                               OriginalFilename originalFilename,
@@ -92,7 +131,12 @@ public final class KnowledgeDocument {
                               Instant updatedAt,
                               Instant parsedAt,
                               Instant parseFailedAt,
-                              KnowledgeParseFailureCode parseFailureCode) {
+                              KnowledgeParseFailureCode parseFailureCode,
+                              Instant indexStartedAt,
+                              Instant indexedAt,
+                              Instant indexFailedAt,
+                              KnowledgeIndexFailureCode indexFailureCode,
+                              EmbeddingDescriptor embedding) {
 
         this.id = requireId(id);
         this.title = requireTitle(title);
@@ -108,8 +152,13 @@ public final class KnowledgeDocument {
         this.parsedAt = parsedAt;
         this.parseFailedAt = parseFailedAt;
         this.parseFailureCode = parseFailureCode;
+        this.indexStartedAt = indexStartedAt;
+        this.indexedAt = indexedAt;
+        this.indexFailedAt = indexFailedAt;
+        this.indexFailureCode = indexFailureCode;
+        this.embedding = embedding;
         requireTimeline();
-        requireParseFieldsConsistent();
+        requireLifecycleFieldsConsistent();
     }
 
     /**
@@ -141,7 +190,8 @@ public final class KnowledgeDocument {
             Instant uploadedAt) {
 
         return new KnowledgeDocument(id, title, originalFilename, format, mediaType, sizeBytes, sha256,
-                contentKey, KnowledgeDocumentStatus.UPLOADED, uploadedAt, uploadedAt, null, null, null);
+                contentKey, KnowledgeDocumentStatus.UPLOADED, uploadedAt, uploadedAt, null, null, null,
+                null, null, null, null, null);
     }
 
     /**
@@ -165,6 +215,14 @@ public final class KnowledgeDocument {
      * @param status           状态
      * @param createdAt        创建时间
      * @param updatedAt        更新时间
+     * @param parsedAt         解析完成时间（仅 {@code PARSED} 及之后的状态非空）
+     * @param parseFailedAt    解析失败时间（仅 {@code PARSE_FAILED} 非空）
+     * @param parseFailureCode 解析失败码（仅 {@code PARSE_FAILED} 非空）
+     * @param indexStartedAt   索引开始时间（索引相关状态非空）
+     * @param indexedAt        索引完成时间（仅 {@code INDEXED} 非空）
+     * @param indexFailedAt    索引失败时间（仅 {@code INDEX_FAILED} 非空）
+     * @param indexFailureCode 索引失败码（仅 {@code INDEX_FAILED} 非空）
+     * @param embedding        向量描述符（索引相关状态非空，其余状态必须为空）
      * @return 恢复出的文档
      * @throws KnowledgeDomainException 快照不自洽
      */
@@ -181,12 +239,18 @@ public final class KnowledgeDocument {
             Instant updatedAt,
             Instant parsedAt,
             Instant parseFailedAt,
-            KnowledgeParseFailureCode parseFailureCode) {
+            KnowledgeParseFailureCode parseFailureCode,
+            Instant indexStartedAt,
+            Instant indexedAt,
+            Instant indexFailedAt,
+            KnowledgeIndexFailureCode indexFailureCode,
+            EmbeddingDescriptor embedding) {
 
         try {
             return new KnowledgeDocument(id, DocumentTitle.of(title), OriginalFilename.of(originalFilename),
                     format, mediaType, sizeBytes, sha256, contentKey, status, createdAt, updatedAt, parsedAt,
-                    parseFailedAt, parseFailureCode);
+                    parseFailedAt, parseFailureCode, indexStartedAt, indexedAt, indexFailedAt,
+                    indexFailureCode, embedding);
         }
         catch (KnowledgeDomainException ex) {
             throw new KnowledgeDomainException(KnowledgeErrorCode.INVALID_RESTORED_STATE,
@@ -213,7 +277,7 @@ public final class KnowledgeDocument {
         this.parseFailedAt = null;
         this.parseFailureCode = null;
         this.updatedAt = time;
-        requireParseFieldsConsistent();
+        requireLifecycleFieldsConsistent();
     }
 
     /**
@@ -230,7 +294,7 @@ public final class KnowledgeDocument {
         this.parseFailedAt = null;
         this.parseFailureCode = null;
         this.updatedAt = time;
-        requireParseFieldsConsistent();
+        requireLifecycleFieldsConsistent();
     }
 
     /**
@@ -255,7 +319,81 @@ public final class KnowledgeDocument {
         this.parseFailureCode = failureCode;
         this.parsedAt = null;
         this.updatedAt = time;
-        requireParseFieldsConsistent();
+        requireLifecycleFieldsConsistent();
+    }
+
+    /**
+     * 领取索引：{@code PARSED} 或 {@code INDEX_FAILED} → {@code INDEXING}。
+     *
+     * <p>只有「已经解析出切片」的文档才能进入索引流程：{@code UPLOADED}/{@code PARSING}/
+     * {@code PARSE_FAILED} 都没有可嵌入的切片，{@code INDEXED} 的向量已经定型
+     * （主动重建索引不在本阶段范围内），{@code INDEXING} 不允许被第二个请求重复领取
+     * —— 否则两批向量会互相覆盖，而两边都可能返回成功。</p>
+     *
+     * <p>领取时写入 provider / model / dimensions 快照：即使将来更换模型，
+     * 也能从库里看出某一批向量究竟由哪个模型生成。</p>
+     *
+     * @param descriptor 本次索引使用的向量模型描述符
+     * @param occurredAt 领取时间
+     * @throws KnowledgeDomainException 状态不允许索引，或时间早于当前更新时间
+     */
+    public void markIndexing(EmbeddingDescriptor descriptor, Instant occurredAt) {
+        requireStatusIn("领取索引", KnowledgeDocumentStatus.PARSED, KnowledgeDocumentStatus.INDEX_FAILED);
+        if (descriptor == null) {
+            throw new KnowledgeDomainException(KnowledgeErrorCode.INVALID_EMBEDDING_DESCRIPTOR,
+                    "向量描述符不能为空");
+        }
+        Instant time = requireTransitionTime(occurredAt);
+        this.status = KnowledgeDocumentStatus.INDEXING;
+        this.indexStartedAt = time;
+        this.embedding = descriptor;
+        // 重新领取索引时清空上一次的失败痕迹：INDEX_FAILED 与 INDEXING 不允许同时携带失败信息
+        this.indexedAt = null;
+        this.indexFailedAt = null;
+        this.indexFailureCode = null;
+        this.updatedAt = time;
+        requireLifecycleFieldsConsistent();
+    }
+
+    /**
+     * 索引完成：{@code INDEXING} → {@code INDEXED}，并记录 {@code indexedAt}。
+     *
+     * @param occurredAt 完成时间
+     * @throws KnowledgeDomainException 非 {@code INDEXING} 状态，或时间不合法
+     */
+    public void markIndexed(Instant occurredAt) {
+        requireStatusIn("完成索引", KnowledgeDocumentStatus.INDEXING);
+        Instant time = requireTransitionTime(occurredAt);
+        this.status = KnowledgeDocumentStatus.INDEXED;
+        this.indexedAt = time;
+        this.indexFailedAt = null;
+        this.indexFailureCode = null;
+        this.updatedAt = time;
+        requireLifecycleFieldsConsistent();
+    }
+
+    /**
+     * 索引失败：{@code INDEXING} → {@code INDEX_FAILED}，并记录稳定失败码。
+     *
+     * <p>只接受枚举错误码：上游 HTTP 响应体、SQL、路径与密钥绝不进入聚合。</p>
+     *
+     * @param failureCode 稳定的失败码
+     * @param occurredAt  失败时间
+     * @throws KnowledgeDomainException 非 {@code INDEXING} 状态、失败码为空或时间不合法
+     */
+    public void markIndexFailed(KnowledgeIndexFailureCode failureCode, Instant occurredAt) {
+        requireStatusIn("标记索引失败", KnowledgeDocumentStatus.INDEXING);
+        if (failureCode == null) {
+            throw new KnowledgeDomainException(KnowledgeErrorCode.INVALID_INDEX_FAILURE_CODE,
+                    "索引失败码不能为空");
+        }
+        Instant time = requireTransitionTime(occurredAt);
+        this.status = KnowledgeDocumentStatus.INDEX_FAILED;
+        this.indexFailedAt = time;
+        this.indexFailureCode = failureCode;
+        this.indexedAt = null;
+        this.updatedAt = time;
+        requireLifecycleFieldsConsistent();
     }
 
     private void requireStatusIn(String operation, KnowledgeDocumentStatus... allowed) {
@@ -393,6 +531,33 @@ public final class KnowledgeDocument {
         requireTimeline(this.createdAt, this.updatedAt);
         requireWithinDocumentWindow(this.parsedAt, "解析完成时间");
         requireWithinDocumentWindow(this.parseFailedAt, "解析失败时间");
+        requireWithinDocumentWindow(this.indexStartedAt, "索引开始时间");
+        requireWithinDocumentWindow(this.indexedAt, "索引完成时间");
+        requireWithinDocumentWindow(this.indexFailedAt, "索引失败时间");
+        // 时间链不得倒流：索引必须发生在解析之后（相等时间合法）
+        requireNotBefore(this.indexStartedAt, this.parsedAt, "索引开始时间", "解析完成时间");
+        requireNotBefore(this.indexedAt, this.indexStartedAt, "索引完成时间", "索引开始时间");
+        requireNotBefore(this.indexFailedAt, this.indexStartedAt, "索引失败时间", "索引开始时间");
+    }
+
+    /**
+     * 要求 {@code value} 不早于 {@code lowerBound}：相等合法，倒流非法。
+     *
+     * @param value      待检查的时间，可为 {@code null}
+     * @param lowerBound 下界，可为 {@code null}
+     * @param fieldName  字段名（错误文案用，不含原始值）
+     * @param lowerName  下界字段名
+     */
+    private static void requireNotBefore(Instant value, Instant lowerBound, String fieldName,
+            String lowerName) {
+
+        if (value == null || lowerBound == null) {
+            return;
+        }
+        if (value.isBefore(lowerBound)) {
+            throw new KnowledgeDomainException(KnowledgeErrorCode.INVALID_TIMELINE,
+                    fieldName + "不能早于" + lowerName);
+        }
     }
 
     private void requireWithinDocumentWindow(Instant value, String fieldName) {
@@ -410,20 +575,40 @@ public final class KnowledgeDocument {
     }
 
     /**
-     * 解析字段必须与状态严格对应，不允许「状态与字段各说各话」的快照。
+     * 解析字段与索引字段必须与状态严格对应，不允许「状态与字段各说各话」的快照。
+     *
+     * <p>两类字段是<b>叠加</b>关系：进入索引流程之后，解析结果（{@code parsedAt}）仍然必须保留，
+     * 因为「已解析」是「已索引」的前提；而解析失败字段绝不能与任何索引状态同时出现。</p>
      */
-    private void requireParseFieldsConsistent() {
+    private void requireLifecycleFieldsConsistent() {
         switch (this.status) {
-            case PARSED -> {
-                if (this.parsedAt == null || this.parseFailedAt != null || this.parseFailureCode != null) {
-                    throw new KnowledgeDomainException(KnowledgeErrorCode.INVALID_RESTORED_STATE,
-                            "PARSED 状态必须且只能带解析完成时间");
-                }
-            }
+            case PARSED -> requireParseOnly("PARSED 状态必须且只能带解析完成时间，且不得携带索引字段");
             case PARSE_FAILED -> {
                 if (this.parseFailedAt == null || this.parseFailureCode == null || this.parsedAt != null) {
                     throw new KnowledgeDomainException(KnowledgeErrorCode.INVALID_RESTORED_STATE,
                             "PARSE_FAILED 状态必须且只能带解析失败时间与失败码");
+                }
+                requireNoIndexFields("PARSE_FAILED 状态不得携带索引字段");
+            }
+            case INDEXING -> {
+                requireParsedForIndexing();
+                if (this.indexedAt != null || this.indexFailedAt != null || this.indexFailureCode != null) {
+                    throw new KnowledgeDomainException(KnowledgeErrorCode.INVALID_RESTORED_STATE,
+                            "INDEXING 状态不得携带索引完成或失败字段");
+                }
+            }
+            case INDEXED -> {
+                requireParsedForIndexing();
+                if (this.indexedAt == null || this.indexFailedAt != null || this.indexFailureCode != null) {
+                    throw new KnowledgeDomainException(KnowledgeErrorCode.INVALID_RESTORED_STATE,
+                            "INDEXED 状态必须且只能带索引完成时间");
+                }
+            }
+            case INDEX_FAILED -> {
+                requireParsedForIndexing();
+                if (this.indexFailedAt == null || this.indexFailureCode == null || this.indexedAt != null) {
+                    throw new KnowledgeDomainException(KnowledgeErrorCode.INVALID_RESTORED_STATE,
+                            "INDEX_FAILED 状态必须且只能带索引失败时间与失败码");
                 }
             }
             default -> {
@@ -431,7 +616,40 @@ public final class KnowledgeDocument {
                     throw new KnowledgeDomainException(KnowledgeErrorCode.INVALID_RESTORED_STATE,
                             this.status + " 状态不应携带解析结果字段");
                 }
+                requireNoIndexFields(this.status + " 状态不应携带索引字段");
             }
+        }
+    }
+
+    /**
+     * {@code PARSED}：只允许解析完成时间，不允许任何失败字段与索引字段。
+     */
+    private void requireParseOnly(String message) {
+        if (this.parsedAt == null || this.parseFailedAt != null || this.parseFailureCode != null) {
+            throw new KnowledgeDomainException(KnowledgeErrorCode.INVALID_RESTORED_STATE, message);
+        }
+        requireNoIndexFields(message);
+    }
+
+    /**
+     * 索引类状态（{@code INDEXING}/{@code INDEXED}/{@code INDEX_FAILED}）的共同前提：
+     * 解析完成时间、索引开始时间与向量描述符都必须存在，且不得携带解析失败字段。
+     */
+    private void requireParsedForIndexing() {
+        if (this.parsedAt == null || this.indexStartedAt == null || this.embedding == null) {
+            throw new KnowledgeDomainException(KnowledgeErrorCode.INVALID_RESTORED_STATE,
+                    this.status + " 状态必须带解析完成时间、索引开始时间与向量描述符");
+        }
+        if (this.parseFailedAt != null || this.parseFailureCode != null) {
+            throw new KnowledgeDomainException(KnowledgeErrorCode.INVALID_RESTORED_STATE,
+                    this.status + " 状态不得携带解析失败字段");
+        }
+    }
+
+    private void requireNoIndexFields(String message) {
+        if (this.indexStartedAt != null || this.indexedAt != null || this.indexFailedAt != null
+                || this.indexFailureCode != null || this.embedding != null) {
+            throw new KnowledgeDomainException(KnowledgeErrorCode.INVALID_RESTORED_STATE, message);
         }
     }
 
@@ -531,6 +749,62 @@ public final class KnowledgeDocument {
      */
     public KnowledgeParseFailureCode parseFailureCode() {
         return this.parseFailureCode;
+    }
+
+    /**
+     * @return 索引开始时间；{@code INDEXING}/{@code INDEXED}/{@code INDEX_FAILED} 非空
+     */
+    public Instant indexStartedAt() {
+        return this.indexStartedAt;
+    }
+
+    /**
+     * @return 索引完成时间；仅 {@code INDEXED} 状态非空
+     */
+    public Instant indexedAt() {
+        return this.indexedAt;
+    }
+
+    /**
+     * @return 索引失败时间；仅 {@code INDEX_FAILED} 状态非空
+     */
+    public Instant indexFailedAt() {
+        return this.indexFailedAt;
+    }
+
+    /**
+     * @return 索引失败码；仅 {@code INDEX_FAILED} 状态非空（稳定枚举，不含上游细节）
+     */
+    public KnowledgeIndexFailureCode indexFailureCode() {
+        return this.indexFailureCode;
+    }
+
+    /**
+     * @return 向量描述符；索引类状态非空，其余状态为 {@code null}
+     */
+    public EmbeddingDescriptor embedding() {
+        return this.embedding;
+    }
+
+    /**
+     * @return 向量服务提供方；未索引时为 {@code null}
+     */
+    public String embeddingProvider() {
+        return this.embedding == null ? null : this.embedding.provider();
+    }
+
+    /**
+     * @return 向量模型标识；未索引时为 {@code null}
+     */
+    public String embeddingModel() {
+        return this.embedding == null ? null : this.embedding.model();
+    }
+
+    /**
+     * @return 向量维度；未索引时为 {@code null}
+     */
+    public Integer embeddingDimensions() {
+        return this.embedding == null ? null : this.embedding.dimensions();
     }
 
     @Override

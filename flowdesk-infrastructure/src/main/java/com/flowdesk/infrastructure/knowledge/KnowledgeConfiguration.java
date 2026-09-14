@@ -3,20 +3,31 @@ package com.flowdesk.infrastructure.knowledge;
 import com.flowdesk.application.knowledge.port.out.DocumentChunker;
 import com.flowdesk.application.knowledge.port.out.DocumentTextParser;
 import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentChunkStore;
+import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentContentReader;
 import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentContentStore;
+import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentEmbeddingStore;
 import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentIdGenerator;
 import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentRepository;
+import com.flowdesk.application.knowledge.port.out.KnowledgeEmbeddingPort;
 import com.flowdesk.application.knowledge.port.out.KnowledgeTimeProvider;
 import com.flowdesk.infrastructure.knowledge.chunking.DeterministicDocumentChunker;
 import com.flowdesk.infrastructure.knowledge.chunking.KnowledgeChunkingProperties;
+import com.flowdesk.infrastructure.knowledge.embedding.DashScopeKnowledgeEmbeddingAdapter;
+import com.flowdesk.infrastructure.knowledge.embedding.DisabledKnowledgeEmbedding;
+import com.flowdesk.infrastructure.knowledge.embedding.KnowledgeEmbeddingConfigurationValidator;
+import com.flowdesk.infrastructure.knowledge.embedding.KnowledgeEmbeddingProperties;
 import com.flowdesk.infrastructure.knowledge.parsing.TikaDocumentTextParser;
 import com.flowdesk.infrastructure.knowledge.persistence.jdbc.JdbcKnowledgeDocumentChunkStore;
+import com.flowdesk.infrastructure.knowledge.persistence.jdbc.JdbcKnowledgeDocumentEmbeddingStore;
 import com.flowdesk.infrastructure.knowledge.persistence.jdbc.JdbcKnowledgeDocumentRepository;
 import com.flowdesk.infrastructure.knowledge.storage.LocalFileSystemKnowledgeContentStore;
 import com.flowdesk.infrastructure.knowledge.support.SystemKnowledgeTimeProvider;
 import com.flowdesk.infrastructure.knowledge.support.UuidKnowledgeDocumentIdGenerator;
 import java.time.Clock;
+import org.springframework.ai.embedding.EmbeddingModel;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.autoconfigure.jdbc.DataSourceProperties;
 import org.springframework.boot.autoconfigure.web.servlet.MultipartProperties;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -29,11 +40,13 @@ import org.springframework.transaction.support.TransactionTemplate;
 /**
  * 知识文档基础设施装配。
  *
- * <p>把应用层定义的四个输出端口落实为具体实现：</p>
+ * <p>把应用层定义的输出端口落实为具体实现：</p>
  * <ul>
  *   <li>{@link KnowledgeDocumentRepository} → {@link JdbcKnowledgeDocumentRepository}（Spring JDBC）；</li>
- *   <li>{@link KnowledgeDocumentContentStore} → {@link LocalFileSystemKnowledgeContentStore}
- *       （本地文件系统；将来可整体替换为对象存储适配器）；</li>
+ *   <li>{@link KnowledgeDocumentContentStore} / {@link KnowledgeDocumentContentReader}
+ *       → {@link LocalFileSystemKnowledgeContentStore}（本地文件系统；将来可整体替换为对象存储适配器）；</li>
+ *   <li>{@link KnowledgeEmbeddingPort} → DashScope 适配器（启用时）或「拒绝一切」的占位实现（关闭时）；</li>
+ *   <li>{@link KnowledgeDocumentEmbeddingStore} → pgvector JDBC 适配器（启用时）或占位实现（关闭时）；</li>
  *   <li>{@link KnowledgeDocumentIdGenerator} → {@link UuidKnowledgeDocumentIdGenerator}；</li>
  *   <li>{@link KnowledgeTimeProvider} → {@link SystemKnowledgeTimeProvider}。</li>
  * </ul>
@@ -44,8 +57,27 @@ import org.springframework.transaction.support.TransactionTemplate;
  */
 @Configuration(proxyBeanMethods = false)
 @EnableConfigurationProperties({ KnowledgeUploadProperties.class, KnowledgeStorageProperties.class,
-        KnowledgeChunkingProperties.class })
+        KnowledgeChunkingProperties.class, KnowledgeEmbeddingProperties.class })
 public class KnowledgeConfiguration {
+
+    /**
+     * 启动期校验向量化配置与环境是否匹配（FD-0010）。
+     *
+     * <p>已启用向量化但没有 PostgreSQL、或没有 EmbeddingModel，都让应用<b>启动失败</b>：
+     * 静默退回 H2 或内存向量库会让「以为索引成功了」变成假象。</p>
+     *
+     * @param embedding      向量化配置
+     * @param dataSource     数据源配置
+     * @param embeddingModel EmbeddingModel 提供者（可能不存在）
+     * @return 校验通过标记
+     */
+    @Bean
+    public Boolean knowledgeEmbeddingConsistency(KnowledgeEmbeddingProperties embedding,
+            DataSourceProperties dataSource, ObjectProvider<EmbeddingModel> embeddingModel) {
+
+        return KnowledgeEmbeddingConfigurationValidator.validate(embedding, dataSource, embeddingModel);
+    }
+
 
     /**
      * 启动期校验两个上传上限不会冲突。
@@ -100,6 +132,53 @@ public class KnowledgeConfiguration {
             JdbcKnowledgeDocumentRepository documentRepository) {
 
         return new JdbcKnowledgeDocumentChunkStore(jdbcClient, knowledgeWriteTransactions, documentRepository);
+    }
+
+    /**
+     * 向量生成端口（FD-0010）。
+     *
+     * <p>启用时使用 DashScope 适配器；关闭时使用「拒绝一切」的占位实现 ——
+     * 两种情况下 Bean 都存在，因此用例服务与 HTTP 契约都不需要知道开关状态。</p>
+     *
+     * @param embedding      向量化配置
+     * @param embeddingModel EmbeddingModel 提供者（关闭时通常为空）
+     * @return 向量生成端口
+     */
+    @Bean
+    public KnowledgeEmbeddingPort knowledgeEmbeddingPort(KnowledgeEmbeddingProperties embedding,
+            ObjectProvider<EmbeddingModel> embeddingModel) {
+
+        if (!embedding.isEnabled()) {
+            return new DisabledKnowledgeEmbedding.Port();
+        }
+        EmbeddingModel model = embeddingModel.getIfAvailable();
+        if (model == null) {
+            // 与启动期校验重复一次：这里的失败信息更贴近「Bean 为什么装配不出来」
+            throw new IllegalStateException("已启用文档向量化，但没有可用的 EmbeddingModel："
+                    + "请同时启用 dashscope-embedding profile 并配置 DASHSCOPE_API_KEY");
+        }
+        return new DashScopeKnowledgeEmbeddingAdapter(model);
+    }
+
+    /**
+     * 向量写入端口（FD-0010）：PostgreSQL + pgvector 的原子完成实现。
+     *
+     * @param jdbcClient             JDBC 客户端
+     * @param knowledgeWriteTransactions 写事务模板
+     * @param documentRepository     文档仓储（同一事务内复用）
+     * @param embedding              向量化配置（关闭时返回占位实现）
+     * @return 向量写入端口
+     */
+    @Bean
+    public KnowledgeDocumentEmbeddingStore knowledgeDocumentEmbeddingStore(JdbcClient jdbcClient,
+            @Qualifier("knowledgeWriteTransactions") TransactionOperations knowledgeWriteTransactions,
+            JdbcKnowledgeDocumentRepository documentRepository, KnowledgeEmbeddingProperties embedding) {
+
+        if (!embedding.isEnabled()) {
+            return new DisabledKnowledgeEmbedding.Store();
+        }
+        return new JdbcKnowledgeDocumentEmbeddingStore(jdbcClient, knowledgeWriteTransactions,
+                documentRepository);
     }
 
     /**

@@ -18,11 +18,23 @@ public enum KnowledgeApplicationErrorCode {
     /** 解析命令本身不合法：命令为 {@code null}、标识缺失或期望版本为负。 */
     INVALID_PARSE_COMMAND,
 
+    /** 索引命令本身不合法：命令为 {@code null}、标识缺失或期望版本为负。 */
+    INVALID_INDEX_COMMAND,
+
     /** 调用方持有的版本已过期（CAS 失败或领取前版本比对不通过）。 */
     KNOWLEDGE_DOCUMENT_VERSION_CONFLICT,
 
     /** 当前状态不允许解析（重复领取、已解析完成等）。 */
     KNOWLEDGE_DOCUMENT_NOT_PARSABLE,
+
+    /** 当前状态不允许索引（未解析、已在索引中、已索引完成等）。 */
+    KNOWLEDGE_DOCUMENT_NOT_INDEXABLE,
+
+    /** 当前环境未启用文档向量化（默认 profile 就是这种状态）。 */
+    KNOWLEDGE_EMBEDDING_DISABLED,
+
+    /** 上游向量服务失败：超时、限流、5xx、连接失败等。 */
+    EMBEDDING_PROVIDER_ERROR,
 
     /** 原始内容不可读：对象缺失、不可读或内容键非法（绝不暴露真实路径）。 */
     DOCUMENT_CONTENT_UNREADABLE,

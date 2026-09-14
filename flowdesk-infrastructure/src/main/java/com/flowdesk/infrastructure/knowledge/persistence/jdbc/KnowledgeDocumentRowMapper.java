@@ -4,10 +4,12 @@ import com.flowdesk.application.knowledge.KnowledgeApplicationErrorCode;
 import com.flowdesk.application.knowledge.KnowledgeApplicationException;
 import com.flowdesk.application.knowledge.port.out.VersionedKnowledgeDocument;
 import com.flowdesk.domain.knowledge.DocumentFormat;
+import com.flowdesk.domain.knowledge.EmbeddingDescriptor;
 import com.flowdesk.domain.knowledge.KnowledgeDocument;
 import com.flowdesk.domain.knowledge.KnowledgeDocumentId;
 import com.flowdesk.domain.knowledge.KnowledgeDocumentStatus;
 import com.flowdesk.domain.knowledge.KnowledgeDomainException;
+import com.flowdesk.domain.knowledge.KnowledgeIndexFailureCode;
 import com.flowdesk.domain.knowledge.KnowledgeParseFailureCode;
 import com.flowdesk.domain.knowledge.Sha256Digest;
 import java.sql.ResultSet;
@@ -60,12 +62,21 @@ final class KnowledgeDocumentRowMapper {
         Instant parsedAt = toInstant(resultSet.getObject("parsed_at", OffsetDateTime.class));
         Instant parseFailedAt = toInstant(resultSet.getObject("parse_failed_at", OffsetDateTime.class));
         KnowledgeParseFailureCode parseFailureCode = parseFailureCode(resultSet.getString("parse_failure_code"));
+        Instant indexStartedAt = toInstant(resultSet.getObject("index_started_at", OffsetDateTime.class));
+        Instant indexedAt = toInstant(resultSet.getObject("indexed_at", OffsetDateTime.class));
+        Instant indexFailedAt = toInstant(resultSet.getObject("index_failed_at", OffsetDateTime.class));
+        KnowledgeIndexFailureCode indexFailureCode = parseIndexFailureCode(
+                resultSet.getString("index_failure_code"));
+        EmbeddingDescriptor embedding = embeddingDescriptor(resultSet.getString("embedding_provider"),
+                resultSet.getString("embedding_model"),
+                resultSet.getObject("embedding_dimensions", Integer.class));
         long version = resultSet.getLong("version");
 
         try {
             KnowledgeDocument document = KnowledgeDocument.restore(KnowledgeDocumentId.of(id), title,
                     originalFilename, format, mediaType, sizeBytes, sha256, contentKey, status, createdAt,
-                    updatedAt, parsedAt, parseFailedAt, parseFailureCode);
+                    updatedAt, parsedAt, parseFailedAt, parseFailureCode, indexStartedAt, indexedAt,
+                    indexFailedAt, indexFailureCode, embedding);
             return new VersionedKnowledgeDocument(document, version);
         }
         catch (KnowledgeDomainException ex) {
@@ -125,6 +136,54 @@ final class KnowledgeDocumentRowMapper {
         catch (KnowledgeDomainException ex) {
             throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.INVALID_PERSISTED_DOCUMENT,
                     "持久化的知识文档摘要不合法", ex);
+        }
+    }
+
+    /**
+     * 索引失败码：{@code null} 是合法值（非失败状态），非空时必须是已知枚举常量。
+     *
+     * @param value 数据库列值
+     * @return 失败码或 {@code null}
+     */
+    private static KnowledgeIndexFailureCode parseIndexFailureCode(String value) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            return KnowledgeIndexFailureCode.valueOf(value);
+        }
+        catch (IllegalArgumentException ex) {
+            throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.INVALID_PERSISTED_DOCUMENT,
+                    "持久化的索引失败码不受支持", ex);
+        }
+    }
+
+    /**
+     * 向量描述符：三列要么全空、要么全非空。
+     *
+     * <p>「部分为空」说明行被外部改坏或来自更旧的版本，属于内部错误；
+     * 维度不是本项目固定值时，领域值对象会拒绝，这里统一映射为
+     * {@code INVALID_PERSISTED_DOCUMENT}。</p>
+     *
+     * @param provider   提供方列
+     * @param model      模型列
+     * @param dimensions 维度列
+     * @return 描述符或 {@code null}
+     */
+    private static EmbeddingDescriptor embeddingDescriptor(String provider, String model, Integer dimensions) {
+        if (provider == null && model == null && dimensions == null) {
+            return null;
+        }
+        if (provider == null || model == null || dimensions == null) {
+            throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.INVALID_PERSISTED_DOCUMENT,
+                    "持久化的向量描述符不完整");
+        }
+        try {
+            return new EmbeddingDescriptor(provider, model, dimensions);
+        }
+        catch (KnowledgeDomainException ex) {
+            throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.INVALID_PERSISTED_DOCUMENT,
+                    "持久化的向量描述符不合法", ex);
         }
     }
 

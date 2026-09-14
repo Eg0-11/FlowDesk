@@ -56,8 +56,10 @@ final class KnowledgePersistenceTestSupport {
         JdbcKnowledgeDocumentRepository repository = new JdbcKnowledgeDocumentRepository(jdbcClient, transactions);
         JdbcKnowledgeDocumentChunkStore chunkStore = new JdbcKnowledgeDocumentChunkStore(jdbcClient, transactions,
                 repository);
+        JdbcKnowledgeDocumentEmbeddingStore embeddingStore = new JdbcKnowledgeDocumentEmbeddingStore(jdbcClient,
+                transactions, repository);
 
-        return new Fixture(jdbcClient, transactions, repository, chunkStore, intercepting);
+        return new Fixture(jdbcClient, transactions, repository, chunkStore, embeddingStore, intercepting);
     }
 
     /**
@@ -137,10 +139,12 @@ final class KnowledgePersistenceTestSupport {
      * @param transactions 事务模板
      * @param repository   元数据仓储
      * @param chunkStore   切片存储
+     * @param embeddingStore 切片向量存储（FD-0010）
      * @param statements   语句拦截层（用于断言「零写入」与定点制造写入失败）
      */
     record Fixture(JdbcClient jdbcClient, TransactionTemplate transactions,
             JdbcKnowledgeDocumentRepository repository, JdbcKnowledgeDocumentChunkStore chunkStore,
+            JdbcKnowledgeDocumentEmbeddingStore embeddingStore,
             StatementInterceptingDataSource statements) {
 
         /** @return 自上次复位以来下发的语句数 */
@@ -161,5 +165,26 @@ final class KnowledgePersistenceTestSupport {
         void failOnStatement(int statementNumber) {
             this.statements.failOnStatement(statementNumber);
         }
+    }
+
+    /**
+     * 构造一段切片：内容为 {@code chunk-<index>}，摘要随内容确定。
+     *
+     * @param documentId 文档标识
+     * @param count      切片数量
+     * @return 切片列表（序号从 0 连续递增）
+     */
+    static java.util.List<com.flowdesk.domain.knowledge.KnowledgeDocumentChunk> chunksOf(
+            KnowledgeDocumentId documentId, int count) {
+
+        java.util.List<com.flowdesk.domain.knowledge.KnowledgeDocumentChunk> chunks =
+                new java.util.ArrayList<>(count);
+        for (int index = 0; index < count; index++) {
+            String content = "chunk-" + index;
+            chunks.add(new com.flowdesk.domain.knowledge.KnowledgeDocumentChunk(documentId, index, content,
+                    content.codePointCount(0, content.length()), Sha256Digest.of(sha256Of(content)),
+                    Instant.parse("2026-05-01T10:00:04Z")));
+        }
+        return java.util.List.copyOf(chunks);
     }
 }

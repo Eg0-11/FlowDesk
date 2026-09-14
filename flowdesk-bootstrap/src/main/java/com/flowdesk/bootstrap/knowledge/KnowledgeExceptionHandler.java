@@ -2,11 +2,13 @@ package com.flowdesk.bootstrap.knowledge;
 
 import com.flowdesk.application.knowledge.KnowledgeApplicationErrorCode;
 import com.flowdesk.application.knowledge.KnowledgeApplicationException;
+import com.flowdesk.application.knowledge.index.DocumentIndexingException;
 import com.flowdesk.application.knowledge.parse.DocumentChunkingException;
 import com.flowdesk.application.knowledge.parse.DocumentParsingException;
 import com.flowdesk.bootstrap.web.FlowDeskProblems;
 import com.flowdesk.domain.knowledge.KnowledgeDomainException;
 import com.flowdesk.domain.knowledge.KnowledgeErrorCode;
+import com.flowdesk.domain.knowledge.KnowledgeIndexFailureCode;
 import com.flowdesk.domain.knowledge.KnowledgeParseFailureCode;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.core.annotation.Order;
@@ -63,7 +65,8 @@ public class KnowledgeExceptionHandler {
             HttpServletRequest request) {
 
         return switch (ex.errorCode()) {
-            case INVALID_UPLOAD_COMMAND, INVALID_QUERY, INVALID_PARSE_COMMAND, EMPTY_DOCUMENT_CONTENT -> problem(
+            case INVALID_UPLOAD_COMMAND, INVALID_QUERY, INVALID_PARSE_COMMAND, INVALID_INDEX_COMMAND,
+                    EMPTY_DOCUMENT_CONTENT -> problem(
                     HttpStatus.BAD_REQUEST, FlowDeskProblems.CODE_INVALID_REQUEST, "请求不合法",
                     fixedDetail(ex.errorCode()), request);
             case DOCUMENT_TOO_LARGE -> problem(HttpStatus.PAYLOAD_TOO_LARGE,
@@ -81,6 +84,15 @@ public class KnowledgeExceptionHandler {
             case KNOWLEDGE_DOCUMENT_NOT_PARSABLE -> problem(HttpStatus.CONFLICT,
                     FlowDeskProblems.CODE_KNOWLEDGE_DOCUMENT_NOT_PARSABLE, "状态不允许解析",
                     "当前状态不允许解析该文档", request);
+            case KNOWLEDGE_DOCUMENT_NOT_INDEXABLE -> problem(HttpStatus.CONFLICT,
+                    FlowDeskProblems.CODE_KNOWLEDGE_DOCUMENT_NOT_INDEXABLE, "状态不允许索引",
+                    "当前状态不允许索引该文档", request);
+            case KNOWLEDGE_EMBEDDING_DISABLED -> problem(HttpStatus.SERVICE_UNAVAILABLE,
+                    FlowDeskProblems.CODE_KNOWLEDGE_EMBEDDING_DISABLED, "向量化未启用",
+                    "当前环境未启用文档向量化", request);
+            case EMBEDDING_PROVIDER_ERROR -> problem(HttpStatus.BAD_GATEWAY,
+                    FlowDeskProblems.CODE_EMBEDDING_PROVIDER_ERROR, "向量服务不可用",
+                    "向量服务暂时不可用，请稍后重试", request);
             case KNOWLEDGE_DOCUMENT_ALREADY_EXISTS, INVALID_PERSISTED_DOCUMENT, CONTENT_STORAGE_FAILURE,
                     METADATA_STORAGE_FAILURE, DOCUMENT_CONTENT_UNREADABLE, KNOWLEDGE_INTERNAL_ERROR -> problem(
                     HttpStatus.INTERNAL_SERVER_ERROR, FlowDeskProblems.CODE_INTERNAL_SERVER_ERROR, "服务端错误",
@@ -113,6 +125,38 @@ public class KnowledgeExceptionHandler {
             HttpServletRequest request) {
 
         return parseFailure(ex.failureCode(), request);
+    }
+
+    /**
+     * 索引失败：按<b>稳定失败码</b>映射，并把失败码本身作为扩展字段返回。
+     *
+     * <p>区分依据是「调用方能否通过重试或换配置解决」：</p>
+     * <ul>
+     *   <li>上游向量服务失败（超时、限流、5xx）—— 可重试，502；</li>
+     *   <li>模型响应不合法、向量写入失败、切片数据不自洽 —— 服务端或数据问题，500；
+     *       绝不把上游响应体、SQL 或异常文本暴露出去。</li>
+     * </ul>
+     */
+    @ExceptionHandler(DocumentIndexingException.class)
+    public ResponseEntity<ProblemDetail> handleIndexingException(DocumentIndexingException ex,
+            HttpServletRequest request) {
+
+        return switch (ex.failureCode()) {
+            case EMBEDDING_PROVIDER_FAILURE -> indexingProblem(HttpStatus.BAD_GATEWAY,
+                    FlowDeskProblems.CODE_EMBEDDING_PROVIDER_ERROR, "向量服务不可用",
+                    "向量服务暂时不可用，请稍后重试", ex.failureCode(), request);
+            case INVALID_EMBEDDING_RESPONSE, VECTOR_STORAGE_FAILURE, CHUNK_DATA_INVALID -> indexingProblem(
+                    HttpStatus.INTERNAL_SERVER_ERROR, FlowDeskProblems.CODE_INTERNAL_SERVER_ERROR, "服务端错误",
+                    "服务暂时不可用，请稍后重试", ex.failureCode(), request);
+        };
+    }
+
+    private static ResponseEntity<ProblemDetail> indexingProblem(HttpStatus status, String code, String title,
+            String detail, KnowledgeIndexFailureCode failureCode, HttpServletRequest request) {
+
+        ProblemDetail problem = FlowDeskProblems.of(status, code, title, detail, request.getRequestURI());
+        problem.setProperty("failureCode", failureCode.name());
+        return ResponseEntity.status(status).contentType(MediaType.APPLICATION_PROBLEM_JSON).body(problem);
     }
 
     /**
@@ -208,6 +252,7 @@ public class KnowledgeExceptionHandler {
         return switch (code) {
             case INVALID_UPLOAD_COMMAND, INVALID_QUERY -> "上传请求不合法";
             case INVALID_PARSE_COMMAND -> "解析请求不合法";
+            case INVALID_INDEX_COMMAND -> "索引请求不合法";
             case EMPTY_DOCUMENT_CONTENT -> "上传内容不能为空";
             default -> "请求不合法";
         };
@@ -222,7 +267,8 @@ public class KnowledgeExceptionHandler {
             case INVALID_DIGEST -> "内容摘要不合法";
             case INVALID_MEDIA_TYPE -> "媒体类型不合法";
             case INVALID_CONTENT_KEY, INVALID_STATUS, INVALID_FORMAT, INVALID_TIMELINE, INVALID_CHUNK,
-                    ILLEGAL_STATUS_TRANSITION, INVALID_PARSE_FAILURE_CODE -> "上传请求不合法";
+                    ILLEGAL_STATUS_TRANSITION, INVALID_PARSE_FAILURE_CODE, INVALID_INDEX_FAILURE_CODE,
+                    INVALID_EMBEDDING_DESCRIPTOR, INVALID_VECTOR -> "上传请求不合法";
             case INVALID_RESTORED_STATE -> "服务暂时不可用，请稍后重试";
         };
     }

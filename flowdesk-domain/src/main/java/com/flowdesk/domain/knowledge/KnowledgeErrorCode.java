@@ -44,6 +44,15 @@ public enum KnowledgeErrorCode {
     /** 解析失败码缺失或不该出现时出现了。 */
     INVALID_PARSE_FAILURE_CODE,
 
+    /** 索引失败码缺失或不该出现时出现了。 */
+    INVALID_INDEX_FAILURE_CODE,
+
+    /** 向量描述符不合法（provider/model 非法，或维度不是本项目固定值）。 */
+    INVALID_EMBEDDING_DESCRIPTOR,
+
+    /** 向量数值不满足不变量（维度不符、含非有限值或全零）。 */
+    INVALID_VECTOR,
+
     /** 切片不满足自身不变量（序号、内容、计数或摘要）。 */
     INVALID_CHUNK,
 

@@ -1,11 +1,14 @@
 package com.flowdesk.bootstrap.knowledge;
 
+import com.flowdesk.application.knowledge.command.IndexKnowledgeDocumentCommand;
 import com.flowdesk.application.knowledge.command.ParseKnowledgeDocumentCommand;
 import com.flowdesk.application.knowledge.command.UploadKnowledgeDocumentCommand;
+import com.flowdesk.application.knowledge.port.in.IndexKnowledgeDocumentUseCase;
 import com.flowdesk.application.knowledge.port.in.KnowledgeDocumentQueryUseCase;
 import com.flowdesk.application.knowledge.port.in.ParseKnowledgeDocumentUseCase;
 import com.flowdesk.application.knowledge.port.in.UploadKnowledgeDocumentUseCase;
 import com.flowdesk.application.knowledge.query.GetKnowledgeDocumentQuery;
+import com.flowdesk.application.knowledge.view.IndexedDocumentView;
 import com.flowdesk.application.knowledge.view.KnowledgeDocumentView;
 import com.flowdesk.application.knowledge.view.ParsedDocumentView;
 import com.flowdesk.bootstrap.web.EntityTag;
@@ -49,18 +52,23 @@ public class KnowledgeDocumentController {
 
     private final ParseKnowledgeDocumentUseCase parseUseCase;
 
+    private final IndexKnowledgeDocumentUseCase indexUseCase;
+
     /**
      * @param uploadUseCase 上传用例输入端口
      * @param queryUseCase  查询用例输入端口
      * @param parseUseCase  解析用例输入端口
+     * @param indexUseCase  索引用例输入端口
      */
     public KnowledgeDocumentController(UploadKnowledgeDocumentUseCase uploadUseCase,
             KnowledgeDocumentQueryUseCase queryUseCase,
-            ParseKnowledgeDocumentUseCase parseUseCase) {
+            ParseKnowledgeDocumentUseCase parseUseCase,
+            IndexKnowledgeDocumentUseCase indexUseCase) {
 
         this.uploadUseCase = uploadUseCase;
         this.queryUseCase = queryUseCase;
         this.parseUseCase = parseUseCase;
+        this.indexUseCase = indexUseCase;
     }
 
     /**
@@ -136,6 +144,40 @@ public class KnowledgeDocumentController {
         return ResponseEntity.ok()
                 .eTag(EntityTag.format(view.version()))
                 .body(ParsedDocumentResponse.from(view));
+    }
+
+    /**
+     * 索引知识文档：分批生成切片向量 → 校验 → 原子写入 pgvector → 状态推进为 {@code INDEXED}。
+     *
+     * <p><b>没有请求体</b>：与解析接口一致，目标文档与期望版本分别在路径与 {@code If-Match} 头里。
+     * 调用方无法指定模型、维度、批次大小或切片内容 —— 这些都由服务端配置与数据库决定。</p>
+     *
+     * <p><b>{@code If-Match} 必填</b>：索引是状态变更（{@code PARSED}/{@code INDEX_FAILED}
+     * → {@code INDEXING} → {@code INDEXED}），因此必须携带版本前置条件。缺失 → 428，
+     * 格式非法 → 400，版本过期 → 412，当前状态不允许索引 → 409。</p>
+     *
+     * <p>索引是<b>同步</b>完成的：请求返回时向量已经落库。响应体不含切片正文与向量数组，
+     * 只有新版本号、状态、向量数量与所用模型。</p>
+     *
+     * <p>默认 profile 未启用向量化：此时接口返回 <b>503 {@code KNOWLEDGE_EMBEDDING_DISABLED}</b>，
+     * 并且<b>不会读取或修改任何文档</b>。</p>
+     *
+     * @param documentId 文档标识
+     * @param ifMatch    {@code If-Match} 头，形如 {@code "2"}
+     * @return 200 OK，带 {@code ETag}
+     */
+    @PostMapping("/{documentId}/index")
+    public ResponseEntity<IndexedDocumentResponse> index(
+            @PathVariable String documentId,
+            @RequestHeader(name = HttpHeaders.IF_MATCH, required = false) String ifMatch) {
+
+        long expectedVersion = EntityTag.requireVersion(ifMatch);
+        IndexedDocumentView view = this.indexUseCase.index(
+                new IndexKnowledgeDocumentCommand(parseDocumentId(documentId), expectedVersion));
+
+        return ResponseEntity.ok()
+                .eTag(EntityTag.format(view.version()))
+                .body(IndexedDocumentResponse.from(view));
     }
 
     /**

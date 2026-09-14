@@ -30,6 +30,21 @@
       <artifactId>spring-ai-starter-model-openai</artifactId>
     </dependency>
 
+    <!--
+      文档切片 Embedding（FD-0010）：DashScope（阿里云百炼）text-embedding-v4。
+
+      决策与理由见 docs/adr/0007-dashscope-embedding-pgvector-storage.md：
+      DeepSeek 只负责 Chat/Agent，Embedding 由 DashScope 提供；两者各自使用自己的 starter，
+      互不替换。版本由 spring-ai-alibaba-bom 管理，此处不写版本。
+
+      该 starter 只在 dashscope-embedding profile 下真正生效：默认配置里
+      spring.ai.model.embedding=none，不会创建 EmbeddingModel，也不会发生任何网络请求。
+    -->
+    <dependency>
+      <groupId>com.alibaba.cloud.ai</groupId>
+      <artifactId>spring-ai-alibaba-starter-dashscope</artifactId>
+    </dependency>
+
     <!-- 工单持久化：显式 SQL + JdbcClient，不使用 JPA。决策理由见 docs/adr/0002。 -->
     <dependency>
       <groupId>org.springframework.boot</groupId>
@@ -59,6 +74,26 @@
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+
+    <!--
+      PostgreSQL + pgvector 集成测试（FD-0010）。
+
+      vector(1024) 列与 HNSW 索引只在真实 PostgreSQL 上存在，因此这部分验证必须跑真库。
+      镜像固定为 pgvector 官方镜像的具体版本（不使用 latest）；没有 Docker 时
+      @Testcontainers(disabledWithoutDocker = true) 会让该测试跳过，
+      交付报告如实标注 POSTGRESQL_PGVECTOR_IT=NOT_RUN。
+      版本由 spring-boot-starter-parent 的 BOM 管理，子模块不写版本。
+    -->
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>postgresql</artifactId>
       <scope>test</scope>
     </dependency>
 

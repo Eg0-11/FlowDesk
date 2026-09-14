@@ -25,6 +25,13 @@ final class KnowledgeTestSupport {
 
     static final Instant UPLOADED_AT = Instant.parse("2026-05-01T10:00:00Z");
 
+    /**
+     * @return 一个随机的合法文档标识（用于「切片归属错误」这类反例）
+     */
+    static KnowledgeDocumentId randomDocumentId() {
+        return KnowledgeDocumentId.of(UUID.randomUUID());
+    }
+
     /** 一份合法的 UTF-8 文本内容。 */
     static final byte[] TEXT_CONTENT = "知识库文档内容\n".getBytes(StandardCharsets.UTF_8);
 

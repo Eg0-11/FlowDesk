@@ -18,7 +18,7 @@
   <packaging>pom</packaging>
 
   <name>flowdesk</name>
-  <description>FlowDesk 企业智能工单与知识运营平台（当前阶段：已完成知识文档安全上传链路，RAG 1/6）</description>
+  <description>FlowDesk 企业智能工单与知识运营平台（当前阶段：已完成知识切片 Embedding 与 PostgreSQL pgvector 原子存储，RAG 3/6）</description>
 
   <modules>
     <module>flowdesk-shared</module>

@@ -35,15 +35,20 @@ import org.springframework.transaction.support.TransactionOperations;
  *   <li>在同一事务内重新读取并返回独立聚合。</li>
  * </ol>
  *
- * <h3>允许通过本方法落库的单步转换（FD-0009-R1 收紧）</h3>
+ * <h3>允许通过本方法落库的单步转换（FD-0009-R1 收紧，FD-0010 扩展到索引生命周期）</h3>
  * <table border="1">
  *   <caption>通用 update 的状态矩阵</caption>
  *   <tr><th>锁定后读到的状态</th><th>允许写入的目标状态</th></tr>
  *   <tr><td>{@code UPLOADED}</td><td>{@code PARSING}（领取解析）</td></tr>
  *   <tr><td>{@code PARSE_FAILED}</td><td>{@code PARSING}（修复后重试）</td></tr>
  *   <tr><td>{@code PARSING}</td><td>{@code PARSE_FAILED}（失败补偿）</td></tr>
- *   <tr><td>{@code PARSED}</td><td><b>无</b> —— 只能由
+ *   <tr><td>{@code PARSED}</td><td>{@code INDEXING}（领取索引）</td></tr>
+ *   <tr><td>{@code INDEX_FAILED}</td><td>{@code INDEXING}（修复后重试）</td></tr>
+ *   <tr><td>{@code INDEXING}</td><td>{@code INDEX_FAILED}（失败补偿）</td></tr>
+ *   <tr><td>{@code PARSED}（作为目标）</td><td><b>无</b> —— 只能由
  *       {@code KnowledgeDocumentChunkStore.completeParsing} 的原子端口落库</td></tr>
+ *   <tr><td>{@code INDEXED}（作为目标）</td><td><b>无</b> —— 只能由
+ *       {@code KnowledgeDocumentEmbeddingStore.completeIndexing} 的原子端口落库</td></tr>
  * </table>
  * <p>把转换矩阵放在<b>适配器</b>里，是为了让「跳过中间状态」「把两次版本递增合并成一次」
  * 这类绕过状态机的写入在数据库边界上就不可能发生 —— 即使将来有别的调用方拿到这个端口。</p>
@@ -151,21 +156,15 @@ public final class JdbcKnowledgeDocumentRepository implements KnowledgeDocumentR
                     KnowledgeApplicationErrorCode.KNOWLEDGE_DOCUMENT_VERSION_CONFLICT,
                     "文档版本不匹配");
         }
-        if (!isAllowedTransition(current.status(), document.status())) {            // 版本相同但转换非法：用现有的稳定状态错误拒绝，不新增公开错误契约、不产生任何写入
-            throw new KnowledgeApplicationException(
-                    KnowledgeApplicationErrorCode.KNOWLEDGE_DOCUMENT_NOT_PARSABLE,
-                    "当前状态不允许该状态转换");
+        if (!isAllowedTransition(current.status(), document.status())) {
+            // 版本相同但转换非法：用现有的稳定状态错误拒绝，不新增公开错误契约、不产生任何写入
+            throw notAllowedTransition(current.status(), document.status());
         }
 
-        int affected = this.jdbcClient.sql(KnowledgeDocumentSql.CAS_UPDATE_STATUS)
-                .param(1, document.status().name())
-                .param(2, toOffsetDateTime(document.updatedAt()))
-                .param(3, toOffsetDateTime(document.parsedAt()), Types.TIMESTAMP_WITH_TIMEZONE)
-                .param(4, toOffsetDateTime(document.parseFailedAt()), Types.TIMESTAMP_WITH_TIMEZONE)
-                .param(5, document.parseFailureCode() == null ? null : document.parseFailureCode().name(),
-                        Types.VARCHAR)
-                .param(6, documentId.value())
-                .param(7, expectedVersion)
+        int affected = KnowledgeDocumentSql.bindLifecycleFields(
+                this.jdbcClient.sql(KnowledgeDocumentSql.CAS_UPDATE_STATUS), document)
+                .param(13, documentId.value())
+                .param(14, expectedVersion)
                 .update();
         if (affected != 1) {
             // 行锁已保证不会走到这里；若真发生，说明写入不完整，按版本冲突处理并回滚
@@ -184,8 +183,21 @@ public final class JdbcKnowledgeDocumentRepository implements KnowledgeDocumentR
     /**
      * 通用 update 允许的单步状态转换。
      *
-     * <p>{@code PARSED} 不在任何「允许写入的目标」里：它只能由
-     * {@code completeParsing} 的原子端口在一次事务中连同切片一起落库。</p>
+     * <table border="1">
+     *   <caption>通用 update 的状态矩阵</caption>
+     *   <tr><th>锁定后读到的状态</th><th>允许写入的目标状态</th></tr>
+     *   <tr><td>{@code UPLOADED}</td><td>{@code PARSING}</td></tr>
+     *   <tr><td>{@code PARSE_FAILED}</td><td>{@code PARSING}</td></tr>
+     *   <tr><td>{@code PARSING}</td><td>{@code PARSE_FAILED}</td></tr>
+     *   <tr><td>{@code PARSED}</td><td>{@code INDEXING}</td></tr>
+     *   <tr><td>{@code INDEX_FAILED}</td><td>{@code INDEXING}</td></tr>
+     *   <tr><td>{@code INDEXING}</td><td>{@code INDEX_FAILED}</td></tr>
+     *   <tr><td>{@code INDEXED}</td><td><b>无</b></td></tr>
+     * </table>
+     *
+     * <p>{@code PARSED} 与 {@code INDEXED} 都不在「允许写入的目标」里：它们只能分别由
+     * {@code completeParsing} 与 {@code completeIndexing} 的原子端口在一次事务中
+     * 连同切片/向量一起落库 —— 否则会出现「状态说成功了，但切片或向量根本没写」。</p>
      *
      * @param currentStatus 锁定后读到的当前状态名
      * @param targetStatus  调用方希望写入的状态
@@ -195,8 +207,34 @@ public final class JdbcKnowledgeDocumentRepository implements KnowledgeDocumentR
         return switch (currentStatus) {
             case "UPLOADED", "PARSE_FAILED" -> targetStatus == KnowledgeDocumentStatus.PARSING;
             case "PARSING" -> targetStatus == KnowledgeDocumentStatus.PARSE_FAILED;
+            case "PARSED", "INDEX_FAILED" -> targetStatus == KnowledgeDocumentStatus.INDEXING;
+            case "INDEXING" -> targetStatus == KnowledgeDocumentStatus.INDEX_FAILED;
             default -> false;
         };
+    }
+
+    /**
+     * 非法转换的稳定错误码：解析类用「不可解析」，索引类用「不可索引」。
+     *
+     * @param currentStatus 当前状态名
+     * @param targetStatus  目标状态
+     * @return 应用层异常
+     */
+    private static KnowledgeApplicationException notAllowedTransition(String currentStatus,
+            KnowledgeDocumentStatus targetStatus) {
+
+        boolean indexingRelated = targetStatus == KnowledgeDocumentStatus.INDEXING
+                || targetStatus == KnowledgeDocumentStatus.INDEX_FAILED
+                || "INDEXING".equals(currentStatus) || "INDEXED".equals(currentStatus)
+                || "INDEX_FAILED".equals(currentStatus);
+        if (indexingRelated) {
+            return new KnowledgeApplicationException(
+                    KnowledgeApplicationErrorCode.KNOWLEDGE_DOCUMENT_NOT_INDEXABLE,
+                    "当前状态不允许该状态转换");
+        }
+        return new KnowledgeApplicationException(
+                KnowledgeApplicationErrorCode.KNOWLEDGE_DOCUMENT_NOT_PARSABLE,
+                "当前状态不允许该状态转换");
     }
 
     /**

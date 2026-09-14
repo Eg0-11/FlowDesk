@@ -18,3 +18,8 @@ spring:
     driver-class-name: org.postgresql.Driver
   flyway:
     enabled: true
+    # PostgreSQL 额外加载专用迁移目录：V6 需要 pgvector 扩展与 vector(1024) 列类型，
+    # H2 既没有这些类型也没有 CREATE EXTENSION，因此它<b>不</b>放在 db/migration 里。
+    # 两个目录的版本号连续（V1~V5 在 db/migration，V6 在 db/postgresql-migration），
+    # 因此不会出现「同一版本两个脚本」的歧义。
+    locations: classpath:db/migration,classpath:db/postgresql-migration

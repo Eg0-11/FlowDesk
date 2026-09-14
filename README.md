@@ -1,6 +1,6 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0009 —— 文档解析与确定性切片（RAG 2/6，已完成；含 R1/R2 两轮修复）**
+> **当前阶段：FD-0010 —— 知识切片 Embedding 与 PostgreSQL pgvector 原子存储（RAG 3/6，已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
@@ -8,9 +8,10 @@
 > 列表接口 + offset 分页 + 排序白名单 + 条件搜索（FD-0007）、
 > 知识文档上传 + 原始文件存储 + 元数据查询（FD-0008）、
 > 文档解析（PDF/DOCX/Markdown/TXT，含 OOXML 包类型验证与显式关闭 OCR）+
-> 确定性切片 + 解析状态机与原子落库（FD-0009）。
-> 尚未实现：Embedding 与向量库、向量检索与 RAG 检索增强、切片内容的公开读取接口、
-> 文档列表/下载/删除、孤立文件清理任务、`PARSING` 悬挂的恢复扫描、
+> 确定性切片 + 解析状态机与原子落库（FD-0009）、
+> 切片向量化（DashScope text-embedding-v4）+ pgvector 原子落库 + 索引状态机（FD-0010）。
+> 尚未实现：向量相似度检索与 RAG 检索增强（含 Query Embedding 与 Rerank）、切片内容的公开读取接口、
+> 文档列表/下载/删除、孤立文件清理任务、`PARSING`/`INDEXING` 悬挂的恢复扫描、
 > 游标分页、PostgreSQL 全文检索与 pg_trgm、MCP 能力、Agent Graph、鉴权与前端。
 
 ## 一、项目简介
@@ -18,12 +19,13 @@
 FlowDesk 面向企业 IT 服务与运营场景，规划能力包括：智能化工单流转、知识库运营、RAG 检索增强、
 Tool 调用、MCP 资产/监控服务以及基于 Agent Graph 的自动化编排。
 
-当前仓库已经完成四件事：一是打通的 AI 垂直链路
+当前仓库已经完成五件事：一是打通的 AI 垂直链路
 （**HTTP → 用例 → Agent 编排 → Spring AI ChatClient → DeepSeek（OpenAI 兼容传输）→
 本地只读工具 → 模型汇总 → HTTP 响应**），二是纯 Java 的工单领域核心
 （工单聚合与生命周期状态机）与完整的工单 REST 链路（ETag 乐观并发、分页与条件搜索），
 三是知识文档的**安全上传链路**（流式落盘、内容键与路径收敛、失败补偿），
 四是文档的**解析与确定性切片**（真实 PDF/DOCX/Markdown/TXT → 纯文本 → 确定性切片 → 原子落库），
+五是切片**向量化与 pgvector 落库**（分批调用 DashScope text-embedding-v4 → 校验 → 单事务替换向量并推进为 INDEXED），
 并保留了清晰的模块边界、单向依赖方向与统一的版本基线。
 
 ## 二、模块职责
@@ -31,10 +33,10 @@ Tool 调用、MCP 资产/监控服务以及基于 Agent Graph 的自动化编排
 | 模块 | 职责 | 当前状态 |
 | --- | --- | --- |
 | `flowdesk-shared` | 通用异常、基础类型、工具类 | 仅模块与 `package-info.java` |
-| `flowdesk-domain` | 领域实体、值对象、领域规则（**不依赖 Spring**） | 已实现工单聚合与生命周期状态机（`com.flowdesk.domain.ticket`）、知识文档聚合与解析状态机、切片不变量（`com.flowdesk.domain.knowledge`） |
-| `flowdesk-application` | 用例服务、输入输出端口 | 已实现 AI 用例（`…application.ai`）、工单用例 + 乐观并发契约（`…application.ticket`）、知识文档上传/查询/解析用例与端口（`…application.knowledge`） |
+| `flowdesk-domain` | 领域实体、值对象、领域规则（**不依赖 Spring**） | 已实现工单聚合与生命周期状态机（`com.flowdesk.domain.ticket`）、知识文档聚合与解析/索引状态机、切片与向量不变量（`com.flowdesk.domain.knowledge`） |
+| `flowdesk-application` | 用例服务、输入输出端口 | 已实现 AI 用例（`…application.ai`）、工单用例 + 乐观并发契约（`…application.ticket`）、知识文档上传/查询/解析/索引用例与端口（`…application.knowledge`，含 `KnowledgeEmbeddingPort`） |
 | `flowdesk-agent` | AI 编排：实现 application 的 AI 用例，用 ChatClient 编排提示词与本地工具 | 已实现普通聊天与工具冒烟 |
-| `flowdesk-infrastructure` | 持久化与模型适配器 | 已提供 JDBC 工单存储（`…ticket.persistence.jdbc`）、DeepSeek 传输适配，以及知识文档的 JDBC 存储、本地文件系统内容读写、Tika 解析适配器与确定性切片器（`…knowledge.*`） |
+| `flowdesk-infrastructure` | 持久化与模型适配器 | 已提供 JDBC 工单存储（`…ticket.persistence.jdbc`）、DeepSeek 传输适配，以及知识文档的 JDBC 存储、本地文件系统内容读写、Tika 解析适配器、确定性切片器、DashScope Embedding 适配器与 pgvector 向量存储适配器（`…knowledge.*`） |
 | `flowdesk-bootstrap` | FlowDesk 主服务启动模块（Web + Validation + Actuator + AI 接口 + 工单 REST 接口 + 知识文档 REST 接口） | 可启动，端口 8080 |
 | `flowdesk-mcp-asset` | 独立资产 MCP 服务（Web + Actuator） | 可启动，端口 8091 |
 | `flowdesk-mcp-monitoring` | 独立监控 MCP 服务（Web + Actuator） | 可启动，端口 8092 |
@@ -71,7 +73,7 @@ flowdesk-mcp-monitoring     ← 只依赖 flowdesk-shared
 | Maven | 3.9+（Enforcer 校验 `[3.9,)`） |
 | Spring Boot | 3.5.8（父 POM + BOM） |
 | Spring AI | 1.1.2（BOM 管理；实际使用 `spring-ai-client-chat` 与 `spring-ai-starter-model-openai`） |
-| Spring AI Alibaba | 1.1.2.2（**仅导入 BOM**，其 Agent Framework 留待后续阶段） |
+| Spring AI Alibaba | 1.1.2.2（BOM 管理；实际使用 `spring-ai-alibaba-starter-dashscope`，只在 `dashscope-embedding` profile 下提供 `EmbeddingModel`；Agent Framework 留待后续阶段） |
 | Spring AI Alibaba Extensions | 1.1.2.2（**仅导入 BOM**） |
 | DeepSeek 传输 | OpenAI 兼容 Chat Completions（`spring-ai-starter-model-openai`，见 [ADR 0001](docs/adr/0001-deepseek-openai-compatible-transport.md)） |
 | Apache Tika | 3.3.2（`tika-core` + `tika-parsers-standard-package`，版本由根 pom 的 `tika.version` 单点锁定；**不使用 `tika-app`**；已排除 `commons-logging` 与 `jcl-over-slf4j`，只保留 Spring 自带的 `spring-jcl`，见 [ADR 0006](docs/adr/0006-document-parsing-and-deterministic-chunking.md)） |
@@ -683,7 +685,8 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 
 - 不使用 Lombok。
 - 不创建空的 Controller、Service、Repository、Entity 占位类。
-- 不提前实现业务功能；不引入 Redis、MQ、RAG、向量库、鉴权或前端依赖。
+- 不提前实现业务功能；不引入 Redis、MQ、鉴权或前端依赖；RAG 与向量存储**只按阶段引入**
+  （RAG 1/6~3/6 已交付：上传、解析切片、Embedding + pgvector 业务表；不使用通用向量库抽象）。
 - 不使用通配符版本；子模块不重复声明受 BOM 管理的版本。
 - 不隐藏编译警告，不跳过测试；全部文件使用 UTF-8。
 
@@ -700,9 +703,10 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0007 | 工单列表、分页、排序与条件搜索 | ✅ 已完成 |
 | FD-0008 | 知识文档领域模型与安全上传链路（RAG 1/6） | ✅ 已完成 |
 | FD-0009 | 文档解析与确定性切片（RAG 2/6） | ✅ 已完成（含 R1/R2 两轮修复：OOXML 类型验证、OCR 关闭、提取上限语义、持久化端口防线、OPC 关系证明与 Unicode 流状态） |
-| 后续 | RAG 3/6：Embedding 与向量存储 | 未开始 |
+| FD-0010 | 切片 Embedding 与 pgvector 原子存储（RAG 3/6） | ✅ 已完成 |
+| 后续 | RAG 4/6：向量检索与引用结果 | 未开始 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm` | 未开始 |
-| 后续 | RAG：向量检索与检索增强生成 | 未开始 |
+| 后续 | RAG：检索增强生成（含 Query Embedding 与 Rerank） | 未开始 |
 | 后续 | 孤立文件清理任务 | 未开始 |
 | 后续 | Tool 体系扩展：面向工单与知识的工具注册 | 未开始 |
 | 后续 | MCP：资产 MCP 服务与监控 MCP 服务的能力实现 | 未开始 |
@@ -712,9 +716,10 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 
 | 项 | 状态 | 含义 |
 | --- | --- | --- |
-| H2 集成 / HTTP 集成 | ✅ 已执行 | 真实 Spring 上下文、真实 JDBC、真实 Flyway 迁移（V1+V2+V3+V4）、真实并发线程、真实文件系统、真实 multipart 上传，以及真实 PDF/DOCX 解析（夹具按规范现场生成） |
-| 本地 smoke（默认 profile） | ✅ 已执行 | 真实进程 + 真实 HTTP：multipart 上传、存储目录落盘校验（FD-0008）、文档解析与状态推进、伪装 XLSX/普通 ZIP 被拒（FD-0009 / R1） |
-| PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证** |
+| H2 集成 / HTTP 集成 | ✅ 已执行 | 真实 Spring 上下文、真实 JDBC、真实 Flyway 迁移（H2 执行 V1~V5；V6 为 PostgreSQL 专用 pgvector 迁移）、真实并发线程、真实文件系统、真实 multipart 上传，以及真实 PDF/DOCX 解析（夹具按规范现场生成） |
+| 本地 smoke（默认 profile） | ✅ 已执行 | 真实进程 + 真实 HTTP：multipart 上传、存储目录落盘校验（FD-0008）、文档解析与状态推进、伪装 XLSX/普通 ZIP 被拒（FD-0009 / R1）；向量化在默认环境关闭，索引接口 503（FD-0010） |
+| PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证**；pgvector 集成测试（Testcontainers，固定镜像 pgvector/pgvector:pg16）在无 Docker 时跳过，报告标注 POSTGRESQL_PGVECTOR_IT=NOT_RUN |
+| 真实 DashScope Embedding | ⚠️ **DASHSCOPE_LIVE=NOT_RUN** | 无 DASHSCOPE_API_KEY，**未对真实向量服务发起过任何请求**；全部自动化测试都不访问真实上游 |
 | 真实 DeepSeek | ⚠️ **LIVE_SMOKE=NOT_RUN** | 无 `DEEPSEEK_API_KEY`，**未对真实模型发起过任何请求** |
 
 > **本文档不宣称 PostgreSQL 或真实 DeepSeek 已验证。** 相关代码按标准 SQL 与 OpenAI 兼容协议编写、
@@ -1031,3 +1036,160 @@ Flyway **V4** 在 `knowledge_documents` 上新增 `parsed_at`、`parse_failed_at
 3. **切片参数变更不会回填历史数据**：改配置后需要重新解析才会生效；
 4. 解析产物的读取端口（`countChunks` / `findChunks`）已经就位，但**没有公开 HTTP 接口** ——
    切片内容是下一阶段（向量化）的内部输入。
+
+## 十七、切片 Embedding 与 pgvector 存储（RAG 3/6）
+
+设计取舍见 [`docs/adr/0007-dashscope-embedding-pgvector-storage.md`](docs/adr/0007-dashscope-embedding-pgvector-storage.md)。
+
+本阶段把「已解析的切片」变成「可检索的向量」：
+**分批读取切片 → 调用 DashScope `text-embedding-v4` 生成 1024 维向量 → 逐批校验 →
+单事务替换向量并把文档推进为 `INDEXED`**。
+**不做**向量相似度查询、Query Embedding、Rerank 与 RAG 问答（那是 RAG 4/6 及之后）。
+
+### 17.1 完整链路与状态机
+
+```
+上传 ──▶ UPLOADED ──领取解析──▶ PARSING ──完成──▶ PARSED ──领取索引──▶ INDEXING ──完成──▶ INDEXED
+                                   │                      │                      │
+                                   └──失败──▶ PARSE_FAILED└──失败──▶ INDEX_FAILED┘
+                    PARSE_FAILED ──重新领取解析──▶ PARSING
+                    INDEX_FAILED ──重新领取索引──▶ INDEXING
+```
+
+| 步骤 | 动作 | 版本 | 事务 |
+| --- | --- | --- | --- |
+| ① 校验命令 | 非法输入在任何端口调用前拒绝 | — | 无 |
+| ② 开关检查 | 未启用向量化 → **503**，且不读仓储 | — | 无 |
+| ③ 读取 + 版本比对 | `If-Match` 过期 → 412 | — | 无 |
+| ④ 状态检查 | 只允许 `PARSED`/`INDEX_FAILED`，否则 409 | — | 无 |
+| ⑤ 领取 | `markIndexing` + CAS 更新为 `INDEXING` | **+1** | 短事务 |
+| ⑥ 分批生成 | 每批 ≤10 条读切片 → 调模型 → 逐批校验 | — | **无事务** |
+| ⑦ 完成 | 校验状态/版本/切片摘要 → 替换向量 → 置 `INDEXED` | **+1** | 短事务 |
+| ⑧ 失败补偿 | 把文档 CAS 成 `INDEX_FAILED`（带稳定失败码） | **+1** | 短事务 |
+
+- 只有把 ⑥ 放在事务外，才不会有「用上游延迟占用数据库连接」的问题；
+- 只有把 ⑦ 做成一个原子端口，才不会出现「文档 INDEXED 但向量只写了一半」；
+- 版本冲突与「状态不允许索引」**不写失败态**（当前请求无权给别人盖失败戳）。
+
+### 17.2 模型、维度与批次
+
+| 项 | 值 | 说明 |
+| --- | --- | --- |
+| 提供方 | `dashscope`（阿里云百炼） | DeepSeek 只负责 Chat/Agent，Embedding 走 DashScope |
+| 模型 | `text-embedding-v4` | 由 `flowdesk.knowledge.embedding.model` 显式指定 |
+| 维度 | `1024` | 与 `vector(1024)` 列、领域不变量三处一致 |
+| 语义 | `document` | 查询侧（下一阶段）才用 `query` |
+| 单批上限 | `10` | `flowdesk.knowledge.embedding.batch-size`，配置校验拒绝 >10 |
+| 维度探测 | **禁止** | 适配器从不调用 `EmbeddingModel.dimensions()`（它可能发起远端请求） |
+
+响应校验（任何一条不满足即 `INVALID_EMBEDDING_RESPONSE`，且**不写入任何向量**）：
+数量与请求一致、按请求顺序映射、每条恰好 1024 维、不含 `null`/`NaN`/`±Infinity`、不是全零。
+
+### 17.3 Profile 与启动方式
+
+| 环境 | 启动方式 | 结果 |
+| --- | --- | --- |
+| 默认（H2） | `.\mvnw.cmd -pl flowdesk-bootstrap spring-boot:run` | 可启动；**不创建 EmbeddingModel**、无网络请求、无需 Key；索引接口 503 |
+| 仅 DeepSeek | `--spring.profiles.active=deepseek` | 只有 ChatModel，仍然没有 EmbeddingModel |
+| 完整生产组合 | `--spring.profiles.active=postgres,deepseek,dashscope-embedding` | Chat 走 DeepSeek、Embedding 走 DashScope、向量落 pgvector |
+| 只启用向量化但没有 PostgreSQL | `--spring.profiles.active=dashscope-embedding` | **启动失败**并给出明确的配置错误（不会静默退回 H2 或内存向量库） |
+
+```powershell
+$env:DASHSCOPE_API_KEY = '<key>'
+$env:FLOWDESK_DB_URL = 'jdbc:postgresql://localhost:5432/flowdesk'
+$env:FLOWDESK_DB_USERNAME = '<user>'
+$env:FLOWDESK_DB_PASSWORD = '<password>'
+java -jar flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar `
+     --spring.profiles.active=postgres,deepseek,dashscope-embedding
+```
+
+仓库中**不保存**任何真实 API Key、数据库密码或 Token：`api-key` 只读取 `${DASHSCOPE_API_KEY}`。
+
+### 17.4 接口与 curl 示例
+
+| 方法 | 路径 | 请求 | 成功响应 |
+| --- | --- | --- | --- |
+| POST | `/api/v1/knowledge/documents/{documentId}/index` | 无请求体；**必须**带 `If-Match` | 200 OK + `ETag` |
+
+```powershell
+# 上传 → 解析 → 索引（同步，返回时向量已落库）
+$doc = curl.exe -s -X POST http://localhost:8080/api/v1/knowledge/documents `
+  -F "title=季度运维报告" -F "file=@report.docx" | ConvertFrom-Json
+
+curl.exe -s -X POST "http://localhost:8080/api/v1/knowledge/documents/$($doc.id)/parse" `
+  -H "If-Match: `"0`""
+# → 200 OK, ETag: "2", status=PARSED
+
+curl.exe -s -i -X POST "http://localhost:8080/api/v1/knowledge/documents/$($doc.id)/index" `
+  -H "If-Match: `"2`""
+# → 200 OK, ETag: "4"
+# {"documentId":"...","title":"季度运维报告","status":"INDEXED","version":4,"chunkCount":3,
+#  "embeddingProvider":"dashscope","embeddingModel":"text-embedding-v4",
+#  "embeddingDimensions":1024,"indexedAt":"2026-09-14T10:12:31.482Z"}
+```
+
+响应里**没有**切片正文、向量数组、内容键、本地路径、API Key 或上游响应。
+`GET /api/v1/knowledge/documents/{id}` 同步扩展了 `parsedAt`/`indexedAt`/`embeddingProvider`/
+`embeddingModel`/`embeddingDimensions`，并使用 `NON_NULL`：不相关状态不输出空字段。
+
+| 场景 | HTTP | code |
+| --- | --- | --- |
+| 索引命令不合法 | 400 | `INVALID_REQUEST` |
+| 缺少 / 非法 `If-Match` | 428 / 400 | `PRECONDITION_REQUIRED` / `INVALID_IF_MATCH` |
+| 文档不存在 | 404 | `KNOWLEDGE_DOCUMENT_NOT_FOUND` |
+| 状态不允许索引 | 409 | `KNOWLEDGE_DOCUMENT_NOT_INDEXABLE` |
+| 版本过期 / 领取 CAS 失败 | 412 | `KNOWLEDGE_DOCUMENT_VERSION_CONFLICT` |
+| 默认环境未启用向量化 | 503 | `KNOWLEDGE_EMBEDDING_DISABLED` |
+| 上游向量服务失败（超时/限流/5xx） | 502 | `EMBEDDING_PROVIDER_ERROR` + `failureCode` |
+| 模型响应非法 / 向量写入失败 / 切片不自洽 | 500 | `INTERNAL_SERVER_ERROR` + `failureCode` |
+
+### 17.5 数据库结构（V5 + V6）
+
+**V5（通用，H2 与 PostgreSQL 都执行）**：给 `knowledge_documents` 增加
+`index_started_at`、`indexed_at`、`index_failed_at`、`index_failure_code`、
+`embedding_provider`、`embedding_model`、`embedding_dimensions`，并把状态 CHECK 扩展到七个取值；
+同时增加「状态与索引字段一致」「维度必须是 1024」「完整时间线」三类 CHECK。
+
+**V6（PostgreSQL 专用，`db/postgresql-migration`）**：`CREATE EXTENSION IF NOT EXISTS vector`，
+并创建业务向量表：
+
+```sql
+knowledge_document_chunk_embeddings (
+    document_id UUID, chunk_index INTEGER, chunk_sha256 CHAR(64),
+    embedding vector(1024), provider, model, embedding_dimensions, created_at,
+    PRIMARY KEY (document_id, chunk_index),
+    FOREIGN KEY (document_id, chunk_index)
+        REFERENCES knowledge_document_chunks (document_id, chunk_index) ON DELETE CASCADE,
+    CHECK (embedding_dimensions = 1024),
+    CHECK (vector_dims(embedding) = embedding_dimensions)
+);
+CREATE INDEX … USING hnsw (embedding vector_cosine_ops);
+```
+
+- `application-postgres.yml` 的 Flyway locations = `classpath:db/migration` + `classpath:db/postgresql-migration`；
+- 默认 H2 **只执行 V1~V5**，不会尝试 `CREATE EXTENSION` 或 `vector(1024)`；
+- **不使用** Spring AI 的 `PgVectorStore` 自动建表，也不创建通用 `vector_store` 表：
+  向量表必须是业务表，才能有「切片外键 + 摘要证明 + 状态 CAS + 同一事务完成」的语义。
+
+### 17.6 原子性、并发与失败补偿
+
+- **向量与状态同事务**：完成阶段在**一个短事务**里校验「文档仍是 `INDEXING` 且版本匹配」→
+  校验向量与库中切片**数量/序号/摘要**完全一致 → 删除旧向量 → 批量写入新向量 →
+  CAS 更新为 `INDEXED` 并版本 +1 → 同事务重新读取。任一步失败**整体回滚**
+  （集成测试用「第 N 条语句失败」与「摘要被改坏」两条路径验证）；
+- **不做任何纠错**：错序、断号、归属错误、摘要变化一律拒绝，绝不按位置重排或跳过不匹配的行；
+- **并发**：领取是 CAS（行锁 + 版本条件更新），同一文档同时只有一个索引请求能成功；
+- **补偿**：失败后把文档 CAS 成 `INDEX_FAILED`（稳定失败码）；补偿失败只作为 suppressed 附加，
+  绝不覆盖根因；版本冲突与状态冲突不写失败态；
+- **切片分页读取**：每批最多 10 条，内存中只累积已校验的 1024 维向量，不会一次性加载整篇切片文本。
+
+### 17.7 已知边界
+
+1. **`INDEXING` 悬挂**：进程在索引期间崩溃会让文档停在 `INDEXING`，本阶段不实现超时回收；
+2. **同步索引**：请求会一直等到全部批次完成并落库，极大文档可能触及客户端/代理超时；
+3. **`INDEXED` 不可重建**：主动重建索引不在本阶段范围内（重新索引需人工退回 `INDEX_FAILED`，
+   届时旧向量会被替换）；
+4. **批次串行**：分批串行调用上游，未做并发化；
+5. **真实上游与真实数据库**：`DASHSCOPE_LIVE=NOT_RUN`、`POSTGRESQL_PGVECTOR_IT=NOT_RUN`
+   （本机没有 Key、没有 PostgreSQL 与 Docker），自动化测试全部使用替身或 H2；
+   pgvector 相关断言由 Testcontainers 测试覆盖，无 Docker 时跳过。

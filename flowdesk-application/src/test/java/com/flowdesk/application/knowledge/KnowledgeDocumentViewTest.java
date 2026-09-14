@@ -67,8 +67,18 @@ class KnowledgeDocumentViewTest {
 
     @Test
     void exposesExactlyTheDocumentedFields() {
+        // 字段集合是对外契约的一部分：新增字段必须在这里显式声明，
+        // 因此「不小心把内部字段塞进视图」会立刻被测试拦住
         assertThat(componentNames()).containsExactlyInAnyOrder("id", "title", "originalFilename", "format",
-                "mediaType", "sizeBytes", "sha256", "status", "version", "createdAt", "updatedAt");
+                "mediaType", "sizeBytes", "sha256", "status", "version", "createdAt", "updatedAt",
+                "parsedAt", "indexedAt", "embeddingProvider", "embeddingModel", "embeddingDimensions");
+    }
+
+    @Test
+    void exposesNoVectorOrChunkContentComponent() {
+        // 向量数组与切片正文绝不能出现在文档视图里
+        assertThat(componentNames()).doesNotContain("vector", "embedding", "chunks", "content");
+        assertThat(componentNames()).noneMatch(name -> name.toLowerCase(java.util.Locale.ROOT).contains("chunk"));
     }
 
     @Test
