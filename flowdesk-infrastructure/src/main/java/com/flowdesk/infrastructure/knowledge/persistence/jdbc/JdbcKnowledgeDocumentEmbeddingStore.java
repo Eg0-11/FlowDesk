@@ -62,11 +62,17 @@ import org.springframework.transaction.support.TransactionOperations;
  * 向量<b>不可能</b>存在没有对应切片的行，删除切片时向量随之级联删除。这是通用
  * {@code vector_store}（只有 id/content/metadata/embedding）无法表达的约束。见 ADR 0007。</p>
  *
- * <h2>不做任何纠错</h2>
- * <p>向量数量不足、{@link KnowledgeDocumentChunkEmbedding#chunkIndex()} 断号/错序、
- * 摘要与库中切片不一致、维度或数值非法 —— 全部<b>拒绝</b>并整体回滚。
+ * <h2>持久化层不做任何「猜测式纠错」（与协议层归位是两件事，FD-0010-R3 澄清）</h2>
+ * <p>本类拿到的是<b>已经绑定好</b>的业务记录：
+ * {@code (documentId, chunkIndex, chunkSha256, vector)}。它<b>不会</b>对这些记录重新排序、
+ * 补号或猜测修复 —— 向量数量不足、{@link KnowledgeDocumentChunkEmbedding#chunkIndex()} 断号/错序、
+ * 归属错误、摘要与库中切片不一致、维度或数值非法，全部<b>拒绝</b>并整体回滚。
  * 「按位置重排」或「跳过不匹配的行」会让库里的向量与切片静默错配，
  * 检索阶段会返回语义完全不相干的片段，而这类错误极难被发现。</p>
+ * <p>这与「按供应商声明的 {@code index} 把原始响应归位」<b>不是</b>同一件事：
+ * 后者发生在协议边界（{@code DashScopeKnowledgeEmbeddingAdapter}），把上游响应翻译成
+ * 「第 i 个向量属于第 i 段文本」的稳定顺序，属于<b>协议映射</b>；
+ * 到了本类，顺序语义已经确定，任何偏差都是业务数据错配，只能拒绝。</p>
  */
 public final class JdbcKnowledgeDocumentEmbeddingStore implements KnowledgeDocumentEmbeddingStore {
 

@@ -1,6 +1,6 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0010-R2 —— 关闭 Embedding provider 血缘错配并修正文档契约（RAG 3/6 修订，已完成）**
+> **当前阶段：FD-0010-R3 —— 统一 Embedding 顺序契约并清理过期阶段说明（文档与注释修订，已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
@@ -11,7 +11,8 @@
 > 确定性切片 + 解析状态机与原子落库（FD-0009）、
 > 切片向量化（DashScope text-embedding-v4）+ pgvector 原子落库 + 索引状态机（FD-0010）、
 > 索引链路修订（Key fail-fast、按 index 归位、关闭依赖库正文日志、失败码贯通、真正的 JDBC 批处理）（FD-0010-R1）、
-> provider 血缘校验与文档契约修正（只允许规范值 `dashscope`、Key 优先级改为模态级优先、失败码措辞不再绝对化）（FD-0010-R2）。
+> provider 血缘校验与文档契约修正（只允许规范值 `dashscope`、Key 优先级改为模态级优先、失败码措辞不再绝对化）（FD-0010-R2）、
+> 顺序契约统一与过期阶段说明清理（协议层归位 vs 持久化层拒绝错配，纯文档修订）（FD-0010-R3）。
 > 尚未实现：向量相似度检索与 RAG 检索增强（含 Query Embedding 与 Rerank）、切片内容的公开读取接口、
 > 文档列表/下载/删除、孤立文件清理任务、`PARSING`/`INDEXING` 悬挂的恢复扫描、
 > 游标分页、PostgreSQL 全文检索与 pg_trgm、MCP 能力、Agent Graph、鉴权与前端。
@@ -708,6 +709,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0010 | 切片 Embedding 与 pgvector 原子存储（RAG 3/6） | ✅ 已完成 |
 | FD-0010-R1 | 索引链路修订：Key fail-fast、按 index 归位、依赖库日志关闭、failureCode 贯通、真实 JDBC 批处理 | ✅ 已完成 |
 | FD-0010-R2 | provider 血缘校验（只允许规范值 dashscope）、Key 优先级说明修正、失败码契约措辞修正 | ✅ 已完成 |
+| FD-0010-R3 | 统一 Embedding 顺序契约（协议层归位 vs 持久化层拒绝错配）、清理过期阶段说明 | ✅ 已完成（仅文档与注释） |
 | 后续 | RAG 4/6：向量检索与引用结果 | 未开始 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm` | 未开始 |
 | 后续 | RAG：检索增强生成（含 Query Embedding 与 Rerank） | 未开始 |
@@ -866,7 +868,8 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 
 本阶段把「已上传的原始文件」变成「可用的纯文本切片」：
 读取原文 → 安全解析 PDF/DOCX/MD/TXT → 规范化 → 确定性切片 → 原子保存 → 状态更新。
-**不做** Embedding、向量库、检索增强，也**没有**读取切片内容的公开接口（那是下一阶段的内部输入）。
+**不做** Embedding、向量库、检索增强，也**没有**读取切片内容的公开接口：切片内容只在服务端
+索引/检索链路内流转（向量化已由 RAG 3/6 实现，见第十七章），不通过任何 HTTP 接口公开。
 
 ### 16.1 接口表
 
@@ -1040,7 +1043,7 @@ Flyway **V4** 在 `knowledge_documents` 上新增 `parsed_at`、`parse_failed_at
 2. **同步解析**：请求会一直等到解析完成，极大文档可能触及客户端/代理超时（本阶段不引入异步任务与 MQ）；
 3. **切片参数变更不会回填历史数据**：改配置后需要重新解析才会生效；
 4. 解析产物的读取端口（`countChunks` / `findChunks`）已经就位，但**没有公开 HTTP 接口** ——
-   切片内容是下一阶段（向量化）的内部输入。
+   切片内容仅供服务端索引/检索链路使用，不通过解析响应公开。
 
 ## 十七、切片 Embedding 与 pgvector 存储（RAG 3/6）
 
@@ -1084,7 +1087,7 @@ Flyway **V4** 在 `knowledge_documents` 上新增 `parsed_at`、`parse_failed_at
 | provider 取值 | **只允许逐字 `dashscope`** | 会被持久化的**血缘字段**；启用时其他取值（含大小写变体与前后空格）一律启动失败（FD-0010-R2，见 17.8） |
 | 模型 | `text-embedding-v4` | 由 `flowdesk.knowledge.embedding.model` 显式指定 |
 | 维度 | `1024` | 与 `vector(1024)` 列、领域不变量三处一致 |
-| 语义 | `document` | 查询侧（下一阶段）才用 `query` |
+| 语义 | `document` | 查询侧（RAG 4/6 的检索阶段，尚未实现）才用 `query` |
 | 单批上限 | `10` | `flowdesk.knowledge.embedding.batch-size`，配置校验拒绝 >10 |
 | 维度探测 | **禁止** | 适配器从不调用 `EmbeddingModel.dimensions()`（它可能发起远端请求） |
 | 结果归位 | 按 `Embedding.getIndex()` | **不**信任响应列表顺序（FD-0010-R1，见 17.8） |
@@ -1228,7 +1231,17 @@ CREATE INDEX … USING hnsw (embedding vector_cosine_ops);
   CAS 更新为 `INDEXED` 并版本 +1 → 同事务重新读取。任一步失败**整体回滚**，
   包括**已经执行过的前几个写批次**（集成测试用「第 2 个批次失败」「所有批次成功后 CAS 失败」
   与「摘要被改坏」三条路径验证）；
-- **不做任何纠错**：错序、断号、归属错误、摘要变化一律拒绝，绝不按位置重排或跳过不匹配的行；
+- **两层顺序语义（FD-0010-R3 澄清）**：
+  - **协议层（`DashScopeKnowledgeEmbeddingAdapter`）按 `Embedding.getIndex()` 归位**：
+    上游响应里每条向量都带着供应商声明的 `index`，适配器据此把它放回**原请求位置**，
+    从而保证端口契约「返回列表与输入文本一一对应、且已恢复为请求顺序」。
+    这属于**协议映射**（把上游字段翻译成本端顺序），**不是**猜测、也**不是**静默纠错；
+    `index` 为 `null`、为负、越界、重复、缺失或数量不一致时一律拒绝
+    （`INVALID_EMBEDDING_RESPONSE`），绝不按响应列表的先后顺序去猜。
+  - **持久化层（`JdbcKnowledgeDocumentEmbeddingStore`）拒绝对业务记录重排**：它拿到的是
+    已经绑定好的 `(documentId, chunkIndex, chunkSha256, vector)`，因此错序、断号、归属错误、
+    摘要变化一律**拒绝并整体回滚**，绝不按位置重排或跳过不匹配的行 —— 到了这一层，
+    顺序语义已经确定，任何偏差都是业务数据错配，只能失败；
 - **并发**：领取是 CAS（行锁 + 版本条件更新），同一文档同时只有一个索引请求能成功；
   并发证据有两处：H2 上的 8 线程真实竞争（`KnowledgeDocumentIndexingClaimConcurrencyTest`）
   与 PostgreSQL 集成测试里的等价用例（无 Docker 时跳过）；
@@ -1269,6 +1282,14 @@ CREATE INDEX … USING hnsw (embedding vector_cosine_ops);
 | 1 | `provider=openai` 也能启动 → 实际由 DashScope 生成向量却把来源标成 openai（**血缘错配**） | `KnowledgeEmbeddingConfigurationValidator.requireSupportedProvider(...)`：启用时要求 provider **逐字**等于 `dashscope`（不 trim、不改大小写）；由启动期校验 Bean 与 `knowledgeEmbeddingPort` 共同调用，两者都在创建适配器之前失败 |
 | 2 | Key 优先级说明写反（写成了「通用优先、模态兜底」） | 代码改为**模态级优先、通用兜底**（与 `DashScopeConnectionUtils` 一致），并新增 `resolveApiKey(...)` 直接断言优先级方向；Javadoc / README / ADR 测试命名同步修正 |
 | 3 | 「数据库 `index_failure_code` 与响应 `failureCode` 永远一致」的绝对表述不成立 | 用例层 Javadoc、README 17.4/17.6、ADR 改为按「补偿成功 / 补偿失败 / 领取之前 / 冲突类」四种情形分别陈述；补偿失败测试改为断根异常不变 + suppressed 存在，不再暗示数据库已写入同一失败码 |
+
+**FD-0010-R3（顺序契约与过期阶段说明，仅文档/注释修订）**
+
+| # | 问题 | 处理 |
+| --- | --- | --- |
+| 1 | `KnowledgeEmbeddingPort` Javadoc 写成「不做按索引字段重排，上游错序就应当失败」，与 R1 之后按 `Embedding.getIndex()` 归位的实现相反 | 端口契约改为「返回列表与输入文本一一对应、且**已恢复为请求顺序**」，并写明**基础设施适配器可以并且应该**按供应商声明的稳定 `index` 归位；这属于**协议映射**而非猜测；非法 index 与数量不符必须拒绝；业务合法性（数量/维度/NaN/Infinity/全零）仍由应用层统一校验 |
+| 2 | README 17.6 与 ADR 0007 笼统写「不做任何纠错／不按位置重排」，与适配器行为模糊冲突 | 明确**两层语义**：协议层（适配器）按 `index` 把原始响应归位；持久化层（`JdbcKnowledgeDocumentEmbeddingStore`）对已绑定的 `(documentId, chunkIndex, chunkSha256, vector)` **不**重排、**不**补号、只拒绝错配。ADR 内不再有互相矛盾的结论（并记录了原文为什么矛盾） |
+| 3 | 过期阶段说明：把已完成的向量化写成「下一阶段/将来」 | `flowdesk-domain/package-info.java`、`KnowledgeDocumentChunk`、`ParsedDocumentResponse`、`DocumentChunker`、`KnowledgeDocumentChunkStore`、解析接口断言说明与 README 对应段落全部更正；**检索增强（RAG 4/6）仍然是未来能力**，相关表述保留并写明阶段名 |
 
 **为什么 Key 校验要读真实值**：DashScope 的自动配置条件是
 `@ConditionalOnProperty(name = "spring.ai.model.embedding", havingValue = "dashscope", matchIfMissing = true)`，

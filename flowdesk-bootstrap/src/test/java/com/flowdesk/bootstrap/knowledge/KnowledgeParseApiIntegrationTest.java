@@ -384,7 +384,7 @@ class KnowledgeParseApiIntegrationTest {
                 .getResponse().getContentAsString(StandardCharsets.UTF_8);
 
         assertThat(fetched)
-                .as("切片内容属于下一阶段（向量化）的内部输入，不通过 HTTP 暴露")
+                .as("切片内容仅供服务端索引/检索链路使用，不通过 HTTP 暴露")
                 .doesNotContain(SENTENCE)
                 .doesNotContain("chunks");
     }

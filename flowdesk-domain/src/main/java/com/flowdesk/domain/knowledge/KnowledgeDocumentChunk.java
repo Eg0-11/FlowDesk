@@ -20,8 +20,11 @@ import java.time.Instant;
  *   <li>{@code createdAt} 非空。</li>
  * </ul>
  *
- * <p>本阶段<b>没有</b> embedding 或向量字段：向量化属于下一个阶段，届时新增字段与迁移，
- * 而不是在这里预留空位。</p>
+ * <p>切片聚合<b>只承载纯文本</b>，刻意<b>不含</b> embedding 或向量字段：
+ * 向量由独立的领域对象 {@link KnowledgeDocumentChunkEmbedding}（以及独立的向量表）承载，
+ * 从而把「模型血缘（provider/model/dimensions）」与「向量数值」挡在切片之外 ——
+ * 切片表达的是「文档被切成了什么」，与「用哪个模型把它向量化过」是两件事，
+ * 混在一起会让更换模型、重新索引、以及逐切片比对摘要都变得困难。</p>
  *
  * @param documentId     所属文档标识
  * @param chunkIndex     文档内序号，从 0 开始

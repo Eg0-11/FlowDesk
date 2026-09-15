@@ -18,12 +18,12 @@ import org.springframework.ai.embedding.EmbeddingRequest;
 import org.springframework.ai.embedding.EmbeddingResponse;
 
 /**
- * DashScope（阿里云百炼）文本向量适配器（FD-0010 / FD-0010-R1）。
+ * DashScope（阿里云百炼）文本向量适配器（FD-0010 / FD-0010-R1 / FD-0010-R3）。
  *
  * <h2>职责边界</h2>
  * <p>本类只做三件事：把文本列表翻译成 Spring AI 的 {@link EmbeddingRequest}、
  * 调用 {@link EmbeddingModel}、把结果按 <b>{@link Embedding#getIndex()} 声明的原请求位置</b>
- * 取出向量。合法性校验属于应用层（数量、维度、NaN/Infinity、全零），本类<b>不</b>做「纠错」，
+ * 取出向量。合法性校验属于应用层（数量、维度、NaN/Infinity、全零），本类<b>不</b>做业务纠错，
  * 也不猜测上游意图。</p>
  *
  * <h2>为什么不依赖响应列表顺序（FD-0010-R1）</h2>
@@ -34,13 +34,18 @@ import org.springframework.ai.embedding.EmbeddingResponse;
  * {@link KnowledgeIndexFailureCode#INVALID_EMBEDDING_RESPONSE}：index 为 {@code null}、
  * 为负、越界、重复、缺失，或结果数量与请求数量不一致。<b>不</b>静默跳过、<b>不</b>覆盖已有位置、
  * <b>不</b>按列表顺序猜测。</p>
+ * <p><b>这是协议映射，不是纠错</b>（FD-0010-R3）：{@code index} 是供应商明确声明的字段，
+ * 按它归位就是把上游协议翻译成本端「第 i 个向量属于第 i 段文本」的稳定顺序；
+ * 与之相对，<b>持久化层</b>（{@code JdbcKnowledgeDocumentEmbeddingStore}）拿到的是已经绑定好的
+ * {@code (documentId, chunkIndex, chunkSha256, vector)} 业务记录，那里既无法也<b>不得</b>
+ * 靠重排来修复错配，只能拒绝。</p>
  *
  * <h2>每次请求都显式指定模型、维度与语义</h2>
  * <p>{@code model}、{@code dimensions}、{@code textType=document} 都在请求选项里显式给出，
  * 而不是依赖 starter 的默认值：默认值会随依赖版本变化，而「用哪个模型、多少维」是
  * 已经写进数据库的契约（{@code embedding_model} / {@code embedding_dimensions}）。</p>
  * <p>{@code textType=document} 是 DashScope 的检索语义约定：文档侧必须用 {@code document}，
- * 查询侧（下一阶段）才用 {@code query}。</p>
+ * 查询侧（RAG 4/6 的检索阶段，尚未实现）才用 {@code query}。</p>
  *
  * <h2>不记录敏感内容</h2>
  * <p>本类不打印切片正文、向量数值、API Key 或完整响应。失败时只抛出携带<b>稳定失败码</b>的

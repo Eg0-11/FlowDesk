@@ -23,8 +23,8 @@ import java.util.List;
  *
  * <h2>读取端口</h2>
  * <p>{@link #countChunks(KnowledgeDocumentId)} 与
- * {@link #findChunks(KnowledgeDocumentId, int, int)} 供后续向量化阶段复用
- * （分页/流式读取），本阶段不提供公开 HTTP 接口。</p>
+ * {@link #findChunks(KnowledgeDocumentId, int, int)} 供索引（向量化）阶段分页读取切片使用，
+ * 不提供公开 HTTP 接口：切片内容只在服务端链路内流转。</p>
  */
 public interface KnowledgeDocumentChunkStore {
 
@@ -52,7 +52,7 @@ public interface KnowledgeDocumentChunkStore {
     long countChunks(KnowledgeDocumentId documentId);
 
     /**
-     * 分页读取切片（供后续向量化阶段使用）。
+     * 分页读取切片（供索引/向量化阶段按 {@code batch-size} 分批读取）。
      *
      * @param documentId 文档标识
      * @param offset     起始序号
