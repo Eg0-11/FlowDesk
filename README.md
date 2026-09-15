@@ -1,6 +1,6 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0010 —— 知识切片 Embedding 与 PostgreSQL pgvector 原子存储（RAG 3/6，已完成）**
+> **当前阶段：FD-0010-R1 —— 索引链路的凭证校验、乱序归位、日志脱敏、失败码与真实批处理（RAG 3/6 修订，已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
@@ -9,7 +9,8 @@
 > 知识文档上传 + 原始文件存储 + 元数据查询（FD-0008）、
 > 文档解析（PDF/DOCX/Markdown/TXT，含 OOXML 包类型验证与显式关闭 OCR）+
 > 确定性切片 + 解析状态机与原子落库（FD-0009）、
-> 切片向量化（DashScope text-embedding-v4）+ pgvector 原子落库 + 索引状态机（FD-0010）。
+> 切片向量化（DashScope text-embedding-v4）+ pgvector 原子落库 + 索引状态机（FD-0010）、
+> 索引链路修订（Key fail-fast、按 index 归位、关闭依赖库正文日志、失败码贯通、真正的 JDBC 批处理）（FD-0010-R1）。
 > 尚未实现：向量相似度检索与 RAG 检索增强（含 Query Embedding 与 Rerank）、切片内容的公开读取接口、
 > 文档列表/下载/删除、孤立文件清理任务、`PARSING`/`INDEXING` 悬挂的恢复扫描、
 > 游标分页、PostgreSQL 全文检索与 pg_trgm、MCP 能力、Agent Graph、鉴权与前端。
@@ -704,6 +705,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0008 | 知识文档领域模型与安全上传链路（RAG 1/6） | ✅ 已完成 |
 | FD-0009 | 文档解析与确定性切片（RAG 2/6） | ✅ 已完成（含 R1/R2 两轮修复：OOXML 类型验证、OCR 关闭、提取上限语义、持久化端口防线、OPC 关系证明与 Unicode 流状态） |
 | FD-0010 | 切片 Embedding 与 pgvector 原子存储（RAG 3/6） | ✅ 已完成 |
+| FD-0010-R1 | 索引链路修订：Key fail-fast、按 index 归位、依赖库日志关闭、failureCode 贯通、真实 JDBC 批处理 | ✅ 已完成 |
 | 后续 | RAG 4/6：向量检索与引用结果 | 未开始 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm` | 未开始 |
 | 后续 | RAG：检索增强生成（含 Query Embedding 与 Rerank） | 未开始 |
@@ -718,7 +720,8 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | --- | --- | --- |
 | H2 集成 / HTTP 集成 | ✅ 已执行 | 真实 Spring 上下文、真实 JDBC、真实 Flyway 迁移（H2 执行 V1~V5；V6 为 PostgreSQL 专用 pgvector 迁移）、真实并发线程、真实文件系统、真实 multipart 上传，以及真实 PDF/DOCX 解析（夹具按规范现场生成） |
 | 本地 smoke（默认 profile） | ✅ 已执行 | 真实进程 + 真实 HTTP：multipart 上传、存储目录落盘校验（FD-0008）、文档解析与状态推进、伪装 XLSX/普通 ZIP 被拒（FD-0009 / R1）；向量化在默认环境关闭，索引接口 503（FD-0010） |
-| PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证**；pgvector 集成测试（Testcontainers，固定镜像 pgvector/pgvector:pg16）在无 Docker 时跳过，报告标注 POSTGRESQL_PGVECTOR_IT=NOT_RUN |
+| 索引链路修订证据（FD-0010-R1） | ✅ 已执行 | 真实嵌套 Spring 上下文：缺失/空/纯空白 Key 均启动失败、假 Key 与 `postgres,deepseek,dashscope-embedding` 组合可完成装配（不经真实数据库与模型）；真实 `DashScopeEmbeddingModel` 指向未监听的本机端口，证明关闭 logger 后切片正文不进入日志（并把 logger 临时打开做反证）；H2 影子表上观测到真实的 `addBatch`/`executeBatch`（无逐条 `executeUpdate`）与跨批次回滚；8 线程真实竞争下只有一个请求进入 `INDEXING` |
+| PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证**；pgvector 集成测试（Testcontainers，镜像固定为带扩展版本的 `pgvector/pgvector:0.8.6-pg16`）在无 Docker 时跳过，报告标注 POSTGRESQL_PGVECTOR_IT=NOT_RUN |
 | 真实 DashScope Embedding | ⚠️ **DASHSCOPE_LIVE=NOT_RUN** | 无 DASHSCOPE_API_KEY，**未对真实向量服务发起过任何请求**；全部自动化测试都不访问真实上游 |
 | 真实 DeepSeek | ⚠️ **LIVE_SMOKE=NOT_RUN** | 无 `DEEPSEEK_API_KEY`，**未对真实模型发起过任何请求** |
 
@@ -1081,18 +1084,22 @@ Flyway **V4** 在 `knowledge_documents` 上新增 `parsed_at`、`parse_failed_at
 | 语义 | `document` | 查询侧（下一阶段）才用 `query` |
 | 单批上限 | `10` | `flowdesk.knowledge.embedding.batch-size`，配置校验拒绝 >10 |
 | 维度探测 | **禁止** | 适配器从不调用 `EmbeddingModel.dimensions()`（它可能发起远端请求） |
+| 结果归位 | 按 `Embedding.getIndex()` | **不**信任响应列表顺序（FD-0010-R1，见 17.8） |
+| 数据库写批次 | `100`（上限 1000） | `JdbcKnowledgeDocumentEmbeddingStore.DEFAULT_WRITE_BATCH_SIZE`，真正的 `executeBatch()` |
 
 响应校验（任何一条不满足即 `INVALID_EMBEDDING_RESPONSE`，且**不写入任何向量**）：
-数量与请求一致、按请求顺序映射、每条恰好 1024 维、不含 `null`/`NaN`/`±Infinity`、不是全零。
+结果数量与请求一致、`index` 存在且落在 `0..n-1`、无重复、无缺失（按 index 归位后逐条校验）、
+每条恰好 1024 维、不含 `null`/`NaN`/`±Infinity`、不是全零。
 
 ### 17.3 Profile 与启动方式
 
 | 环境 | 启动方式 | 结果 |
 | --- | --- | --- |
 | 默认（H2） | `.\mvnw.cmd -pl flowdesk-bootstrap spring-boot:run` | 可启动；**不创建 EmbeddingModel**、无网络请求、无需 Key；索引接口 503 |
-| 仅 DeepSeek | `--spring.profiles.active=deepseek` | 只有 ChatModel，仍然没有 EmbeddingModel |
+| 仅 DeepSeek | `--spring.profiles.active=deepseek` | 只有 ChatModel，仍然没有 EmbeddingModel，**不要求 DashScope Key** |
 | 完整生产组合 | `--spring.profiles.active=postgres,deepseek,dashscope-embedding` | Chat 走 DeepSeek、Embedding 走 DashScope、向量落 pgvector |
 | 只启用向量化但没有 PostgreSQL | `--spring.profiles.active=dashscope-embedding` | **启动失败**并给出明确的配置错误（不会静默退回 H2 或内存向量库） |
+| 只启用向量化但 Key 缺失/空/纯空白 | `--spring.profiles.active=postgres,dashscope-embedding` | **启动失败**，错误信息只提 `DASHSCOPE_API_KEY` 与配置名（FD-0010-R1） |
 
 ```powershell
 $env:DASHSCOPE_API_KEY = '<key>'
@@ -1103,7 +1110,21 @@ java -jar flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar `
      --spring.profiles.active=postgres,deepseek,dashscope-embedding
 ```
 
-仓库中**不保存**任何真实 API Key、数据库密码或 Token：`api-key` 只读取 `${DASHSCOPE_API_KEY}`。
+仓库中**不保存**任何真实 API Key、数据库密码或 Token：`api-key` 只读取 `${DASHSCOPE_API_KEY:}`
+（带空默认值是刻意的，见 17.8）。Key 的**真实值**由启动期校验读取并拒绝空值，
+因此「清掉环境变量后应用仍然启动」不会再发生。本项目只承认
+`spring.ai.dashscope.api-key`（回退 `spring.ai.dashscope.embedding.api-key`）这一条来源，
+**不**读取 starter 额外支持的 `AI_DASHSCOPE_API_KEY`：Key 从哪来必须能被启动期校验确定性地看到。
+
+`dashscope-embedding` profile 同时把依赖库的日志关掉：
+
+```yaml
+logging:
+  level:
+    # DashScopeEmbeddingModel 会把切片正文（request.getInstructions()）写进日志，
+    # 且发生在我们的适配器捕获异常之前，因此必须由配置关掉它（FD-0010-R1）
+    com.alibaba.cloud.ai.dashscope.embedding.DashScopeEmbeddingModel: "OFF"
+```
 
 ### 17.4 接口与 curl 示例
 
@@ -1140,8 +1161,14 @@ curl.exe -s -i -X POST "http://localhost:8080/api/v1/knowledge/documents/$($doc.
 | 状态不允许索引 | 409 | `KNOWLEDGE_DOCUMENT_NOT_INDEXABLE` |
 | 版本过期 / 领取 CAS 失败 | 412 | `KNOWLEDGE_DOCUMENT_VERSION_CONFLICT` |
 | 默认环境未启用向量化 | 503 | `KNOWLEDGE_EMBEDDING_DISABLED` |
-| 上游向量服务失败（超时/限流/5xx） | 502 | `EMBEDDING_PROVIDER_ERROR` + `failureCode` |
-| 模型响应非法 / 向量写入失败 / 切片不自洽 | 500 | `INTERNAL_SERVER_ERROR` + `failureCode` |
+| 上游向量服务失败（超时/限流/5xx） | 502 | `EMBEDDING_PROVIDER_ERROR` + `failureCode=EMBEDDING_PROVIDER_FAILURE` |
+| 模型响应非法（乱序/重复/越界/缺 index/数量不符） | 500 | `INTERNAL_SERVER_ERROR` + `failureCode=INVALID_EMBEDDING_RESPONSE` |
+| 切片数量或摘要与库中不一致 | 500 | `INTERNAL_SERVER_ERROR` + `failureCode=CHUNK_DATA_INVALID` |
+| 向量写入 / 批处理 / 事务提交失败 | 500 | `INTERNAL_SERVER_ERROR` + `failureCode=VECTOR_STORAGE_FAILURE` |
+
+**5xx 一定带 `failureCode`，而且与数据库里持久化的 `index_failure_code` 是同一个值**
+（FD-0010-R1 修正：FD-0010 里完成阶段的异常被统一包成 `METADATA_STORAGE_FAILURE`，
+在响应中丢掉了失败码）。响应始终是固定安全文案：不含 SQL、连接串、上游响应体、切片正文或异常类名。
 
 ### 17.5 数据库结构（V5 + V6）
 
@@ -1174,11 +1201,14 @@ CREATE INDEX … USING hnsw (embedding vector_cosine_ops);
 ### 17.6 原子性、并发与失败补偿
 
 - **向量与状态同事务**：完成阶段在**一个短事务**里校验「文档仍是 `INDEXING` 且版本匹配」→
-  校验向量与库中切片**数量/序号/摘要**完全一致 → 删除旧向量 → 批量写入新向量 →
-  CAS 更新为 `INDEXED` 并版本 +1 → 同事务重新读取。任一步失败**整体回滚**
-  （集成测试用「第 N 条语句失败」与「摘要被改坏」两条路径验证）；
+  校验向量与库中切片**数量/序号/摘要**完全一致 → 删除旧向量 → 分批写入新向量 →
+  CAS 更新为 `INDEXED` 并版本 +1 → 同事务重新读取。任一步失败**整体回滚**，
+  包括**已经执行过的前几个写批次**（集成测试用「第 2 个批次失败」「所有批次成功后 CAS 失败」
+  与「摘要被改坏」三条路径验证）；
 - **不做任何纠错**：错序、断号、归属错误、摘要变化一律拒绝，绝不按位置重排或跳过不匹配的行；
 - **并发**：领取是 CAS（行锁 + 版本条件更新），同一文档同时只有一个索引请求能成功；
+  并发证据有两处：H2 上的 8 线程真实竞争（`KnowledgeDocumentIndexingClaimConcurrencyTest`）
+  与 PostgreSQL 集成测试里的等价用例（无 Docker 时跳过）；
 - **补偿**：失败后把文档 CAS 成 `INDEX_FAILED`（稳定失败码）；补偿失败只作为 suppressed 附加，
   绝不覆盖根因；版本冲突与状态冲突不写失败态；
 - **切片分页读取**：每批最多 10 条，内存中只累积已校验的 1024 维向量，不会一次性加载整篇切片文本。
@@ -1190,6 +1220,31 @@ CREATE INDEX … USING hnsw (embedding vector_cosine_ops);
 3. **`INDEXED` 不可重建**：主动重建索引不在本阶段范围内（重新索引需人工退回 `INDEX_FAILED`，
    届时旧向量会被替换）；
 4. **批次串行**：分批串行调用上游，未做并发化；
-5. **真实上游与真实数据库**：`DASHSCOPE_LIVE=NOT_RUN`、`POSTGRESQL_PGVECTOR_IT=NOT_RUN`
+5. **依赖库日志被整体关闭**：`DashScopeEmbeddingModel` 的 logger 是 `OFF`，
+   因此该类自己的诊断信息（含上游错误细节）不会出现在日志里；
+   替代品是我们适配器里「只记失败码 + 异常类名」的一条 ERROR，原始异常仍作为 cause 保留在服务端；
+6. **真实上游与真实数据库**：`DASHSCOPE_LIVE=NOT_RUN`、`POSTGRESQL_PGVECTOR_IT=NOT_RUN`
    （本机没有 Key、没有 PostgreSQL 与 Docker），自动化测试全部使用替身或 H2；
    pgvector 相关断言由 Testcontainers 测试覆盖，无 Docker 时跳过。
+
+### 17.8 FD-0010-R1：五个缺口的修复
+
+| # | 缺口 | 修复位置 |
+| --- | --- | --- |
+| 1 | 清掉 `DASHSCOPE_API_KEY` 后应用仍能启动（只检查了 Bean 是否存在） | `application-dashscope-embedding.yml` 改为 `${DASHSCOPE_API_KEY:}`；`KnowledgeEmbeddingConfigurationValidator.requireDashScopeApiKey(...)` 读**真实配置值**并拒绝缺失/空/纯空白；`KnowledgeConfiguration.knowledgeEmbeddingPort` 在解析模型前再校验一次 |
+| 2 | 假定 `response.getResults()` 的顺序就是请求顺序 | `DashScopeKnowledgeEmbeddingAdapter.orderByIndex(...)`：按 `Embedding.getIndex()` 归位；index 为 `null`、为负、越界、重复、缺失或数量不一致一律 `INVALID_EMBEDDING_RESPONSE` |
+| 3 | 依赖库把切片正文写进日志 | profile 里 `com.alibaba.cloud.ai.dashscope.embedding.DashScopeEmbeddingModel: "OFF"`；自有适配器改为「只记失败码 + 异常类名」 |
+| 4 | 真实向量写入失败在响应里没有 `failureCode` | 适配器抛 `DocumentIndexingException(VECTOR_STORAGE_FAILURE)` / `(CHUNK_DATA_INVALID)`；用例层对 `DocumentIndexingException` 原样保留，不再包装成 `METADATA_STORAGE_FAILURE` |
+| 5 | 循环 `executeUpdate()` 不是批处理 | `JdbcKnowledgeDocumentEmbeddingStore` 改用 `JdbcTemplate.batchUpdate(sql, collection, writeBatchSize, setter)`，批大小有界、与删除旧向量和状态 CAS 同事务 |
+
+**为什么 Key 校验要读真实值**：DashScope 的自动配置条件是
+`@ConditionalOnProperty(name = "spring.ai.model.embedding", havingValue = "dashscope", matchIfMissing = true)`，
+「什么都不配」也会命中 —— Bean 能创建出来，可用性却取决于连接属性里的 Key，
+所以「Bean 存在」不构成有效防线。
+
+**为什么用 `OFF` 而不是只关 `ERROR`**：该依赖类有三个分支把
+`request.getInstructions()`（切片正文）当日志参数：`Error embedding request: {}`、
+`Error message returned for request: {}`（error）与 `No embeddings returned for request: {}`（warn）。
+
+**为什么 `null`/空白 Key 也必须失败**：它们会让每一次索引都以 401/403 收场，
+表现为「每次索引都 502」，比起动失败难排查得多。

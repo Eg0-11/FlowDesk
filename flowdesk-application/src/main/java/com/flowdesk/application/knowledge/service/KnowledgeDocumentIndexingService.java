@@ -44,6 +44,23 @@ import java.util.Objects;
  *       补偿失败只作为 suppressed 附加，绝不覆盖根因；版本冲突与「状态不允许索引」不写成失败态。</li>
  * </ol>
  *
+ * <h2>失败码契约（FD-0010-R1）</h2>
+ * <p>失败只有三种归宿，且<b>数据库里持久化的 {@code index_failure_code} 与对外响应里的
+ * {@code failureCode} 永远一致</b>：</p>
+ * <table border="1">
+ *   <caption>失败映射</caption>
+ *   <tr><th>失败</th><th>补偿</th><th>对外</th></tr>
+ *   <tr><td>版本冲突 / 状态不允许索引 / 文档不存在</td><td>不写失败态</td><td>412 / 409 / 404（原样上抛）</td></tr>
+ *   <tr><td>向量服务失败、响应非法、切片不自洽、向量写入失败</td>
+ *       <td>{@code INDEX_FAILED} + 对应失败码</td>
+ *       <td>{@link com.flowdesk.application.knowledge.index.DocumentIndexingException}
+ *           （<b>原样保留，不重新包装</b>）</td></tr>
+ *   <tr><td>其它运行时异常</td><td>{@code INDEX_FAILED} + 兜底失败码</td>
+ *       <td>包装成 {@code DocumentIndexingException}(兜底码, 原因只留在 cause)</td></tr>
+ * </table>
+ * <p>「不重新包装」是刻意的：FD-0010 曾经在这里把完成阶段的异常统一包成
+ * {@code METADATA_STORAGE_FAILURE}，结果真实的向量写入失败在响应里丢掉了 {@code failureCode}。</p>
+ *
  * <h2>内存占用</h2>
  * <p>切片正文<b>分批</b>读取（每批最多 {@code batchSize} 条），不会一次性把整篇文档的切片文本加载进来；
  * 内存里只累积「已经校验过的 1024 维向量」。</p>
@@ -134,8 +151,9 @@ public final class KnowledgeDocumentIndexingService implements IndexKnowledgeDoc
             embeddings = embedAllChunks(document);
         }
         catch (RuntimeException failure) {
-            markFailed(document, claimedVersion, failure);
-            throw failure;
+            // 向量生成阶段的兜底失败码是「上游调用失败」：只有在本层拿不到更精确语义时才用它
+            throw failIndexing(document, claimedVersion, failure,
+                    KnowledgeIndexFailureCode.EMBEDDING_PROVIDER_FAILURE);
         }
 
         try {
@@ -149,12 +167,9 @@ public final class KnowledgeDocumentIndexingService implements IndexKnowledgeDoc
                     saved.document().indexedAt());
         }
         catch (RuntimeException failure) {
-            markFailed(document, claimedVersion, failure);
-            if (failure instanceof KnowledgeApplicationException applicationFailure) {
-                throw applicationFailure;
-            }
-            throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.METADATA_STORAGE_FAILURE,
-                    "索引结果写入失败", failure);
+            // 完成阶段的兜底失败码是「向量写入失败」：pgvector/JDBC/批处理/提交失败都归到它
+            throw failIndexing(document, claimedVersion, failure,
+                    KnowledgeIndexFailureCode.VECTOR_STORAGE_FAILURE);
         }
     }
 
@@ -331,45 +346,82 @@ public final class KnowledgeDocumentIndexingService implements IndexKnowledgeDoc
     }
 
     /**
+     * 索引失败的统一处理（FD-0010-R1）：先决定「要不要写失败态」，再决定「对外抛出什么」。
+     *
+     * <p>两者的<b>失败码必须一致</b>：数据库里持久化的 {@code index_failure_code} 与
+     * HTTP 响应里的 {@code failureCode} 是同一个值，否则运维看到的失败原因与重试依据会互相矛盾。</p>
+     *
+     * <h2>三类处理</h2>
+     * <ol>
+     *   <li><b>不写失败态</b>（版本冲突、状态不允许索引、文档不存在）：当前请求没有资格给文档
+     *       盖失败戳，异常原样上抛（412 / 409 / 404）；</li>
+     *   <li><b>已经是 {@link DocumentIndexingException}</b>：它自带稳定失败码，
+     *       <b>原样保留</b>，绝不重新包装（包装会让响应丢掉 {@code failureCode}）；</li>
+     *   <li><b>其它运行时异常</b>：用兜底失败码包装成 {@link DocumentIndexingException}
+     *       （原始异常只作为 cause 保留在服务端）。</li>
+     * </ol>
+     *
+     * @param document       文档聚合
+     * @param claimedVersion 领取后的版本（数据库当前版本）
+     * @param failure        原始失败
+     * @param fallback       兜底失败码（本层拿不到更精确语义时使用）
+     * @return 要向上抛出的异常
+     */
+    private RuntimeException failIndexing(KnowledgeDocument document, long claimedVersion,
+            RuntimeException failure, KnowledgeIndexFailureCode fallback) {
+
+        KnowledgeIndexFailureCode failureCode = failureCodeOf(failure, fallback);
+        if (failureCode == null) {
+            return failure;
+        }
+        // 根因决定对外异常：已经是稳定失败码的异常原样保留，其它用兜底码包装
+        RuntimeException rootCause = failure instanceof DocumentIndexingException ? failure
+                : new DocumentIndexingException(failureCode, messageOf(failureCode), failure);
+
+        RuntimeException compensationFailure = markFailed(document, claimedVersion, failureCode);
+        if (compensationFailure != null && compensationFailure != failure) {
+            rootCause.addSuppressed(compensationFailure);
+        }
+        return rootCause;
+    }
+
+    /**
      * 失败补偿：把文档 CAS 成 {@code INDEX_FAILED}。
      *
-     * <p>以下两类失败<b>不</b>写失败态：</p>
-     * <ul>
-     *   <li>版本冲突：说明文档已经被别人改过，当前请求无权给它盖失败戳；</li>
-     *   <li>状态不允许索引：说明领取之前状态就不对（或已被并发请求领取）。</li>
-     * </ul>
      * <p>完成阶段失败时聚合可能已经被 {@code markIndexed} 推进到 {@code INDEXED}，
      * 而数据库写入已经整体回滚；这时用当前字段重建一个 {@code INDEXING} 快照再记录失败，
      * 否则文档会永远停在 {@code INDEXING} 这个谁也领不走的状态。</p>
      *
-     * @param document        文档聚合
-     * @param claimedVersion  领取后的版本（数据库当前版本）
-     * @param primaryFailure  原始失败
+     * @param document       文档聚合
+     * @param claimedVersion 领取后的版本（数据库当前版本）
+     * @param failureCode    要持久化的稳定失败码
+     * @return 补偿自身的失败；{@code null} 表示补偿成功
      */
-    private void markFailed(KnowledgeDocument document, long claimedVersion, RuntimeException primaryFailure) {
-        KnowledgeIndexFailureCode failureCode = failureCodeOf(primaryFailure);
-        if (failureCode == null) {
-            return;
-        }
+    private RuntimeException markFailed(KnowledgeDocument document, long claimedVersion,
+            KnowledgeIndexFailureCode failureCode) {
+
         try {
             KnowledgeDocument target = document.status() == KnowledgeDocumentStatus.INDEXING
                     ? document
                     : indexingSnapshotOf(document);
             target.markIndexFailed(failureCode, this.timeProvider.now());
             this.documentRepository.update(target, claimedVersion);
+            return null;
         }
         catch (RuntimeException compensationFailure) {
-            if (compensationFailure != primaryFailure) {
-                primaryFailure.addSuppressed(compensationFailure);
-            }
+            // 补偿失败只作为 suppressed 附加在根因上，绝不覆盖根因
+            return compensationFailure;
         }
     }
 
     /**
-     * @param failure 原始失败
+     * @param failure  原始失败
+     * @param fallback 兜底失败码
      * @return 要记录的稳定失败码；{@code null} 表示「不应该写失败态」
      */
-    private static KnowledgeIndexFailureCode failureCodeOf(RuntimeException failure) {
+    private static KnowledgeIndexFailureCode failureCodeOf(RuntimeException failure,
+            KnowledgeIndexFailureCode fallback) {
+
         if (failure instanceof DocumentIndexingException indexingFailure) {
             return indexingFailure.failureCode();
         }
@@ -377,6 +429,7 @@ public final class KnowledgeDocumentIndexingService implements IndexKnowledgeDoc
             return switch (applicationFailure.errorCode()) {
                 case KNOWLEDGE_DOCUMENT_VERSION_CONFLICT, KNOWLEDGE_DOCUMENT_NOT_INDEXABLE,
                         KNOWLEDGE_DOCUMENT_NOT_FOUND -> null;
+                // 存储类/内部一致性类失败：对索引而言都是「写入没成功」
                 default -> KnowledgeIndexFailureCode.VECTOR_STORAGE_FAILURE;
             };
         }
@@ -384,7 +437,20 @@ public final class KnowledgeDocumentIndexingService implements IndexKnowledgeDoc
             // 领域层拒绝通常意味着切片或状态数据不自洽
             return KnowledgeIndexFailureCode.CHUNK_DATA_INVALID;
         }
-        return KnowledgeIndexFailureCode.VECTOR_STORAGE_FAILURE;
+        return fallback;
+    }
+
+    /**
+     * @param failureCode 稳定失败码
+     * @return 服务端诊断用的固定文案（绝不包含上游文本、SQL 或连接信息）
+     */
+    private static String messageOf(KnowledgeIndexFailureCode failureCode) {
+        return switch (failureCode) {
+            case EMBEDDING_PROVIDER_FAILURE -> "向量服务调用失败";
+            case INVALID_EMBEDDING_RESPONSE -> "向量服务返回的数据不合法";
+            case VECTOR_STORAGE_FAILURE -> "索引结果写入失败";
+            case CHUNK_DATA_INVALID -> "切片数据不自洽";
+        };
     }
 
     /**

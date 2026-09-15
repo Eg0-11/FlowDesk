@@ -24,6 +24,7 @@ import com.flowdesk.infrastructure.knowledge.storage.LocalFileSystemKnowledgeCon
 import com.flowdesk.infrastructure.knowledge.support.SystemKnowledgeTimeProvider;
 import com.flowdesk.infrastructure.knowledge.support.UuidKnowledgeDocumentIdGenerator;
 import java.time.Clock;
+import javax.sql.DataSource;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -32,6 +33,7 @@ import org.springframework.boot.autoconfigure.web.servlet.MultipartProperties;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.env.Environment;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionOperations;
@@ -61,21 +63,23 @@ import org.springframework.transaction.support.TransactionTemplate;
 public class KnowledgeConfiguration {
 
     /**
-     * 启动期校验向量化配置与环境是否匹配（FD-0010）。
+     * 启动期校验向量化配置与环境是否匹配（FD-0010 / FD-0010-R1）。
      *
-     * <p>已启用向量化但没有 PostgreSQL、或没有 EmbeddingModel，都让应用<b>启动失败</b>：
-     * 静默退回 H2 或内存向量库会让「以为索引成功了」变成假象。</p>
+     * <p>已启用向量化但没有 PostgreSQL、没有 DashScope API Key、或没有 EmbeddingModel，
+     * 都让应用<b>启动失败</b>：静默退回 H2 或内存向量库会让「以为索引成功了」变成假象。</p>
      *
      * @param embedding      向量化配置
      * @param dataSource     数据源配置
      * @param embeddingModel EmbeddingModel 提供者（可能不存在）
+     * @param environment    配置环境（用于读取 DashScope 连接属性中的真实 Key）
      * @return 校验通过标记
      */
     @Bean
     public Boolean knowledgeEmbeddingConsistency(KnowledgeEmbeddingProperties embedding,
-            DataSourceProperties dataSource, ObjectProvider<EmbeddingModel> embeddingModel) {
+            DataSourceProperties dataSource, ObjectProvider<EmbeddingModel> embeddingModel,
+            Environment environment) {
 
-        return KnowledgeEmbeddingConfigurationValidator.validate(embedding, dataSource, embeddingModel);
+        return KnowledgeEmbeddingConfigurationValidator.validate(embedding, dataSource, embeddingModel, environment);
     }
 
 
@@ -140,17 +144,25 @@ public class KnowledgeConfiguration {
      * <p>启用时使用 DashScope 适配器；关闭时使用「拒绝一切」的占位实现 ——
      * 两种情况下 Bean 都存在，因此用例服务与 HTTP 契约都不需要知道开关状态。</p>
      *
+     * <p>取 {@link EmbeddingModel} 之前先做一次 Key 校验（FD-0010-R1）：
+     * {@code EmbeddingModel} Bean 由依赖库的自动配置创建，而它的自动配置条件是
+     * {@code matchIfMissing=true}，所以「Bean 存在」并不代表「Key 可用」。
+     * 在这里先校验可以保证：无论容器先装配本 Bean 还是先装配启动期校验 Bean，
+     * 拿到的都是同一条只提配置名的稳定错误信息。</p>
+     *
      * @param embedding      向量化配置
      * @param embeddingModel EmbeddingModel 提供者（关闭时通常为空）
+     * @param environment    配置环境（用于读取 DashScope 连接属性中的真实 Key）
      * @return 向量生成端口
      */
     @Bean
     public KnowledgeEmbeddingPort knowledgeEmbeddingPort(KnowledgeEmbeddingProperties embedding,
-            ObjectProvider<EmbeddingModel> embeddingModel) {
+            ObjectProvider<EmbeddingModel> embeddingModel, Environment environment) {
 
         if (!embedding.isEnabled()) {
             return new DisabledKnowledgeEmbedding.Port();
         }
+        KnowledgeEmbeddingConfigurationValidator.requireDashScopeApiKey(embedding, environment);
         EmbeddingModel model = embeddingModel.getIfAvailable();
         if (model == null) {
             // 与启动期校验重复一次：这里的失败信息更贴近「Bean 为什么装配不出来」
@@ -164,6 +176,7 @@ public class KnowledgeConfiguration {
      * 向量写入端口（FD-0010）：PostgreSQL + pgvector 的原子完成实现。
      *
      * @param jdbcClient             JDBC 客户端
+     * @param dataSource             数据源（用于构造真正的 JDBC 批处理模板）
      * @param knowledgeWriteTransactions 写事务模板
      * @param documentRepository     文档仓储（同一事务内复用）
      * @param embedding              向量化配置（关闭时返回占位实现）
@@ -171,13 +184,14 @@ public class KnowledgeConfiguration {
      */
     @Bean
     public KnowledgeDocumentEmbeddingStore knowledgeDocumentEmbeddingStore(JdbcClient jdbcClient,
+            DataSource dataSource,
             @Qualifier("knowledgeWriteTransactions") TransactionOperations knowledgeWriteTransactions,
             JdbcKnowledgeDocumentRepository documentRepository, KnowledgeEmbeddingProperties embedding) {
 
         if (!embedding.isEnabled()) {
             return new DisabledKnowledgeEmbedding.Store();
         }
-        return new JdbcKnowledgeDocumentEmbeddingStore(jdbcClient, knowledgeWriteTransactions,
+        return new JdbcKnowledgeDocumentEmbeddingStore(jdbcClient, dataSource, knowledgeWriteTransactions,
                 documentRepository);
     }
 

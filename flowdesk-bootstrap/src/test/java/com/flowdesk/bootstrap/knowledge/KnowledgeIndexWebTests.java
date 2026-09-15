@@ -57,6 +57,9 @@ import org.springframework.test.web.servlet.MvcResult;
         "flowdesk.knowledge.upload.max-size=1MB",
         "flowdesk.knowledge.embedding.enabled=true",
         "flowdesk.knowledge.embedding.batch-size=2",
+        // FD-0010-R1：启用向量化就必须有 DashScope Key（启动期校验），这里给一个假 Key。
+        // 真正的模型调用被下面的 StubEmbeddingPort 覆盖，因此不会发出任何网络请求。
+        "spring.ai.dashscope.api-key=test-fake-key-not-a-real-secret",
         // 让测试用的校验 Bean 覆盖生产 Bean（否则生产校验会因 H2 直接拒绝启动）
         "spring.main.allow-bean-definition-overriding=true"
 })
@@ -238,17 +241,91 @@ class KnowledgeIndexWebTests {
     }
 
     @Test
-    void aStorageFailureReturns500AndLeavesTheDocumentRetryable() throws Exception {
+    void aStorageFailureReturns500WithTheVectorStorageFailureCode() throws Exception {
         String documentId = parsedDocument();
-        this.embeddingStore.failWith(new IllegalStateException("pgvector 写入失败"));
+        // 与真实适配器一致：向量写入失败带稳定失败码，数据库异常只作为 cause
+        this.embeddingStore.failWith(new DocumentIndexingException(
+                KnowledgeIndexFailureCode.VECTOR_STORAGE_FAILURE, "向量写入失败 sentinel-server-message",
+                new java.sql.SQLException("INSERT INTO knowledge_document_chunk_embeddings "
+                        + "VALUES (... sentinel-sql ...) jdbc:postgresql://user:sentinel-password@host:5432/db")));
 
-        this.mockMvc.perform(post(BASE_PATH + "/{id}/index", documentId)
+        MvcResult result = this.mockMvc.perform(post(BASE_PATH + "/{id}/index", documentId)
                         .header(HttpHeaders.IF_MATCH, "\"2\""))
                 .andExpect(status().isInternalServerError())
-                .andExpect(jsonPath("$.code").value("INTERNAL_SERVER_ERROR"));
+                .andExpect(content().contentType("application/problem+json"))
+                .andExpect(jsonPath("$.code").value("INTERNAL_SERVER_ERROR"))
+                .andExpect(jsonPath("$.failureCode").value("VECTOR_STORAGE_FAILURE"))
+                .andReturn();
+
+        // 响应必须是固定安全文案：SQL、连接串、驱动信息与异常类名都不得出现
+        assertThat(result.getResponse().getContentAsString(StandardCharsets.UTF_8))
+                .doesNotContain("sentinel")
+                .doesNotContain("INSERT")
+                .doesNotContain("jdbc:")
+                .doesNotContain("postgresql")
+                .doesNotContain("SQLException");
 
         assertThat(statusOf(documentId)).isEqualTo("INDEX_FAILED");
         assertThat(indexFailureCodeOf(documentId)).isEqualTo("VECTOR_STORAGE_FAILURE");
+    }
+
+    @Test
+    void anUnexpectedStorageExceptionStillCarriesTheVectorStorageFailureCode() throws Exception {
+        // FD-0010 的缺口：完成阶段的非预期异常曾被包装成 METADATA_STORAGE_FAILURE，
+        // 于是响应是一个没有 failureCode 的 500。现在必须带失败码。
+        String documentId = parsedDocument();
+        this.embeddingStore.failWith(new IllegalStateException("pgvector 写入失败 sentinel-raw"));
+
+        MvcResult result = this.mockMvc.perform(post(BASE_PATH + "/{id}/index", documentId)
+                        .header(HttpHeaders.IF_MATCH, "\"2\""))
+                .andExpect(status().isInternalServerError())
+                .andExpect(jsonPath("$.code").value("INTERNAL_SERVER_ERROR"))
+                .andExpect(jsonPath("$.failureCode").value("VECTOR_STORAGE_FAILURE"))
+                .andReturn();
+
+        assertThat(result.getResponse().getContentAsString(StandardCharsets.UTF_8))
+                .doesNotContain("sentinel");
+
+        assertThat(statusOf(documentId)).as("补偿后必须可重试").isEqualTo("INDEX_FAILED");
+        assertThat(indexFailureCodeOf(documentId)).isEqualTo("VECTOR_STORAGE_FAILURE");
+    }
+
+    @Test
+    void aChunkDataFailureReturns500WithTheChunkDataInvalidFailureCode() throws Exception {
+        String documentId = parsedDocument();
+        this.embeddingStore.failWith(new DocumentIndexingException(
+                KnowledgeIndexFailureCode.CHUNK_DATA_INVALID, "切片摘要不一致 sentinel-digest"));
+
+        MvcResult result = this.mockMvc.perform(post(BASE_PATH + "/{id}/index", documentId)
+                        .header(HttpHeaders.IF_MATCH, "\"2\""))
+                .andExpect(status().isInternalServerError())
+                .andExpect(jsonPath("$.code").value("INTERNAL_SERVER_ERROR"))
+                .andExpect(jsonPath("$.failureCode").value("CHUNK_DATA_INVALID"))
+                .andReturn();
+
+        assertThat(result.getResponse().getContentAsString(StandardCharsets.UTF_8))
+                .doesNotContain("sentinel");
+
+        assertThat(statusOf(documentId)).isEqualTo("INDEX_FAILED");
+        assertThat(indexFailureCodeOf(documentId)).isEqualTo("CHUNK_DATA_INVALID");
+    }
+
+    @Test
+    void aVersionConflictFromTheCompletionPortStays412WithoutMarkingTheDocumentFailed() throws Exception {
+        String documentId = parsedDocument();
+        this.embeddingStore.failWith(new com.flowdesk.application.knowledge.KnowledgeApplicationException(
+                com.flowdesk.application.knowledge.KnowledgeApplicationErrorCode
+                        .KNOWLEDGE_DOCUMENT_VERSION_CONFLICT,
+                "文档版本不匹配"));
+
+        this.mockMvc.perform(post(BASE_PATH + "/{id}/index", documentId)
+                        .header(HttpHeaders.IF_MATCH, "\"2\""))
+                .andExpect(status().isPreconditionFailed())
+                .andExpect(jsonPath("$.code").value("KNOWLEDGE_DOCUMENT_VERSION_CONFLICT"));
+
+        // 版本冲突不得给别人盖失败戳
+        assertThat(statusOf(documentId)).as("不得被补偿成 INDEX_FAILED").isEqualTo("INDEXING");
+        assertThat(indexFailureCodeOf(documentId)).isNull();
     }
 
     @Test

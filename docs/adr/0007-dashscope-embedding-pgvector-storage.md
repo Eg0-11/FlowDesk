@@ -149,8 +149,9 @@ knowledge_document_chunk_embeddings (
 | 未启用向量化 | 什么都没变（**不读仓储**） | 503 `KNOWLEDGE_EMBEDDING_DISABLED` |
 | 领取 CAS 失败（并发） | 什么都没变 | 412，**不写失败态** |
 | 状态不允许索引 | 什么都没变 | 409 `KNOWLEDGE_DOCUMENT_NOT_INDEXABLE` |
-| 上游失败 / 响应非法 / 切片不自洽 | 文档 `INDEX_FAILED` + 稳定失败码 | 502 或 500；**没有向量** |
-| 完成阶段写入失败 | 向量与状态整体回滚，然后文档被 CAS 成 `INDEX_FAILED` | 500；文档可重试 |
+| 上游失败 / 响应非法 | 文档 `INDEX_FAILED` + 稳定失败码 | 502 `EMBEDDING_PROVIDER_FAILURE` / 500 `INVALID_EMBEDDING_RESPONSE`；**没有向量** |
+| 切片数量或摘要不自洽 | 文档 `INDEX_FAILED` + `CHUNK_DATA_INVALID` | 500 + `failureCode=CHUNK_DATA_INVALID`；**没有向量** |
+| 完成阶段写入失败（写入/批处理/事务提交） | 向量与状态整体回滚，然后文档被 CAS 成 `INDEX_FAILED` + `VECTOR_STORAGE_FAILURE` | 500 + `failureCode=VECTOR_STORAGE_FAILURE`；文档可重试 |
 | 完成阶段版本冲突 | 文档保持 `INDEXING`（不写失败态） | 412；由后续重试或人工处理 |
 | 补偿写库也失败 | 文档可能停在 `INDEXING` | 原始异常照常抛出，补偿失败只作为 suppressed |
 | 进程在 `INDEXING` 期间被杀 | 文档停在 `INDEXING`（**悬挂**） | 本任务不实现超时回收，如实记录 |
@@ -158,6 +159,118 @@ knowledge_document_chunk_embeddings (
 - 「版本冲突不写失败态」是刻意的：说明文档已经被别人改过，当前请求无权给它盖失败戳。
 - 失败码是**稳定枚举**（`KnowledgeIndexFailureCode`）：上游响应体、SQL、路径与密钥
   绝不进入数据库或响应；响应里额外返回 `failureCode` 供调用方分支。
+- **数据库里持久化的 `index_failure_code` 与响应里的 `failureCode` 永远是同一个值**
+  （FD-0010-R1 修正）：否则运维看到的失败原因与重试依据会互相矛盾。
+
+## 修订（FD-0010-R1）：五个缺口的处理与理由
+
+FD-0010 交付后复核出五个缺口，下面记录每一项的根因与取舍。
+
+### 1. 凭证校验必须看「真实配置值」，而不是「Bean 是否存在」
+
+- **根因**：`DashScopeEmbeddingAutoConfiguration` 的门条件是
+  `@ConditionalOnProperty(name = "spring.ai.model.embedding", havingValue = "dashscope",
+  matchIfMissing = true)` + `@ConditionalOnDashScopeEnabled`。也就是说「什么都不配」也会命中，
+  Bean 能被创建出来，**可用性却取决于连接属性里的 Key**。因此 FD-0010 的
+  「检查 EmbeddingModel Bean 是否存在」在 Key 缺失时并不构成有效防线。
+- **决策**：占位符写成 `${DASHSCOPE_API_KEY:}`（带空默认值），再由
+  `KnowledgeEmbeddingConfigurationValidator.requireDashScopeApiKey(...)` 读**真实配置值**并拒绝
+  缺失、空字符串与纯空白。带空默认值而不是不带，是因为：不带默认值时失败发生在占位符解析，
+  信息是 Spring 的 `Could not resolve placeholder`，而且无法区分「没配」与「配了空白」。
+- **只承认一条 Key 来源**（`spring.ai.dashscope.api-key`，回退
+  `spring.ai.dashscope.embedding.api-key`，顺序与 starter 的 `DashScopeConnectionUtils` 一致），
+  刻意**不**读取 starter 额外支持的 `AI_DASHSCOPE_API_KEY` 环境变量：
+  「Key 从哪来」必须是启动期校验能确定性看到的事实，否则同一份配置在开发机（恰好导出过该变量）
+  与 CI 上会得到不同结论 —— 那正是「清掉 Key 之后应用仍然启动」这类问题的温床。
+- **校验点放在两处**：启动期校验 Bean，以及会创建 `EmbeddingModel` 的装配路径
+  （`knowledgeEmbeddingPort` 在解析模型之前先校验）。这样无论容器先装配哪个 Bean，
+  得到的都是同一条只提配置名的稳定错误信息，而不是依赖库的 `Assert` 或占位符解析失败。
+- **不泄露**：错误信息里只出现配置名与数据源类型，没有 Key 内容、用户名、密码或连接串。
+
+### 2. 按 `Embedding.getIndex()` 归位，而不是信任响应顺序
+
+- **根因**：上游返回的列表顺序不是契约。并发批量、内部重试、分片聚合都可能改变顺序，
+  而 `results.get(i)` 静默地把「A 的向量」写到「B 的切片」上 —— 检索阶段才发现召回错乱。
+- **决策**：用 `Embedding.getIndex()` 把结果放回原请求位置；index 为 `null`、为负、越界、
+  重复、缺失或结果数量不一致，一律抛 `INVALID_EMBEDDING_RESPONSE`。
+  **不**静默跳过、**不**覆盖已有位置、**不**按列表顺序猜测。
+- 说明：「index 缺失」在「数量一致 + 无重复 + 无越界」时由鸽巢原理不可达，
+  代码里保留显式防线，测试通过重复 / 越界 / 数量不一致三类输入覆盖可观测的拒绝路径。
+
+### 3. 关闭依赖库的正文日志（OFF）
+
+- **根因**：`DashScopeEmbeddingModel` 有三个日志点以 `request.getInstructions()`
+  （即切片正文）作为参数：`Error embedding request: {}`（调用异常）、
+  `Error message returned for request: {}`（上游返回错误体）、
+  `No embeddings returned for request: {}`（空结果）。它们发生在我们的适配器能捕获异常之前，
+  因此「FlowDesk 自己有节制的日志」并不足以保证正文不泄露。
+- **决策**：在 `dashscope-embedding` profile 里把该 logger 设为 `OFF`。
+  用 `OFF` 而不是只关 `ERROR`：warn 分支同样会打印正文。
+- **代价与补偿**：关掉后该类的诊断信息全部消失，因此**我们自己的适配器**补一条
+  「只记稳定失败码 + 异常类名」的日志（不记 `ex.getMessage()`，因为上游 message 可能回显请求内容；
+  不记堆栈，因为堆栈首行就是 message）。原始异常仍作为 cause 保留在服务端。
+- **不通过升级规避**：升级 Spring Boot / Spring AI / Spring AI Alibaba 会改变
+  OpenAI 兼容传输、DashScope 自动配置与重试行为，属于另一个变更面；
+  在依赖版本不变的前提下，日志级别是唯一能精确关闭该泄露点的开关。
+- **测试**：`KnowledgeEmbeddingLogRedactionTests` 用真实上下文 + 真实
+  `DashScopeEmbeddingModel`（base-url 指向未监听的本机端口）验证两个方向 ——
+  配置下 sentinel 正文不进入日志；把该 logger 临时开到 ERROR 后同一次调用**确实会**打印正文。
+  没有第二个方向，「什么都没记录」的假测试会永远通过。
+- **共享 JVM 的注意事项**：日志级别是进程级状态，测试用 `try/finally` 恢复原级别，
+  避免影响同一次 Surefire fork 里的其它测试类。
+
+### 4. 失败码必须与 HTTP 契约一致
+
+- **根因**：FD-0010 里完成阶段的异常被统一包成
+  `KnowledgeApplicationException(METADATA_STORAGE_FAILURE)`，而该错误码在异常处理器里映射为
+  **不带 `failureCode` 的 500** —— 于是真实的向量写入失败在响应里丢掉了失败码，
+  与文档、报告的说法不一致。
+- **决策**：
+  1. 适配器把写入 / 批处理 / 事务提交失败（`DataAccessException`、`TransactionException`）
+     直接抛成 `DocumentIndexingException(VECTOR_STORAGE_FAILURE)`；
+  2. 切片数量或摘要不自洽抛 `CHUNK_DATA_INVALID`；
+  3. 用例层对 `DocumentIndexingException` **原样保留**，不再重新包装；
+     非预期的运行时异常用兜底失败码（模型阶段 `EMBEDDING_PROVIDER_FAILURE`、
+     完成阶段 `VECTOR_STORAGE_FAILURE`）包装；
+  4. 版本冲突 / 状态不允许索引 / 文档不存在仍然原样上抛 412 / 409 / 404，且**不写失败态**。
+- 结果：索引路径上的 5xx **一定**带 `failureCode`，且与数据库里持久化的
+  `index_failure_code` 完全一致。
+
+### 5. 真正的 JDBC 批处理
+
+- **根因**：`for (…) jdbcClient.sql(INSERT).update();` 是 N 次独立的 `executeUpdate()`：
+  每次都要走一遍「解析 SQL → 绑定 → 执行 → 取结果」，既不是批处理，
+  也没有「写批次」这个可观测边界。
+- **决策**：改用 `JdbcTemplate.batchUpdate(sql, collection, writeBatchSize, setter)`：
+  一条准备好的语句 + 逐行 `addBatch()` + 每 `writeBatchSize` 行一次 `executeBatch()`。
+  批大小有界（默认 100，上限 1000），**不**拼接超长 SQL，所有值仍然参数绑定，
+  向量在绑定前仍逐个校验维度与有限性。
+- **同事务**：批次之间没有独立提交，它们与「删除旧向量」「文档状态 CAS」同属一个事务，
+  因此「前一批已执行、后一批失败」时前一批也会回滚（H2 影子表测试与 pgvector 集成测试各有一条）。
+- **可观测**：测试基础设施统计 `addBatch()` / `executeBatch()` / 单条 `executeUpdate()`
+  的次数与每批行数，并断言「向量写入没有走逐条 `executeUpdate`」。
+- **测试不绑定实现**：失败注入从「第 N 条语句」改成语义化方式
+  （`failOnBatchExecution(n)` 与 `failOnSql(fragment)`），不再依赖「第 5 条 INSERT」这类序号。
+
+### 6. 测试镜像标签固定
+
+- `pgvector/pgvector:pg16` 是**会移动的主版本标签**：同一个标签在不同时间拉到的 pgvector
+  扩展版本可能不同（0.8.x 与后续版本的算子与行为不保证一致），因此不能称为「固定具体版本」。
+- 现在固定为 `pgvector/pgvector:0.8.6-pg16`（pgvector 0.8.6 + PostgreSQL 16）。
+  该标签由 Docker Hub 解析到的 manifest list digest 记录在测试类注释里；
+  本机没有 Docker，无法拉取校验，因此只记录不断言。
+
+### 7. 并发领取的证据边界
+
+- 「并发索引 CAS」在 **H2 上真实执行**：`KnowledgeDocumentIndexingClaimConcurrencyTest`
+  用 8 个真实线程、真实连接与真实仓储 CAS，验证只有一个请求能进入 `INDEXING`、
+  其余得到 `KNOWLEDGE_DOCUMENT_VERSION_CONFLICT`、数据库版本只增加一次；
+  PostgreSQL 集成测试里也有一条等价用例（无 Docker 时跳过）。
+- **H2 不能证明的东西仍然由 PostgreSQL 独占**：`vector(1024)` 列宽、`vector_dims` 约束、
+  HNSW 索引、pgvector 的写入语义，以及真实的 `executeBatch()` 在 pgvector 表上的行为。
+- H2 上的批处理与回滚测试使用一张**影子表**（表名/列名/主键/复合外键与 V6 一致，
+  `embedding` 换成 PostgreSQL 兼容模式下可用的 `vector` 域），
+  目的是验证批处理机制与事务边界，而**不是**验证向量类型 —— 这一点在测试类注释里写明。
 
 ## 已知边界（如实记录）
 

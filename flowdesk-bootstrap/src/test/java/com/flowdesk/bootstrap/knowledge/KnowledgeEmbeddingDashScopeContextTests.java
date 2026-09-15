@@ -86,14 +86,17 @@ class KnowledgeEmbeddingDashScopeContextTests {
         }
 
         assertThat(profile)
-                .contains("api-key: ${DASHSCOPE_API_KEY}")
+                // FD-0010-R1：带空默认值，让「Key 缺失」由我们自己的启动期校验统一处理
+                .contains("api-key: ${DASHSCOPE_API_KEY:}")
                 .contains("model: text-embedding-v4")
                 .contains("dimensions: 1024")
                 .contains("batch-size: 10")
                 .contains("embedding: dashscope")
                 .contains("read-timeout")
                 .contains("retry")
-                .contains("retry");
+                // FD-0010-R1：依赖库的 logger 必须关闭（它会把切片正文写进日志）
+                .contains("logging:")
+                .contains("com.alibaba.cloud.ai.dashscope.embedding.DashScopeEmbeddingModel: \"OFF\"");
 
         // 仓库中不得出现真实 Key：整个 profile 里只有一处 api-key，且必须是环境变量占位符
         assertThat(countOccurrences(profile, "api-key")).isEqualTo(1);

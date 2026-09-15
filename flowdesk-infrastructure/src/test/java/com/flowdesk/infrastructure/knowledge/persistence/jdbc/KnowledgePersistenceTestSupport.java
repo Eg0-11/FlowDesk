@@ -57,7 +57,41 @@ final class KnowledgePersistenceTestSupport {
         JdbcKnowledgeDocumentChunkStore chunkStore = new JdbcKnowledgeDocumentChunkStore(jdbcClient, transactions,
                 repository);
         JdbcKnowledgeDocumentEmbeddingStore embeddingStore = new JdbcKnowledgeDocumentEmbeddingStore(jdbcClient,
-                transactions, repository);
+                intercepting, transactions, repository);
+
+        return new Fixture(jdbcClient, transactions, repository, chunkStore, embeddingStore, intercepting);
+    }
+
+    /**
+     * 与 {@link #migrate(String)} 相同，但把数据库写批次收窄到 {@code writeBatchSize}，
+     * 用于制造「前一批已执行、后一批失败」的场景。
+     *
+     * @param databaseName   内存库名（每个测试类唯一）
+     * @param writeBatchSize 单批最大行数
+     * @return 装配结果
+     */
+    static Fixture migrateWithWriteBatchSize(String databaseName, int writeBatchSize) {
+        JdbcDataSource dataSource = new JdbcDataSource();
+        dataSource.setURL("jdbc:h2:mem:" + databaseName
+                + ";MODE=PostgreSQL;DB_CLOSE_DELAY=-1;DATABASE_TO_LOWER=TRUE");
+        dataSource.setUser("sa");
+        dataSource.setPassword("");
+
+        Flyway.configure()
+                .dataSource(dataSource)
+                .locations("classpath:db/migration")
+                .load()
+                .migrate();
+
+        StatementInterceptingDataSource intercepting = new StatementInterceptingDataSource(dataSource);
+        JdbcClient jdbcClient = JdbcClient.create(intercepting);
+        TransactionTemplate transactions = new TransactionTemplate(
+                new DataSourceTransactionManager(intercepting));
+        JdbcKnowledgeDocumentRepository repository = new JdbcKnowledgeDocumentRepository(jdbcClient, transactions);
+        JdbcKnowledgeDocumentChunkStore chunkStore = new JdbcKnowledgeDocumentChunkStore(jdbcClient, transactions,
+                repository);
+        JdbcKnowledgeDocumentEmbeddingStore embeddingStore = new JdbcKnowledgeDocumentEmbeddingStore(jdbcClient,
+                intercepting, transactions, repository, writeBatchSize);
 
         return new Fixture(jdbcClient, transactions, repository, chunkStore, embeddingStore, intercepting);
     }
@@ -164,6 +198,54 @@ final class KnowledgePersistenceTestSupport {
          */
         void failOnStatement(int statementNumber) {
             this.statements.failOnStatement(statementNumber);
+        }
+
+        /**
+         * 让第 N 次 {@code executeBatch()} 失败（此前的批次已经真实下发）。
+         *
+         * @param batchNumber 从 1 开始；0 表示关闭
+         */
+        void failOnBatchExecution(int batchNumber) {
+            this.statements.failOnBatchExecution(batchNumber);
+        }
+
+        /**
+         * 让 SQL 中包含指定片段的语句失败（与序号无关的语义化注入）。
+         *
+         * @param sqlFragment SQL 片段；{@code null} 表示关闭
+         */
+        void failOnSql(String sqlFragment) {
+            this.statements.failOnSql(sqlFragment);
+        }
+
+        /** @return {@code addBatch()} 调用次数 */
+        int batchAdds() {
+            return this.statements.batchAdds();
+        }
+
+        /** @return 成功下发的批次数 */
+        int batchExecutions() {
+            return this.statements.batchExecutions();
+        }
+
+        /** @return 被注入失败的批次数 */
+        int failedBatchExecutions() {
+            return this.statements.batchExecutionsFailed();
+        }
+
+        /** @return 每批行数 */
+        java.util.List<Integer> batchSizes() {
+            return this.statements.batchSizes();
+        }
+
+        /** @return 通过 {@code executeBatch()} 下发的语句 SQL */
+        java.util.List<String> batchExecutionSql() {
+            return this.statements.batchExecutionSql();
+        }
+
+        /** @return 通过单条 {@code executeUpdate()} 下发的语句 SQL */
+        java.util.List<String> singleExecutionSql() {
+            return this.statements.singleExecutionSql();
         }
     }
 

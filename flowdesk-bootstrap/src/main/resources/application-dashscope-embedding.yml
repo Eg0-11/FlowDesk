@@ -8,13 +8,32 @@
 #   java -jar flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar \
 #        --spring.profiles.active=postgres,deepseek,dashscope-embedding
 #
-# 三条环境边界（见 ADR 0007）：
-#   1. 默认（H2，不启用 embedding）：可启动，索引接口 503，向量表不存在；
+# 四条环境边界（见 ADR 0007）：
+#   1. 默认（H2，不启用 embedding）：可启动，索引接口 503，向量表不存在，不需要任何 Key；
 #   2. 只启用本 profile 但不是 PostgreSQL：<b>启动失败</b>（pgvector 只存在于 PostgreSQL，
 #      静默退回 H2 或内存向量库会让「以为索引成功了」变成假象）；
-#   3. postgres + pgvector + 本 profile：真实索引链路可用。
+#   3. 只启用本 profile 但没有 DASHSCOPE_API_KEY（缺失 / 空 / 纯空白）：<b>启动失败</b>
+#      （每一次索引都会以 401/403 收场，「每次 502」比起动失败难排查得多）；
+#   4. postgres + pgvector + 本 profile + 真实 Key：真实索引链路可用。
 #
 # 仓库中不保存任何真实 API Key。
+#
+# FD-0010-R1：Key 缺失必须<b>在装配阶段</b>失败，而不是等到第一次索引请求。
+# 占位符带空默认值（${DASHSCOPE_API_KEY:}）是刻意的：没有默认值时失败发生在占位符解析，
+# 信息是 Spring 的「Could not resolve placeholder」，且无法区分「没配」与「配了空白」；
+# 带上空默认值后，值会真实落到连接属性上，再由
+# KnowledgeEmbeddingConfigurationValidator.requireDashScopeApiKey(...) 给出唯一且稳定的一条错误信息。
+logging:
+  level:
+    # 关闭依赖库自己的日志（FD-0010-R1）。
+    # DashScopeEmbeddingModel 在三个分支上以 request.getInstructions() 作为日志参数
+    # （"Error embedding request: {}" / "Error message returned for request: {}" /
+    #  "No embeddings returned for request: {}"），也就是把切片正文写进日志；
+    # 这条日志发生在我们的适配器能捕获异常之前，因此「FlowDesk 自己不打印正文」并不足以保证不泄露。
+    # 用 OFF 而不是 ERROR：warn 分支同样会打印正文，只关 error 挡不住。
+    # 我们自己的诊断改为「只记稳定失败码 + 异常类名」，见 DashScopeKnowledgeEmbeddingAdapter。
+    com.alibaba.cloud.ai.dashscope.embedding.DashScopeEmbeddingModel: "OFF"
+
 spring:
   config:
     activate:
@@ -23,8 +42,9 @@ spring:
     dashscope:
       # 总开关：DashScope 各能力的自动配置都挂在这个开关上
       enabled: true
-      # 连接与超时：有界超时，避免请求无限期挂住（占着请求线程与数据库连接池的等待）
-      api-key: ${DASHSCOPE_API_KEY}
+      # 连接与超时：有界超时，避免请求无限期挂住（占着请求线程与数据库连接池的等待）。
+      # 空默认值是刻意的：Key 缺失由我们自己的启动期校验给出稳定错误信息（见文件顶部说明）。
+      api-key: ${DASHSCOPE_API_KEY:}
       read-timeout: 30000
       # 只需要 embedding：其余能力显式关闭，避免创建出用不到、还需要 Key 的 Bean。
       # 注意 chat 不设为 none —— 那会覆盖 deepseek profile 的 chat=openai 并使组合 profile 失效；

@@ -293,30 +293,51 @@ class KnowledgeDocumentIndexingServiceTest {
     }
 
     @Test
-    void aStorageFailureIsRecordedAsIndexFailed() {
+    void aStorageFailureBecomesAVectorStorageFailureWithAFailureCode() {
         parsedDocument(0L);
         this.chunkPages.serve(RecordingIndexingPorts.chunks(DOCUMENT_ID, 2));
         this.embeddingStore.failWith(new IllegalStateException("数据库连接断了"));
 
-        assertApplicationError(() -> this.service.index(command(0L)),
-                KnowledgeApplicationErrorCode.METADATA_STORAGE_FAILURE);
+        // FD-0010-R1：非预期的写入异常必须带稳定失败码，否则 HTTP 层会返回一个没有 failureCode 的 500
+        assertIndexingFailure(KnowledgeIndexFailureCode.VECTOR_STORAGE_FAILURE,
+                () -> this.service.index(command(0L)));
 
         assertThat(this.repository.lastUpdated().status()).isEqualTo(KnowledgeDocumentStatus.INDEX_FAILED);
         assertThat(this.repository.lastUpdated().indexFailureCode())
+                .as("持久化的失败码与对外失败码一致")
                 .isEqualTo(KnowledgeIndexFailureCode.VECTOR_STORAGE_FAILURE);
     }
 
     @Test
-    void aStorageFailureWithAnApplicationCodeKeepsThatCode() {
+    void aCompletionFailureThatAlreadyCarriesAFailureCodeIsReRaisedUnchanged() {
+        parsedDocument(0L);
+        this.chunkPages.serve(RecordingIndexingPorts.chunks(DOCUMENT_ID, 2));
+        DocumentIndexingException fromStore = new DocumentIndexingException(
+                KnowledgeIndexFailureCode.CHUNK_DATA_INVALID, "摘要不一致");
+        this.embeddingStore.failWith(fromStore);
+
+        // 原样保留（同一个异常实例），绝不重新包装成 METADATA_STORAGE_FAILURE
+        assertThat(capture(() -> this.service.index(command(0L)))).isSameAs(fromStore);
+
+        assertThat(this.repository.lastUpdated().status()).isEqualTo(KnowledgeDocumentStatus.INDEX_FAILED);
+        assertThat(this.repository.lastUpdated().indexFailureCode())
+                .isEqualTo(KnowledgeIndexFailureCode.CHUNK_DATA_INVALID);
+    }
+
+    @Test
+    void aStorageFailureWithAnApplicationCodeKeepsTheFailureCodeContract() {
         parsedDocument(0L);
         this.chunkPages.serve(RecordingIndexingPorts.chunks(DOCUMENT_ID, 2));
         this.embeddingStore.failWith(new KnowledgeApplicationException(
                 KnowledgeApplicationErrorCode.KNOWLEDGE_INTERNAL_ERROR, "向量与切片不一致"));
 
-        assertApplicationError(() -> this.service.index(command(0L)),
-                KnowledgeApplicationErrorCode.KNOWLEDGE_INTERNAL_ERROR);
+        // 内部一致性类失败对索引而言就是「写入没成功」：补一个稳定失败码，绝不出现裸 500
+        assertIndexingFailure(KnowledgeIndexFailureCode.VECTOR_STORAGE_FAILURE,
+                () -> this.service.index(command(0L)));
 
         assertThat(this.repository.lastUpdated().status()).isEqualTo(KnowledgeDocumentStatus.INDEX_FAILED);
+        assertThat(this.repository.lastUpdated().indexFailureCode())
+                .isEqualTo(KnowledgeIndexFailureCode.VECTOR_STORAGE_FAILURE);
     }
 
     @Test

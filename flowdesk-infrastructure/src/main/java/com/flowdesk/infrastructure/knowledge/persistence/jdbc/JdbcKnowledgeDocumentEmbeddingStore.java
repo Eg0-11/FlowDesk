@@ -2,22 +2,28 @@ package com.flowdesk.infrastructure.knowledge.persistence.jdbc;
 
 import com.flowdesk.application.knowledge.KnowledgeApplicationErrorCode;
 import com.flowdesk.application.knowledge.KnowledgeApplicationException;
+import com.flowdesk.application.knowledge.index.DocumentIndexingException;
 import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentEmbeddingStore;
 import com.flowdesk.application.knowledge.port.out.VersionedKnowledgeDocument;
 import com.flowdesk.domain.knowledge.KnowledgeDocument;
 import com.flowdesk.domain.knowledge.KnowledgeDocumentChunkEmbedding;
 import com.flowdesk.domain.knowledge.KnowledgeDocumentId;
 import com.flowdesk.domain.knowledge.KnowledgeDocumentStatus;
+import com.flowdesk.domain.knowledge.KnowledgeIndexFailureCode;
+import java.sql.PreparedStatement;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
+import javax.sql.DataSource;
 import org.springframework.dao.DataAccessException;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.transaction.TransactionException;
 import org.springframework.transaction.support.TransactionOperations;
 
 /**
- * 「完成索引」的 PostgreSQL + pgvector 实现（FD-0010）。
+ * 「完成索引」的 PostgreSQL + pgvector 实现（FD-0010 / FD-0010-R1）。
  *
  * <h2>为什么五步必须在一个事务里</h2>
  * <p>完成索引要同时做到：校验文档仍是 {@code INDEXING} 且版本匹配、校验待写入向量与库中切片
@@ -27,7 +33,29 @@ import org.springframework.transaction.support.TransactionOperations;
  *   <li>「文档是 INDEXED 但向量只写了一半」→ 后续检索召回不完整，且无法从状态看出；</li>
  *   <li>「向量是新的但文档仍在 INDEXING」→ 文档永远领不走，向量却已经存在。</li>
  * </ul>
- * <p>因此这五步共享同一个事务，任一步抛出异常都整体回滚。</p>
+ * <p>因此这五步共享同一个事务，任一步（含任意一个写批次）抛出异常都整体回滚。</p>
+ *
+ * <h2>真正的 JDBC 批处理（FD-0010-R1）</h2>
+ * <p>FD-0010 的写入是 {@code for (… ) jdbcClient.sql(INSERT).update();} —— 那是 N 次独立的
+ * {@code executeUpdate()}，每次都要走一遍「解析 SQL → 绑定 → 执行 → 取结果」，
+ * 既不是批处理，也没有「写批次」这个可观测的边界。</p>
+ * <p>现在用 {@link JdbcTemplate#batchUpdate(String, java.util.Collection, int,
+ * org.springframework.jdbc.core.ParameterizedPreparedStatementSetter)}：
+ * 一条准备好的语句 + {@code addBatch()} 累积 + 每 {@code writeBatchSize} 条一次
+ * {@code executeBatch()}。批次有界（默认 {@value #DEFAULT_WRITE_BATCH_SIZE} 条），
+ * <b>不</b>拼接超长 SQL，所有值仍然参数绑定，向量在绑定前仍逐个做维度与有限性校验。</p>
+ * <p>批与批之间<b>没有</b>独立提交：它们和删除旧向量、文档状态 CAS 同属一个事务，
+ * 因此「前一批已执行、后一批失败」时，前一批的写入也会被回滚（由集成测试实证）。</p>
+ *
+ * <h2>失败码契约（FD-0010-R1）</h2>
+ * <ul>
+ *   <li>写入 / 批次 / 事务提交失败（{@link DataAccessException}、{@link TransactionException}）→
+ *       {@link KnowledgeIndexFailureCode#VECTOR_STORAGE_FAILURE}；</li>
+ *   <li>切片摘要或数量与库中不一致 → {@link KnowledgeIndexFailureCode#CHUNK_DATA_INVALID}
+ *       （此时<b>不写入任何向量</b>）；</li>
+ *   <li>版本冲突 / 状态不允许索引 → 保持 {@link KnowledgeApplicationException}，
+ *       由用例层映射为 412 / 409，<b>不</b>降级成写入失败。</li>
+ * </ul>
  *
  * <h2>为什么不用自动建表的通用 vector_store</h2>
  * <p>本表有复合外键指向 {@code knowledge_document_chunks(document_id, chunk_index)}：
@@ -42,23 +70,53 @@ import org.springframework.transaction.support.TransactionOperations;
  */
 public final class JdbcKnowledgeDocumentEmbeddingStore implements KnowledgeDocumentEmbeddingStore {
 
+    /** 默认数据库写批次大小：一条 prepared statement 最多累积这么多行。 */
+    public static final int DEFAULT_WRITE_BATCH_SIZE = 100;
+
+    /** 写批次上限：批次越大，单次 {@code executeBatch()} 的失败重试代价与内存占用越高。 */
+    public static final int MAX_WRITE_BATCH_SIZE = 1000;
+
     private final JdbcClient jdbcClient;
+
+    private final JdbcTemplate jdbcTemplate;
 
     private final TransactionOperations transactions;
 
     private final JdbcKnowledgeDocumentRepository documentRepository;
 
+    private final int writeBatchSize;
+
     /**
      * @param jdbcClient         Spring JDBC 客户端
+     * @param dataSource         数据源（用于构造真正的批处理模板）
      * @param transactions       写事务模板
      * @param documentRepository 文档仓储（同一事务内复用，用于最终重新读取）
      */
-    public JdbcKnowledgeDocumentEmbeddingStore(JdbcClient jdbcClient, TransactionOperations transactions,
-            JdbcKnowledgeDocumentRepository documentRepository) {
+    public JdbcKnowledgeDocumentEmbeddingStore(JdbcClient jdbcClient, DataSource dataSource,
+            TransactionOperations transactions, JdbcKnowledgeDocumentRepository documentRepository) {
+
+        this(jdbcClient, dataSource, transactions, documentRepository, DEFAULT_WRITE_BATCH_SIZE);
+    }
+
+    /**
+     * @param jdbcClient         Spring JDBC 客户端
+     * @param dataSource         数据源（用于构造真正的批处理模板）
+     * @param transactions       写事务模板
+     * @param documentRepository 文档仓储（同一事务内复用，用于最终重新读取）
+     * @param writeBatchSize     单批最大行数，必须在 {@code 1..}{@value #MAX_WRITE_BATCH_SIZE} 之间
+     */
+    public JdbcKnowledgeDocumentEmbeddingStore(JdbcClient jdbcClient, DataSource dataSource,
+            TransactionOperations transactions, JdbcKnowledgeDocumentRepository documentRepository,
+            int writeBatchSize) {
 
         this.jdbcClient = Objects.requireNonNull(jdbcClient, "jdbcClient 不能为 null");
+        this.jdbcTemplate = new JdbcTemplate(Objects.requireNonNull(dataSource, "dataSource 不能为 null"));
         this.transactions = Objects.requireNonNull(transactions, "transactions 不能为 null");
         this.documentRepository = Objects.requireNonNull(documentRepository, "documentRepository 不能为 null");
+        if (writeBatchSize < 1 || writeBatchSize > MAX_WRITE_BATCH_SIZE) {
+            throw new IllegalArgumentException("writeBatchSize 必须在 1.." + MAX_WRITE_BATCH_SIZE + " 之间");
+        }
+        this.writeBatchSize = writeBatchSize;
     }
 
     @Override
@@ -77,10 +135,14 @@ public final class JdbcKnowledgeDocumentEmbeddingStore implements KnowledgeDocum
                     status -> completeWithinTransaction(indexedDocument, expectedVersion, embeddings, documentId));
         }
         catch (KnowledgeApplicationException ex) {
+            // 版本冲突 / 状态不允许索引：语义保持原样，绝不降级成「写入失败」
             throw ex;
         }
-        catch (DataAccessException ex) {
-            throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.METADATA_STORAGE_FAILURE,
+        catch (DataAccessException | TransactionException ex) {
+            // 写入、批处理与事务提交阶段的一切数据库失败：带稳定失败码抛出，
+            // 让 HTTP 层能返回 failureCode=VECTOR_STORAGE_FAILURE（而不是一个没有失败码的 500）。
+            // 细节（SQL、连接串、驱动信息）只留在 cause，绝不进入消息或响应。
+            throw new DocumentIndexingException(KnowledgeIndexFailureCode.VECTOR_STORAGE_FAILURE,
                     "向量写入失败", ex);
         }
     }
@@ -142,23 +204,8 @@ public final class JdbcKnowledgeDocumentEmbeddingStore implements KnowledgeDocum
                 .param(1, documentId.value())
                 .update();
 
-        // ③ 批量写入全部向量（循环批量，避免单条语句长度随切片数线性增长）。
-        //    created_at 用文档的 indexedAt：时间来自应用层的时间端口，适配器自己不看系统时钟，
-        //    因此同一事务里「文档完成时间」与「向量创建时间」必然一致且可预测。
-        java.time.OffsetDateTime createdAt = KnowledgeDocumentSql.toOffsetDateTime(
-                indexedDocument.indexedAt());
-        for (KnowledgeDocumentChunkEmbedding embedding : embeddings) {
-            this.jdbcClient.sql(KnowledgeEmbeddingSql.INSERT)
-                    .param(1, documentId.value())
-                    .param(2, embedding.chunkIndex())
-                    .param(3, embedding.chunkSha256().value())
-                    .param(4, toVectorLiteral(embedding))
-                    .param(5, embedding.descriptor().provider())
-                    .param(6, embedding.descriptor().model())
-                    .param(7, embedding.dimensions())
-                    .param(8, createdAt)
-                    .update();
-        }
+        // ③ 真正的 JDBC 批处理写入：每批 writeBatchSize 条一次 executeBatch()
+        writeEmbeddingsInBatches(indexedDocument, embeddings, documentId);
 
         // ④ 更新文档状态（CAS：id + version 同时匹配），与向量写入同属一个事务
         int affected = KnowledgeDocumentSql.bindLifecycleFields(
@@ -179,7 +226,41 @@ public final class JdbcKnowledgeDocumentEmbeddingStore implements KnowledgeDocum
     }
 
     /**
+     * 分批写入全部向量。
+     *
+     * <p>{@code created_at} 用文档的 {@code indexedAt}：时间来自应用层的时间端口，
+     * 适配器自己不看系统时钟，因此同一事务里「文档完成时间」与「向量创建时间」必然一致且可预测。</p>
+     *
+     * @param indexedDocument 已标记完成的文档聚合
+     * @param embeddings      待写入向量（序号从 0 连续递增）
+     * @param documentId      文档标识
+     */
+    private void writeEmbeddingsInBatches(KnowledgeDocument indexedDocument,
+            List<KnowledgeDocumentChunkEmbedding> embeddings, KnowledgeDocumentId documentId) {
+
+        java.time.OffsetDateTime createdAt = KnowledgeDocumentSql.toOffsetDateTime(indexedDocument.indexedAt());
+        // Spring 6.2 起 batchUpdate 的「集合 + 批大小」重载：一条 prepared statement、
+        // 逐行 addBatch()、每 writeBatchSize 行一次 executeBatch()，不会拼接超长 SQL。
+        this.jdbcTemplate.batchUpdate(KnowledgeEmbeddingSql.INSERT, embeddings, this.writeBatchSize,
+                (PreparedStatement statement, KnowledgeDocumentChunkEmbedding embedding) -> {
+                    statement.setObject(1, documentId.value());
+                    statement.setInt(2, embedding.chunkIndex());
+                    statement.setString(3, embedding.chunkSha256().value());
+                    // 向量的最后一道闸门：维度与有限性校验发生在「数值进入 SQL 之前」
+                    statement.setString(4, toVectorLiteral(embedding));
+                    statement.setString(5, embedding.descriptor().provider());
+                    statement.setString(6, embedding.descriptor().model());
+                    statement.setInt(7, embedding.dimensions());
+                    statement.setObject(8, createdAt);
+                });
+    }
+
+    /**
      * 向量与库中切片必须一一对应：数量相同、序号相同、摘要相同。
+     *
+     * <p>摘要不一致意味着片段内容在「生成向量」与「写入向量」之间被换过：写入它等于把
+     * 「旧文本的向量」挂到「新切片」上。这类数据不自洽按 {@code CHUNK_DATA_INVALID} 上报，
+     * 与「向量服务返回了畸形数据」区分开。</p>
      *
      * @param documentId 文档标识
      * @param embeddings 待写入向量
@@ -198,15 +279,12 @@ public final class JdbcKnowledgeDocumentEmbeddingStore implements KnowledgeDocum
         }
 
         if (chunkDigests.size() != embeddings.size()) {
-            throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.KNOWLEDGE_INTERNAL_ERROR,
-                    "待写入向量数量与数据库切片数量不一致");
+            throw chunkDataInvalid("待写入向量数量与数据库切片数量不一致");
         }
         for (KnowledgeDocumentChunkEmbedding embedding : embeddings) {
             String digest = chunkDigests.get(embedding.chunkIndex());
             if (digest == null || !digest.equals(embedding.chunkSha256().value())) {
-                // 切片在向量生成之后被换过：写入它等于把「旧文本的向量」挂到「新切片」上
-                throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.KNOWLEDGE_INTERNAL_ERROR,
-                        "待写入向量与数据库切片的摘要不一致");
+                throw chunkDataInvalid("待写入向量与数据库切片的摘要不一致");
             }
         }
     }
@@ -256,6 +334,10 @@ public final class JdbcKnowledgeDocumentEmbeddingStore implements KnowledgeDocum
 
     private static KnowledgeApplicationException internalError(String message) {
         return new KnowledgeApplicationException(KnowledgeApplicationErrorCode.KNOWLEDGE_INTERNAL_ERROR, message);
+    }
+
+    private static DocumentIndexingException chunkDataInvalid(String message) {
+        return new DocumentIndexingException(KnowledgeIndexFailureCode.CHUNK_DATA_INVALID, message);
     }
 
     /**
