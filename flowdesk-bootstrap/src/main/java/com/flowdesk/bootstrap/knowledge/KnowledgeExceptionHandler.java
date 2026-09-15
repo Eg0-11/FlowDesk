@@ -69,6 +69,10 @@ public class KnowledgeExceptionHandler {
                     EMPTY_DOCUMENT_CONTENT -> problem(
                     HttpStatus.BAD_REQUEST, FlowDeskProblems.CODE_INVALID_REQUEST, "请求不合法",
                     fixedDetail(ex.errorCode()), request);
+            // 检索请求不合法：固定 detail（不回显 query、topK 或 minScore 的原始取值）
+            case INVALID_RETRIEVAL_QUERY -> problem(HttpStatus.BAD_REQUEST,
+                    FlowDeskProblems.CODE_INVALID_REQUEST, "请求不合法",
+                    "检索请求不合法", request);
             case DOCUMENT_TOO_LARGE -> problem(HttpStatus.PAYLOAD_TOO_LARGE,
                     FlowDeskProblems.CODE_DOCUMENT_TOO_LARGE, "文档过大",
                     "上传内容超过允许的最大大小", request);
@@ -94,7 +98,8 @@ public class KnowledgeExceptionHandler {
                     FlowDeskProblems.CODE_EMBEDDING_PROVIDER_ERROR, "向量服务不可用",
                     "向量服务暂时不可用，请稍后重试", request);
             case KNOWLEDGE_DOCUMENT_ALREADY_EXISTS, INVALID_PERSISTED_DOCUMENT, CONTENT_STORAGE_FAILURE,
-                    METADATA_STORAGE_FAILURE, DOCUMENT_CONTENT_UNREADABLE, KNOWLEDGE_INTERNAL_ERROR -> problem(
+                    METADATA_STORAGE_FAILURE, DOCUMENT_CONTENT_UNREADABLE, KNOWLEDGE_INTERNAL_ERROR,
+                    KNOWLEDGE_RETRIEVAL_FAILURE -> problem(
                     HttpStatus.INTERNAL_SERVER_ERROR, FlowDeskProblems.CODE_INTERNAL_SERVER_ERROR, "服务端错误",
                     "服务暂时不可用，请稍后重试", request);
         };

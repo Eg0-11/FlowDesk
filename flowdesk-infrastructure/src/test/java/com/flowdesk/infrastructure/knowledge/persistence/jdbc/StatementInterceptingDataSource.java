@@ -50,6 +50,8 @@ final class StatementInterceptingDataSource implements DataSource {
 
     private final AtomicInteger batchFailures = new AtomicInteger();
 
+    private final List<Object> boundParameters = Collections.synchronizedList(new ArrayList<>());
+
     private volatile int failOnStatementNumber;
 
     private volatile int failOnBatchExecutionNumber;
@@ -102,6 +104,15 @@ final class StatementInterceptingDataSource implements DataSource {
         }
     }
 
+    /**
+     * @return 自上次复位以来通过 {@code setXxx(index, value)} 绑定的参数值，按调用顺序
+     */
+    List<Object> boundParameters() {
+        synchronized (this.boundParameters) {
+            return List.copyOf(this.boundParameters);
+        }
+    }
+
     // ---------- 控制 ----------
 
     void resetStatements() {
@@ -111,6 +122,7 @@ final class StatementInterceptingDataSource implements DataSource {
         this.batchSizes.clear();
         this.batchExecutionSql.clear();
         this.singleExecutionSql.clear();
+        this.boundParameters.clear();
     }
 
     /**
@@ -206,7 +218,12 @@ final class StatementInterceptingDataSource implements DataSource {
                         }
                         case "executeUpdate", "executeLargeUpdate", "execute" -> this.singleExecutionSql.add(sql);
                         default -> {
-                            // 其余方法直接转发
+                            if (name.startsWith("set") && args != null && args.length >= 2
+                                    && args[0] instanceof Integer) {
+                                // setXxx(index, value)：记录绑定值（setNull 记录为 null），
+                                // 用于断言「所有值都是参数绑定、且顺序与 SQL 占位符一致」
+                                this.boundParameters.add("setNull".equals(name) ? null : args[1]);
+                            }
                         }
                     }
                     return invoke(statement, method, args);

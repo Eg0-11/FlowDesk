@@ -36,6 +36,18 @@ public enum KnowledgeApplicationErrorCode {
     /** 上游向量服务失败：超时、限流、5xx、连接失败等。 */
     EMBEDDING_PROVIDER_ERROR,
 
+    /** 检索请求本身不合法：query 缺失/空白/超长/含控制字符，或 topK、minScore 越界。 */
+    INVALID_RETRIEVAL_QUERY,
+
+    /**
+     * 检索链路内部失败（RAG 4/6）：模型响应结构非法、查询向量不满足不变量、
+     * 数据库检索失败，或向量检索端口返回的结果违反自身契约。
+     *
+     * <p>与 {@link #INVALID_RETRIEVAL_QUERY} 严格区分：那是「调用方输入有问题」（400），
+     * 这一类是「服务端自己有问题」（500），绝不能落进 400 的映射里。</p>
+     */
+    KNOWLEDGE_RETRIEVAL_FAILURE,
+
     /** 原始内容不可读：对象缺失、不可读或内容键非法（绝不暴露真实路径）。 */
     DOCUMENT_CONTENT_UNREADABLE,
 

@@ -9,12 +9,16 @@ import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentContentStore
 import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentIdGenerator;
 import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentRepository;
 import com.flowdesk.application.knowledge.port.out.KnowledgeEmbeddingPort;
+import com.flowdesk.application.knowledge.port.out.KnowledgeQueryEmbeddingPort;
 import com.flowdesk.application.knowledge.port.out.KnowledgeTimeProvider;
+import com.flowdesk.application.knowledge.port.out.KnowledgeVectorSearchPort;
 import com.flowdesk.application.knowledge.service.KnowledgeDocumentApplicationService;
 import com.flowdesk.application.knowledge.service.KnowledgeDocumentIndexingService;
 import com.flowdesk.application.knowledge.service.KnowledgeDocumentParsingService;
+import com.flowdesk.application.knowledge.service.KnowledgeRetrievalService;
 import com.flowdesk.infrastructure.knowledge.KnowledgeUploadProperties;
 import com.flowdesk.infrastructure.knowledge.embedding.KnowledgeEmbeddingProperties;
+import com.flowdesk.infrastructure.knowledge.retrieval.KnowledgeRetrievalProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -109,5 +113,32 @@ public class KnowledgeApplicationConfiguration {
         return new KnowledgeDocumentIndexingService(documentRepository, chunkStore, embeddingPort,
                 embeddingStore, timeProvider, embedding.isEnabled(), embedding.descriptor(),
                 embedding.getBatchSize());
+    }
+
+    /**
+     * 知识检索用例服务（RAG 4/6）。
+     *
+     * <p>开关与模型参数从配置取出后以纯值注入：应用层只认识 {@code boolean}、描述符与几个数值，
+     * 不认识 Spring 的配置类型。关闭状态下两个端口都由「拒绝一切」的占位实现提供，
+     * 用例服务本身仍然存在 —— 这样 HTTP 契约（503 {@code KNOWLEDGE_EMBEDDING_DISABLED}）
+     * 在默认环境也成立，而不是变成「Bean 缺失」导致的启动失败。</p>
+     *
+     * @param queryEmbeddingPort 查询向量生成端口
+     * @param vectorSearchPort   向量检索端口
+     * @param embedding          向量化配置（提供开关与描述符）
+     * @param retrieval          检索配置（提供 query 上限、topK 与阈值默认值/上限）
+     * @return 检索用例服务
+     */
+    @Bean
+    public KnowledgeRetrievalService knowledgeRetrievalService(
+            KnowledgeQueryEmbeddingPort queryEmbeddingPort,
+            KnowledgeVectorSearchPort vectorSearchPort,
+            KnowledgeEmbeddingProperties embedding,
+            KnowledgeRetrievalProperties retrieval) {
+
+        retrieval.validate();
+        return new KnowledgeRetrievalService(queryEmbeddingPort, vectorSearchPort, embedding.isEnabled(),
+                embedding.descriptor(), retrieval.getMaxQueryCodePoints(), retrieval.getDefaultTopK(),
+                retrieval.getMaxTopK(), retrieval.getDefaultMinScore());
     }
 }

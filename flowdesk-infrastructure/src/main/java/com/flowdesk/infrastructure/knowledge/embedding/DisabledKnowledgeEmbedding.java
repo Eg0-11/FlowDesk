@@ -4,10 +4,14 @@ import com.flowdesk.application.knowledge.KnowledgeApplicationErrorCode;
 import com.flowdesk.application.knowledge.KnowledgeApplicationException;
 import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentEmbeddingStore;
 import com.flowdesk.application.knowledge.port.out.KnowledgeEmbeddingPort;
+import com.flowdesk.application.knowledge.port.out.KnowledgeQueryEmbeddingPort;
+import com.flowdesk.application.knowledge.port.out.KnowledgeVectorMatch;
+import com.flowdesk.application.knowledge.port.out.KnowledgeVectorSearchPort;
 import com.flowdesk.application.knowledge.port.out.VersionedKnowledgeDocument;
 import com.flowdesk.domain.knowledge.EmbeddingDescriptor;
 import com.flowdesk.domain.knowledge.KnowledgeDocument;
 import com.flowdesk.domain.knowledge.KnowledgeDocumentChunkEmbedding;
+import com.flowdesk.domain.knowledge.KnowledgeQueryEmbedding;
 import java.util.List;
 
 /**
@@ -46,6 +50,33 @@ public final class DisabledKnowledgeEmbedding {
         @Override
         public VersionedKnowledgeDocument completeIndexing(KnowledgeDocument indexedDocument,
                 long expectedVersion, List<KnowledgeDocumentChunkEmbedding> embeddings) {
+
+            throw disabled();
+        }
+    }
+
+    /**
+     * 关闭状态下的查询向量端口（RAG 4/6）：任何调用都被拒绝，绝不调用模型。
+     */
+    public static final class QueryPort implements KnowledgeQueryEmbeddingPort {
+
+        @Override
+        public float[] embedQuery(String query, EmbeddingDescriptor descriptor) {
+            throw disabled();
+        }
+    }
+
+    /**
+     * 关闭状态下的向量检索端口（RAG 4/6）：任何调用都被拒绝，绝不访问向量表。
+     *
+     * <p>默认环境（H2）没有 pgvector，也不应该有人绕过用例服务直接调用检索端口；
+     * 用占位实现替换真实适配器，可以让「未启用向量化」这条边界在装配层就封闭。</p>
+     */
+    public static final class Search implements KnowledgeVectorSearchPort {
+
+        @Override
+        public List<KnowledgeVectorMatch> search(KnowledgeQueryEmbedding queryEmbedding, double minScore,
+                int topK) {
 
             throw disabled();
         }

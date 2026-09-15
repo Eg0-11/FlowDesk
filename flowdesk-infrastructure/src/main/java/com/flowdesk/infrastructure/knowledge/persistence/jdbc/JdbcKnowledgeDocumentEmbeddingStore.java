@@ -298,8 +298,10 @@ public final class JdbcKnowledgeDocumentEmbeddingStore implements KnowledgeDocum
     /**
      * 把向量序列化为 pgvector 字面量（{@code [0.1,0.2,...]}）。
      *
-     * <p>序列化前再次校验有限性与维度：这是「数值进入 SQL 之前」的最后一道闸门，
-     * {@code NaN}/{@code Infinity} 会让 pgvector 报类型错误或写入无意义的值。</p>
+     * <p>序列化主体已经提取为包内共享工具 {@link PgVectorLiteral}（RAG 4/6 的查询路径
+     * 需要产生完全相同的表示）。这里保留写入路径原有的两道语义：维度不符与
+     * 非有限数值都以 {@code KNOWLEDGE_INTERNAL_ERROR} 抛出 —— 它们是<b>内部契约破坏</b>，
+     * 而不是调用方输入问题。</p>
      *
      * @param embedding 向量值对象
      * @return pgvector 字面量
@@ -309,19 +311,12 @@ public final class JdbcKnowledgeDocumentEmbeddingStore implements KnowledgeDocum
         if (vector.length != embedding.dimensions()) {
             throw internalError("向量维度与描述符不一致");
         }
-        StringBuilder literal = new StringBuilder(vector.length * 12 + 2);
-        literal.append('[');
-        for (int index = 0; index < vector.length; index++) {
-            float value = vector[index];
-            if (Float.isNaN(value) || Float.isInfinite(value)) {
-                throw internalError("向量必须全部是有限数值");
-            }
-            if (index > 0) {
-                literal.append(',');
-            }
-            literal.append(Float.toString(value));
+        try {
+            return PgVectorLiteral.serialize(vector);
         }
-        return literal.append(']').toString();
+        catch (IllegalArgumentException ex) {
+            throw internalError("向量必须全部是有限数值");
+        }
     }
 
     private CurrentRow lockDocument(KnowledgeDocumentId documentId) {

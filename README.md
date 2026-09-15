@@ -1,6 +1,6 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0010-R3 —— 统一 Embedding 顺序契约并清理过期阶段说明（文档与注释修订，已完成）**
+> **当前阶段：FD-0011 —— Query Embedding、pgvector 相似度检索与可审计引用结果（RAG 4/6，已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
@@ -12,9 +12,10 @@
 > 切片向量化（DashScope text-embedding-v4）+ pgvector 原子落库 + 索引状态机（FD-0010）、
 > 索引链路修订（Key fail-fast、按 index 归位、关闭依赖库正文日志、失败码贯通、真正的 JDBC 批处理）（FD-0010-R1）、
 > provider 血缘校验与文档契约修正（只允许规范值 `dashscope`、Key 优先级改为模态级优先、失败码措辞不再绝对化）（FD-0010-R2）、
-> 顺序契约统一与过期阶段说明清理（协议层归位 vs 持久化层拒绝错配，纯文档修订）（FD-0010-R3）。
-> 尚未实现：向量相似度检索与 RAG 检索增强（含 Query Embedding 与 Rerank）、切片内容的公开读取接口、
-> 文档列表/下载/删除、孤立文件清理任务、`PARSING`/`INDEXING` 悬挂的恢复扫描、
+> 顺序契约统一与过期阶段说明清理（协议层归位 vs 持久化层拒绝错配，纯文档修订）（FD-0010-R3）、
+> 知识检索（Query Embedding + pgvector 余弦检索 + 稳定引用编号）（FD-0011）。
+> 尚未实现：Rerank、全文检索与混合检索、基于检索结果的答案生成、
+> 任意切片读取接口、文档列表/下载/删除、孤立文件清理任务、`PARSING`/`INDEXING` 悬挂的恢复扫描、
 > 游标分页、PostgreSQL 全文检索与 pg_trgm、MCP 能力、Agent Graph、鉴权与前端。
 
 ## 一、项目简介
@@ -22,13 +23,14 @@
 FlowDesk 面向企业 IT 服务与运营场景，规划能力包括：智能化工单流转、知识库运营、RAG 检索增强、
 Tool 调用、MCP 资产/监控服务以及基于 Agent Graph 的自动化编排。
 
-当前仓库已经完成五件事：一是打通的 AI 垂直链路
+当前仓库已经完成六件事：一是打通的 AI 垂直链路
 （**HTTP → 用例 → Agent 编排 → Spring AI ChatClient → DeepSeek（OpenAI 兼容传输）→
 本地只读工具 → 模型汇总 → HTTP 响应**），二是纯 Java 的工单领域核心
 （工单聚合与生命周期状态机）与完整的工单 REST 链路（ETag 乐观并发、分页与条件搜索），
 三是知识文档的**安全上传链路**（流式落盘、内容键与路径收敛、失败补偿），
 四是文档的**解析与确定性切片**（真实 PDF/DOCX/Markdown/TXT → 纯文本 → 确定性切片 → 原子落库），
 五是切片**向量化与 pgvector 落库**（分批调用 DashScope text-embedding-v4 → 校验 → 单事务替换向量并推进为 INDEXED），
+六是**知识检索**（Query Embedding（textType=query）→ pgvector 余弦检索 → 稳定引用编号 K1、K2……），
 并保留了清晰的模块边界、单向依赖方向与统一的版本基线。
 
 ## 二、模块职责
@@ -36,11 +38,11 @@ Tool 调用、MCP 资产/监控服务以及基于 Agent Graph 的自动化编排
 | 模块 | 职责 | 当前状态 |
 | --- | --- | --- |
 | `flowdesk-shared` | 通用异常、基础类型、工具类 | 仅模块与 `package-info.java` |
-| `flowdesk-domain` | 领域实体、值对象、领域规则（**不依赖 Spring**） | 已实现工单聚合与生命周期状态机（`com.flowdesk.domain.ticket`）、知识文档聚合与解析/索引状态机、切片与向量不变量（`com.flowdesk.domain.knowledge`） |
-| `flowdesk-application` | 用例服务、输入输出端口 | 已实现 AI 用例（`…application.ai`）、工单用例 + 乐观并发契约（`…application.ticket`）、知识文档上传/查询/解析/索引用例与端口（`…application.knowledge`，含 `KnowledgeEmbeddingPort`） |
+| `flowdesk-domain` | 领域实体、值对象、领域规则（**不依赖 Spring**） | 已实现工单聚合与生命周期状态机（`com.flowdesk.domain.ticket`）、知识文档聚合与解析/索引状态机、切片与向量不变量、查询向量（`com.flowdesk.domain.knowledge`） |
+| `flowdesk-application` | 用例服务、输入输出端口 | 已实现 AI 用例（`…application.ai`）、工单用例 + 乐观并发契约（`…application.ticket`）、知识文档上传/查询/解析/索引用例与端口（`…application.knowledge`，含 `KnowledgeEmbeddingPort`）、知识检索用例与端口（`…application.knowledge`，含 `KnowledgeQueryEmbeddingPort` 与 `KnowledgeVectorSearchPort`） |
 | `flowdesk-agent` | AI 编排：实现 application 的 AI 用例，用 ChatClient 编排提示词与本地工具 | 已实现普通聊天与工具冒烟 |
-| `flowdesk-infrastructure` | 持久化与模型适配器 | 已提供 JDBC 工单存储（`…ticket.persistence.jdbc`）、DeepSeek 传输适配，以及知识文档的 JDBC 存储、本地文件系统内容读写、Tika 解析适配器、确定性切片器、DashScope Embedding 适配器与 pgvector 向量存储适配器（`…knowledge.*`） |
-| `flowdesk-bootstrap` | FlowDesk 主服务启动模块（Web + Validation + Actuator + AI 接口 + 工单 REST 接口 + 知识文档 REST 接口） | 可启动，端口 8080 |
+| `flowdesk-infrastructure` | 持久化与模型适配器 | 已提供 JDBC 工单存储（`…ticket.persistence.jdbc`）、DeepSeek 传输适配，以及知识文档的 JDBC 存储、本地文件系统内容读写、Tika 解析适配器、确定性切片器、DashScope 文档/查询 Embedding 适配器、pgvector 向量写入与相似度检索适配器（`…knowledge.*`） |
+| `flowdesk-bootstrap` | FlowDesk 主服务启动模块（Web + Validation + Actuator + AI 接口 + 工单 REST 接口 + 知识文档 REST 接口 + 知识检索接口） | 可启动，端口 8080 |
 | `flowdesk-mcp-asset` | 独立资产 MCP 服务（Web + Actuator） | 可启动，端口 8091 |
 | `flowdesk-mcp-monitoring` | 独立监控 MCP 服务（Web + Actuator） | 可启动，端口 8092 |
 
@@ -710,6 +712,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0010-R1 | 索引链路修订：Key fail-fast、按 index 归位、依赖库日志关闭、failureCode 贯通、真实 JDBC 批处理 | ✅ 已完成 |
 | FD-0010-R2 | provider 血缘校验（只允许规范值 dashscope）、Key 优先级说明修正、失败码契约措辞修正 | ✅ 已完成 |
 | FD-0010-R3 | 统一 Embedding 顺序契约（协议层归位 vs 持久化层拒绝错配）、清理过期阶段说明 | ✅ 已完成（仅文档与注释） |
+| FD-0011 | Query Embedding、pgvector 相似度检索与可审计引用结果（RAG 4/6） | ✅ 已完成 |
 | 后续 | RAG 4/6：向量检索与引用结果 | 未开始 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm` | 未开始 |
 | 后续 | RAG：检索增强生成（含 Query Embedding 与 Rerank） | 未开始 |
@@ -723,9 +726,10 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | 项 | 状态 | 含义 |
 | --- | --- | --- |
 | H2 集成 / HTTP 集成 | ✅ 已执行 | 真实 Spring 上下文、真实 JDBC、真实 Flyway 迁移（H2 执行 V1~V5；V6 为 PostgreSQL 专用 pgvector 迁移）、真实并发线程、真实文件系统、真实 multipart 上传，以及真实 PDF/DOCX 解析（夹具按规范现场生成） |
-| 本地 smoke（默认 profile） | ✅ 已执行 | 真实进程 + 真实 HTTP：multipart 上传、存储目录落盘校验（FD-0008）、文档解析与状态推进、伪装 XLSX/普通 ZIP 被拒（FD-0009 / R1）；向量化在默认环境关闭，索引接口 503（FD-0010） |
+| 本地 smoke（默认 profile） | ✅ 已执行 | 真实进程 + 真实 HTTP：multipart 上传、存储目录落盘校验（FD-0008）、文档解析与状态推进、伪装 XLSX/普通 ZIP 被拒（FD-0009 / R1）；向量化在默认环境关闭，索引接口 503（FD-0010）；**检索接口在同一进程返回 503 且不需要任何 Key**（FD-0011） |
 | 索引链路修订证据（FD-0010-R1 / R2） | ✅ 已执行 | 真实嵌套 Spring 上下文：缺失/空/纯空白 Key 均启动失败、`provider` 非规范值（含 `openai`/大小写变体/前后空格）在创建适配器之前启动失败、假 Key 与 `postgres,deepseek,dashscope-embedding` 组合可完成装配（不经真实数据库与模型）；真实 `DashScopeEmbeddingModel` 指向未监听的本机端口，证明关闭 logger 后切片正文不进入日志（并把 logger 临时打开做反证）；H2 影子表上观测到真实的 `addBatch`/`executeBatch`（无逐条 `executeUpdate`）与跨批次回滚；8 线程真实竞争下只有一个请求进入 `INDEXING` |
-| PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证**；pgvector 集成测试（Testcontainers，镜像固定为带扩展版本的 `pgvector/pgvector:0.8.6-pg16`）在无 Docker 时跳过，报告标注 POSTGRESQL_PGVECTOR_IT=NOT_RUN |
+| 检索链路证据（FD-0011） | ✅ 已执行 | 真实 Spring 上下文 + 真实 HTTP：完整成功 JSON、空 citations、非法字段 400（固定 detail）、上游失败 502、内部失败 500、415/406/坏 JSON、响应不含 query/向量/SQL/异常；真实用例服务上验证「先模型后数据库」「非法输入零端口调用」「关闭状态零模型零数据库」；JDBC 替身上验证 SQL 原样下发与 11 个参数绑定顺序；`PgVectorLiteral` 在土耳其语/德语 Locale 下仍输出点号小数点 |
+| PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证**；pgvector 集成测试（Testcontainers，镜像固定为带扩展版本的 `pgvector/pgvector:0.8.6-pg16`）在无 Docker 时跳过（当前跳过 26 条：15 条索引写入 + 11 条相似度检索），报告标注 POSTGRESQL_PGVECTOR_IT=NOT_RUN |
 | 真实 DashScope Embedding | ⚠️ **DASHSCOPE_LIVE=NOT_RUN** | 无 DASHSCOPE_API_KEY，**未对真实向量服务发起过任何请求**；全部自动化测试都不访问真实上游 |
 | 真实 DeepSeek | ⚠️ **LIVE_SMOKE=NOT_RUN** | 无 `DEEPSEEK_API_KEY`，**未对真实模型发起过任何请求** |
 
@@ -868,8 +872,9 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 
 本阶段把「已上传的原始文件」变成「可用的纯文本切片」：
 读取原文 → 安全解析 PDF/DOCX/MD/TXT → 规范化 → 确定性切片 → 原子保存 → 状态更新。
-**不做** Embedding、向量库、检索增强，也**没有**读取切片内容的公开接口：切片内容只在服务端
-索引/检索链路内流转（向量化已由 RAG 3/6 实现，见第十七章），不通过任何 HTTP 接口公开。
+**不做** Embedding、向量库、检索增强，也**没有**「按 documentId + chunkIndex 直接读取切片」的接口：
+切片内容只在服务端索引/检索链路内流转（向量化见第十七章，检索见第十八章）——
+检索接口会返回**命中片段**，但只返回受 `topK` 与 `minScore` 限制的那几条。
 
 ### 16.1 接口表
 
@@ -1289,7 +1294,7 @@ CREATE INDEX … USING hnsw (embedding vector_cosine_ops);
 | --- | --- | --- |
 | 1 | `KnowledgeEmbeddingPort` Javadoc 写成「不做按索引字段重排，上游错序就应当失败」，与 R1 之后按 `Embedding.getIndex()` 归位的实现相反 | 端口契约改为「返回列表与输入文本一一对应、且**已恢复为请求顺序**」，并写明**基础设施适配器可以并且应该**按供应商声明的稳定 `index` 归位；这属于**协议映射**而非猜测；非法 index 与数量不符必须拒绝；业务合法性（数量/维度/NaN/Infinity/全零）仍由应用层统一校验 |
 | 2 | README 17.6 与 ADR 0007 笼统写「不做任何纠错／不按位置重排」，与适配器行为模糊冲突 | 明确**两层语义**：协议层（适配器）按 `index` 把原始响应归位；持久化层（`JdbcKnowledgeDocumentEmbeddingStore`）对已绑定的 `(documentId, chunkIndex, chunkSha256, vector)` **不**重排、**不**补号、只拒绝错配。ADR 内不再有互相矛盾的结论（并记录了原文为什么矛盾） |
-| 3 | 过期阶段说明：把已完成的向量化写成「下一阶段/将来」 | `flowdesk-domain/package-info.java`、`KnowledgeDocumentChunk`、`ParsedDocumentResponse`、`DocumentChunker`、`KnowledgeDocumentChunkStore`、解析接口断言说明与 README 对应段落全部更正；**检索增强（RAG 4/6）仍然是未来能力**，相关表述保留并写明阶段名 |
+| 3 | 过期阶段说明：把已完成的向量化写成「下一阶段/将来」 | `flowdesk-domain/package-info.java`、`KnowledgeDocumentChunk`、`ParsedDocumentResponse`、`DocumentChunker`、`KnowledgeDocumentChunkStore`、解析接口断言说明与 README 对应段落全部更正；尚未交付的能力（截至当时含检索增强）保留表述并写明阶段名 —— 检索增强现已由 FD-0011 交付（RAG 4/6，见第十八章），**Rerank 与答案生成仍未实现** |
 
 **为什么 Key 校验要读真实值**：DashScope 的自动配置条件是
 `@ConditionalOnProperty(name = "spring.ai.model.embedding", havingValue = "dashscope", matchIfMissing = true)`，
@@ -1306,3 +1311,142 @@ CREATE INDEX … USING hnsw (embedding vector_cosine_ops);
 
 **为什么 `null`/空白 Key 也必须失败**：它们会让每一次索引都以 401/403 收场，
 表现为「每次索引都 502」，比起动失败难排查得多。
+
+## 十八、知识检索：Query Embedding 与 pgvector 相似度检索（RAG 4/6）
+
+设计取舍见 [`docs/adr/0008-query-embedding-and-pgvector-similarity-search.md`](docs/adr/0008-query-embedding-and-pgvector-similarity-search.md)。
+
+本阶段把「用户问题」变成「可审计的引用结果」：
+**规范化问题 → 生成查询向量（textType=query）→ pgvector 余弦检索 → 结果契约校验 → 引用编号 K1、K2……**。
+**不做**：调用 DeepSeek Chat、生成自然语言答案、Rerank、全文/混合检索、接入 Agent/MCP、
+修改任何文档状态或向量。
+
+### 18.1 完整链路与固定时序
+
+```
+POST /api/v1/knowledge/search
+  └─ ① 校验并规范化 query（NFC → strip → 判空 → code point 上限 → 拒绝 ISO 控制字符）
+      ② 解析 topK / minScore（套用配置默认值，校验范围）
+      ③ 开关检查：未启用向量化 → 503（不调用模型、不访问向量表）
+      ④ 查询向量：DashScopeQueryEmbeddingAdapter（一次请求一个 query，textType=query）
+      ⑤ 领域校验：KnowledgeQueryEmbedding（1024 维、有限、非全零、防御性复制）
+      ⑥ 相似度检索：JdbcKnowledgeVectorSearchAdapter（一条只读 SQL，只检索 INDEXED）
+      ⑦ 结果校验：条数 ≤ topK、分数 ∈ [0,1] 且 ≥ minScore、顺序与去重（违反即 500，不修正）
+      ⑧ 引用编号：按最终顺序生成 K1、K2……与 rank 1、2……
+```
+
+- ④ 发生在**任何 SQL 之前**，且不持有数据库连接；
+- ⑥ 是**单条只读语句**：不开显式事务、不加 `FOR UPDATE`、不写任何表；
+- ⑦ 只**校验**，不排序、不去重、不截断：违反契约一律按内部错误失败，
+  避免把「适配器坏了」掩饰成「结果看起来正常」。
+
+### 18.2 接口与示例
+
+| 方法 | 路径 | 请求 | 成功响应 |
+| --- | --- | --- | --- |
+| POST | `/api/v1/knowledge/search` | `application/json`：`query`（必填）、`topK`、`minScore` | 200 OK + 检索结果 |
+
+```powershell
+curl.exe -s -X POST http://localhost:8080/api/v1/knowledge/search `
+  -H "Content-Type: application/json" `
+  -d '{\"query\":\"VPN 无法连接应该如何处理？\",\"topK\":5,\"minScore\":0.30}'
+```
+
+```json
+{
+  "provider": "dashscope",
+  "model": "text-embedding-v4",
+  "dimensions": 1024,
+  "topK": 5,
+  "minScore": 0.30,
+  "citations": [
+    {
+      "citationId": "K1",
+      "rank": 1,
+      "documentId": "4fac368c-8d3f-4a4e-9b1f-6f0b1f2a77aa",
+      "documentVersion": 4,
+      "documentTitle": "VPN 故障处理手册",
+      "chunkIndex": 2,
+      "chunkSha256": "9f2c…（64 位小写十六进制）",
+      "content": "第一步：检查隧道状态，确认预共享密钥未过期",
+      "score": 0.873421
+    }
+  ]
+}
+```
+
+请求参数规则：
+
+| 字段 | 规则 |
+| --- | --- |
+| `query` | 必填；NFC 规范化后 `strip`；不能为空；最多 `max-query-code-points`（默认 2000）个 **code point**；拒绝 ISO 控制字符 |
+| `topK` | 可选，默认 `default-top-k`（5）；必须在 `1..max-top-k`（默认 20）之间 |
+| `minScore` | 可选，默认 `default-min-score`（0.30）；必须是 `0.0..1.0` 的**有限**数值（含边界） |
+
+响应约束：`citationId` 按最终顺序为 `K1`、`K2`……，`rank` 从 1 连续递增；
+**不回显 query**、不含向量、不含 SQL；无命中时返回 200 与空 `citations`（不是 404）。
+
+### 18.3 错误矩阵
+
+| 场景 | HTTP | code |
+| --- | --- | --- |
+| query 缺失/空白/超长/含控制字符，topK 或 minScore 越界 | 400 | `INVALID_REQUEST`（detail 固定为「检索请求不合法」） |
+| 默认环境未启用向量化 | 503 | `KNOWLEDGE_EMBEDDING_DISABLED` |
+| 上游超时、限流、连接失败、5xx | 502 | `EMBEDDING_PROVIDER_ERROR` |
+| 模型响应结构非法 / 查询向量非法 / 数据库检索失败 / 结果契约被破坏 | 500 | `INTERNAL_SERVER_ERROR` |
+| `Content-Type` 不受支持 / `Accept` 无法满足 / 请求体无法解析 | 415 / 406 / 400 | `UNSUPPORTED_MEDIA_TYPE` / `NOT_ACCEPTABLE` / `INVALID_REQUEST` |
+
+检索是**只读**的：不修改文档版本、状态、失败码或任何向量，因此响应里**没有** `failureCode`。
+
+### 18.4 检索 SQL 的过滤、排序与绑定
+
+`KnowledgeRetrievalSql.SELECT_MATCHES` 是一条只读 SQL，逐条满足：
+
+1. `d.status = 'INDEXED'`：只检索已索引文档；
+2. 描述符**精确匹配**：文档行与向量行的 `provider/model/dimensions` 都必须等于当前配置
+   （换模型之后的历史向量不会被误用）；
+3. `JOIN knowledge_document_chunks`：`document_id` 与 `chunk_index` 相等，
+   且 `c.sha256 = e.chunk_sha256`（摘要不符说明切片在写入向量之后被换过，必须排除）；
+4. 相似度 `1 - (e.embedding <=> ?::vector)`；
+5. 阈值过滤 `>= ?`（含边界）；
+6. 排序 `ORDER BY e.embedding <=> ?::vector ASC, e.document_id ASC, e.chunk_index ASC`：
+   **距离是第一排序键**（这样 HNSW `vector_cosine_ops` 索引才可用），
+   tie-break 保证同分时顺序确定；
+7. `LIMIT ?` 绑定经过校验的 topK；
+8. 11 个参数全部是占位符绑定：查询向量 3 次（相似度、阈值、排序）、
+   描述符 3+3 次（文档行与向量行）、阈值 1 次、topK 1 次；**没有任何字符串拼接**；
+9. 没有 `FOR UPDATE`、没有任何写语句、不开启跨模型调用的事务；
+10. **不**写成 `ORDER BY (1 - distance) DESC` —— 那会让 pgvector 退化成全表扫描加排序。
+
+向量字面量由写入与查询**共用**的 `PgVectorLiteral` 生成（`[0.1,0.2,…]`，Locale 无关，
+只输出有限数值），保证同一个数值在两条语句里被解析成同一个向量。
+
+### 18.5 配置
+
+```yaml
+flowdesk:
+  knowledge:
+    retrieval:
+      max-query-code-points: 2000   # 单个 query 的 code point 上限
+      default-top-k: 5              # topK 默认值
+      max-top-k: 20                 # topK 上限（请求只能更小）
+      default-min-score: 0.30       # 相似度阈值默认值
+```
+
+装配期校验：`1 <= default-top-k <= max-top-k <= 50`；`default-min-score` 必须是 `0..1` 的
+有限数值；`max-query-code-points` 必须在合理正数范围内。应用服务只接收纯 Java 数值。
+
+默认 profile（H2、未启用向量化）仍然**零依赖启动**：检索用例与接口都装配好了，
+有效请求得到 503；真实检索需要 `--spring.profiles.active=postgres,dashscope-embedding`。
+
+### 18.6 已知边界
+
+1. **无 Rerank**：只按向量相似度排序，没有重排兜底；
+2. **无混合检索**：没有 BM25 / 全文检索 / `pg_trgm` 融合，纯向量召回；
+3. **不生成答案**：只返回引用片段，不调用 Chat 模型；
+4. **没有任意切片读取接口**：切片只能通过检索返回，且受 `topK` 与 `minScore` 限制；
+5. **HNSW + 过滤是后过滤**：带过滤条件的索引扫描可能返回少于实际匹配数的行
+   （`iterative scan` / 调高 `ef_search` 未启用，也未做规模压测）；
+6. **没有分页**：单次最多 `max-top-k` 条，不提供游标翻页；
+7. **真实上游与真实数据库**：`DASHSCOPE_LIVE=NOT_RUN`、`POSTGRESQL_PGVECTOR_IT=NOT_RUN`
+   （本机没有 Key、没有 PostgreSQL 与 Docker），pgvector 断言由 Testcontainers 覆盖，无 Docker 时跳过。

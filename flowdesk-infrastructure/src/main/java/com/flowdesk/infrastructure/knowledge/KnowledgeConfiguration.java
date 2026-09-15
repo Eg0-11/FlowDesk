@@ -9,10 +9,13 @@ import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentEmbeddingSto
 import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentIdGenerator;
 import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentRepository;
 import com.flowdesk.application.knowledge.port.out.KnowledgeEmbeddingPort;
+import com.flowdesk.application.knowledge.port.out.KnowledgeQueryEmbeddingPort;
 import com.flowdesk.application.knowledge.port.out.KnowledgeTimeProvider;
+import com.flowdesk.application.knowledge.port.out.KnowledgeVectorSearchPort;
 import com.flowdesk.infrastructure.knowledge.chunking.DeterministicDocumentChunker;
 import com.flowdesk.infrastructure.knowledge.chunking.KnowledgeChunkingProperties;
 import com.flowdesk.infrastructure.knowledge.embedding.DashScopeKnowledgeEmbeddingAdapter;
+import com.flowdesk.infrastructure.knowledge.embedding.DashScopeKnowledgeQueryEmbeddingAdapter;
 import com.flowdesk.infrastructure.knowledge.embedding.DisabledKnowledgeEmbedding;
 import com.flowdesk.infrastructure.knowledge.embedding.KnowledgeEmbeddingConfigurationValidator;
 import com.flowdesk.infrastructure.knowledge.embedding.KnowledgeEmbeddingProperties;
@@ -20,6 +23,8 @@ import com.flowdesk.infrastructure.knowledge.parsing.TikaDocumentTextParser;
 import com.flowdesk.infrastructure.knowledge.persistence.jdbc.JdbcKnowledgeDocumentChunkStore;
 import com.flowdesk.infrastructure.knowledge.persistence.jdbc.JdbcKnowledgeDocumentEmbeddingStore;
 import com.flowdesk.infrastructure.knowledge.persistence.jdbc.JdbcKnowledgeDocumentRepository;
+import com.flowdesk.infrastructure.knowledge.persistence.jdbc.JdbcKnowledgeVectorSearchAdapter;
+import com.flowdesk.infrastructure.knowledge.retrieval.KnowledgeRetrievalProperties;
 import com.flowdesk.infrastructure.knowledge.storage.LocalFileSystemKnowledgeContentStore;
 import com.flowdesk.infrastructure.knowledge.support.SystemKnowledgeTimeProvider;
 import com.flowdesk.infrastructure.knowledge.support.UuidKnowledgeDocumentIdGenerator;
@@ -59,7 +64,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  */
 @Configuration(proxyBeanMethods = false)
 @EnableConfigurationProperties({ KnowledgeUploadProperties.class, KnowledgeStorageProperties.class,
-        KnowledgeChunkingProperties.class, KnowledgeEmbeddingProperties.class })
+        KnowledgeChunkingProperties.class, KnowledgeEmbeddingProperties.class,
+        KnowledgeRetrievalProperties.class })
 public class KnowledgeConfiguration {
 
     /**
@@ -200,6 +206,69 @@ public class KnowledgeConfiguration {
         }
         return new JdbcKnowledgeDocumentEmbeddingStore(jdbcClient, dataSource, knowledgeWriteTransactions,
                 documentRepository);
+    }
+
+    /**
+     * 查询向量生成端口（RAG 4/6）。
+     *
+     * <p>与文档侧端口复用同一个 {@code EmbeddingModel} Bean 与同一份描述符，
+     * 但用<b>独立类型</b>把 {@code textType=query} 语义固化下来；关闭时用占位实现，
+     * 这样默认环境仍然装配得出检索用例（有效请求返回 503，而不是「Bean 缺失」）。</p>
+     *
+     * @param embedding      向量化配置
+     * @param embeddingModel EmbeddingModel 提供者（关闭时通常为空）
+     * @param environment    配置环境（用于读取 DashScope 连接属性中的真实 Key）
+     * @return 查询向量生成端口
+     */
+    @Bean
+    public KnowledgeQueryEmbeddingPort knowledgeQueryEmbeddingPort(KnowledgeEmbeddingProperties embedding,
+            ObjectProvider<EmbeddingModel> embeddingModel, Environment environment) {
+
+        if (!embedding.isEnabled()) {
+            return new DisabledKnowledgeEmbedding.QueryPort();
+        }
+        KnowledgeEmbeddingConfigurationValidator.requireSupportedProvider(embedding);
+        KnowledgeEmbeddingConfigurationValidator.requireDashScopeApiKey(embedding, environment);
+        EmbeddingModel model = embeddingModel.getIfAvailable();
+        if (model == null) {
+            throw new IllegalStateException("已启用文档向量化，但没有可用的 EmbeddingModel："
+                    + "请同时启用 dashscope-embedding profile 并配置 DASHSCOPE_API_KEY");
+        }
+        return new DashScopeKnowledgeQueryEmbeddingAdapter(model);
+    }
+
+    /**
+     * 向量检索端口（RAG 4/6）：pgvector 只读相似度检索。
+     *
+     * <p>关闭向量化时用占位实现：默认环境没有 pgvector，也不应该有人绕过用例服务访问向量表。</p>
+     *
+     * @param jdbcClient JDBC 客户端
+     * @param embedding  向量化配置（关闭时返回占位实现）
+     * @return 向量检索端口
+     */
+    @Bean
+    public KnowledgeVectorSearchPort knowledgeVectorSearchPort(JdbcClient jdbcClient,
+            KnowledgeEmbeddingProperties embedding) {
+
+        if (!embedding.isEnabled()) {
+            return new DisabledKnowledgeEmbedding.Search();
+        }
+        return new JdbcKnowledgeVectorSearchAdapter(jdbcClient);
+    }
+
+    /**
+     * 启动期校验检索配置（RAG 4/6）。
+     *
+     * <p>Bean 在装配阶段创建，因此非法配置（topK 区间颠倒、阈值越界、query 上限为 0 等）
+     * 会让应用<b>启动失败</b>，而不是等到某次检索才在运行期暴露。</p>
+     *
+     * @param retrieval 检索配置
+     * @return 校验通过标记
+     */
+    @Bean
+    public Boolean knowledgeRetrievalConsistency(KnowledgeRetrievalProperties retrieval) {
+        retrieval.validate();
+        return Boolean.TRUE;
     }
 
     /**
