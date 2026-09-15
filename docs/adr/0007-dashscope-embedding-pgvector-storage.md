@@ -159,8 +159,53 @@ knowledge_document_chunk_embeddings (
 - 「版本冲突不写失败态」是刻意的：说明文档已经被别人改过，当前请求无权给它盖失败戳。
 - 失败码是**稳定枚举**（`KnowledgeIndexFailureCode`）：上游响应体、SQL、路径与密钥
   绝不进入数据库或响应；响应里额外返回 `failureCode` 供调用方分支。
-- **数据库里持久化的 `index_failure_code` 与响应里的 `failureCode` 永远是同一个值**
-  （FD-0010-R1 修正）：否则运维看到的失败原因与重试依据会互相矛盾。
+- **数据库 `index_failure_code` 与响应 `failureCode` 的关系（FD-0010-R2 修正措辞）**：
+  只有在「成功领取索引且补偿 CAS 成功」时两者才是同一个值；补偿 CAS 失败时数据库可能仍是
+  `INDEXING`（或已被并发改动），而根异常与响应里的 `failureCode` 保持不变、补偿异常只作为
+  suppressed；领取之前的读取/存储失败不写失败态（文档还没被领取，不存在可安全持久化的
+  `INDEX_FAILED`）；版本冲突 / 状态冲突 / 文档不存在仍不得写失败态。
+  **不再宣称两者「永远一致」** —— 补偿本身是一次可能失败的写操作。
+
+## 修订（FD-0010-R2）：provider 血缘、Key 优先级与契约措辞
+
+### 1. provider 是血缘字段，只允许规范值 `dashscope`
+
+- **根因**：本版本只有 `DashScopeKnowledgeEmbeddingAdapter` 一个向量适配器，而
+  `flowdesk.knowledge.embedding.provider` 是**会被持久化**的字段
+  （`knowledge_documents.embedding_provider` 与向量表的 `provider` 列）。此前把
+  `provider` 只当作「非空字符串」，于是 `provider=openai` 也能启动：**实际由 DashScope 生成向量，
+  却把来源写成 openai**，检索阶段据此判断来源时会得到错误结论，而且不会有任何报错。
+- **决策**：启用状态下 `provider` 必须**逐字**等于 `dashscope`：
+  - `null`、空串、纯空白、`openai`、`DashScope`（大小写变体）、`" dashscope "`（前后空格）全部启动失败；
+  - **不** trim、**不**做大小写归一：静默纠正会让配置文件里写的与实际生效（并被持久化）的不一致，
+    那正是血缘错配的来源。
+- **放置位置**：`KnowledgeEmbeddingConfigurationValidator.requireSupportedProvider(...)`，
+  由**所有会创建适配器的装配路径**共同调用（启动期校验 Bean 与 `knowledgeEmbeddingPort`），
+  因此无论容器以什么顺序装配 Bean，provider 不受支持时都**不会**创建
+  `DashScopeKnowledgeEmbeddingAdapter`；`knowledgeEmbeddingPort` 在解析 `EmbeddingModel`
+  与构造适配器之前就抛出。
+- **错误信息**：只说明「当前版本只支持 dashscope」，**不回显**原始 provider，也不含 Key、
+  URL、用户名或密码。
+- **开关关闭时不做该检查**：此时 provider 只是一个不会被使用的字段，保持既有行为
+  （默认 profile 与仅 deepseek profile 的启动行为不变）。
+
+### 2. DashScope Key 的优先级：模态级优先、通用兜底
+
+- **修正**：FD-0010-R1 的文档与代码写成了「通用属性优先、模态属性兜底」，与依赖 1.1.2.2 的
+  真实行为相反。`DashScopeConnectionUtils.resolveConnectionProperties(common, model, taskName)`
+  的实际顺序是 **`model`（模态级）优先**：先取 `spring.ai.dashscope.embedding.api-key`，
+  只在它没有文本时才回退 `spring.ai.dashscope.api-key`（`base-url` / `workspace-id` 同理）。
+- 只有在选出的配置值为 `null` 时，依赖库才会尝试 `AI_DASHSCOPE_API_KEY` 环境变量；
+  **本项目不承认这条来源**：profile 把通用属性绑定为 `${DASHSCOPE_API_KEY:}`，
+  未设置时是空串（本就不会触发该回退），而空值由项目校验器直接拒绝 ——
+  「Key 从哪来」必须是启动期校验能确定性看到的事实。
+- 代码与文档已同步修正，并有一个直接断言优先级方向的单元测试
+  （`resolveApiKey` 在两条都配置时返回模态级的值）。
+
+### 3. 失败码一致性的措辞修正
+
+见上文「失败语义与补偿」最后一条：不再宣称数据库与响应「永远一致」，
+改为按「补偿成功 / 补偿失败 / 领取之前 / 冲突类」四种情形分别陈述。
 
 ## 修订（FD-0010-R1）：五个缺口的处理与理由
 
@@ -177,8 +222,8 @@ FD-0010 交付后复核出五个缺口，下面记录每一项的根因与取舍
   `KnowledgeEmbeddingConfigurationValidator.requireDashScopeApiKey(...)` 读**真实配置值**并拒绝
   缺失、空字符串与纯空白。带空默认值而不是不带，是因为：不带默认值时失败发生在占位符解析，
   信息是 Spring 的 `Could not resolve placeholder`，而且无法区分「没配」与「配了空白」。
-- **只承认一条 Key 来源**（`spring.ai.dashscope.api-key`，回退
-  `spring.ai.dashscope.embedding.api-key`，顺序与 starter 的 `DashScopeConnectionUtils` 一致），
+- **只承认一条 Key 来源**（模态级 `spring.ai.dashscope.embedding.api-key` 优先，
+  通用 `spring.ai.dashscope.api-key` 兜底 —— **顺序见 R2 §2 的修正**），
   刻意**不**读取 starter 额外支持的 `AI_DASHSCOPE_API_KEY` 环境变量：
   「Key 从哪来」必须是启动期校验能确定性看到的事实，否则同一份配置在开发机（恰好导出过该变量）
   与 CI 上会得到不同结论 —— 那正是「清掉 Key 之后应用仍然启动」这类问题的温床。
@@ -233,8 +278,10 @@ FD-0010 交付后复核出五个缺口，下面记录每一项的根因与取舍
      非预期的运行时异常用兜底失败码（模型阶段 `EMBEDDING_PROVIDER_FAILURE`、
      完成阶段 `VECTOR_STORAGE_FAILURE`）包装；
   4. 版本冲突 / 状态不允许索引 / 文档不存在仍然原样上抛 412 / 409 / 404，且**不写失败态**。
-- 结果：索引路径上的 5xx **一定**带 `failureCode`，且与数据库里持久化的
-  `index_failure_code` 完全一致。
+- 结果（FD-0010-R2 修正措辞，不再宣称绝对一致）：**补偿 CAS 成功时**，索引路径上的 5xx
+  一定带 `failureCode`，且与数据库里的 `index_failure_code` 是同值；**补偿 CAS 失败**时，
+  根异常与 `failureCode` 不变、补偿异常只作为 suppressed，数据库可能仍是 `INDEXING`；
+  **领取之前**的失败不写失败态（也就没有 `failureCode` 可写）。
 
 ### 5. 真正的 JDBC 批处理
 

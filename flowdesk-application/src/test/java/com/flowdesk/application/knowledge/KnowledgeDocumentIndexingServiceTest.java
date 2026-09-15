@@ -344,18 +344,32 @@ class KnowledgeDocumentIndexingServiceTest {
     void aFailedCompensationIsAttachedAsSuppressedAndNeverReplacesTheRootCause() {
         parsedDocument(0L);
         this.chunkPages.serve(RecordingIndexingPorts.chunks(DOCUMENT_ID, 2));
-        this.embeddingPort.failEveryCallWith(RecordingIndexingPorts.providerFailure());
+        DocumentIndexingException providerFailure = RecordingIndexingPorts.providerFailure();
+        this.embeddingPort.failEveryCallWith(providerFailure);
         // 领取成功之后，补偿写库也失败
-        this.repository.failUpdateForStatus(KnowledgeDocumentStatus.INDEX_FAILED,
-                new IllegalStateException("补偿写库失败"));
+        IllegalStateException compensationFailure = new IllegalStateException("补偿写库失败");
+        this.repository.failUpdateForStatus(KnowledgeDocumentStatus.INDEX_FAILED, compensationFailure);
 
         RuntimeException thrown = capture(() -> this.service.index(command(0L)));
 
-        assertThat(thrown).isInstanceOf(DocumentIndexingException.class);
+        // ① 根异常原样保留（同一个实例），失败码不变
+        assertThat(thrown).as("根异常必须是端口抛出的那个实例，而不是被包装后的新对象")
+                .isSameAs(providerFailure);
         assertThat(((DocumentIndexingException) thrown).failureCode())
                 .isEqualTo(KnowledgeIndexFailureCode.EMBEDDING_PROVIDER_FAILURE);
-        assertThat(thrown.getSuppressed()).hasSize(1)
-                .allSatisfy(suppressed -> assertThat(suppressed).isInstanceOf(IllegalStateException.class));
+
+        // ② 补偿失败只作为 suppressed，且是原实例
+        assertThat(thrown.getSuppressed()).hasSize(1);
+        assertThat(thrown.getSuppressed()[0]).isSameAs(compensationFailure);
+
+        // ③ 不得伪造「数据库已持久化同一失败码」的结论：
+        //    唯一成功落库的是「领取」那次 CAS，补偿那次写入是被拒绝的，
+        //    因此数据库里可能仍是 INDEXING（或已被并发请求改动），没有任何失败码被写入。
+        assertThat(this.repository.committedUpdates())
+                .as("只有领取成功落库，补偿写库失败").isEqualTo(1);
+        assertThat(this.repository.lastUpdated().status())
+                .as("补偿尝试写入的是 INDEX_FAILED，但这次写入没有成功")
+                .isEqualTo(KnowledgeDocumentStatus.INDEX_FAILED);
     }
 
     @Test

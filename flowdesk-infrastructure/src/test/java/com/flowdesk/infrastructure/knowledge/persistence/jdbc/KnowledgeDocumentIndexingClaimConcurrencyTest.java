@@ -9,7 +9,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.flowdesk.application.knowledge.KnowledgeApplicationErrorCode;
 import com.flowdesk.application.knowledge.KnowledgeApplicationException;
 import com.flowdesk.application.knowledge.command.IndexKnowledgeDocumentCommand;
+import com.flowdesk.application.knowledge.index.DocumentIndexingException;
 import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentEmbeddingStore;
+import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentRepository;
 import com.flowdesk.application.knowledge.port.out.KnowledgeEmbeddingPort;
 import com.flowdesk.application.knowledge.port.out.VersionedKnowledgeDocument;
 import com.flowdesk.application.knowledge.service.KnowledgeDocumentIndexingService;
@@ -18,6 +20,8 @@ import com.flowdesk.domain.knowledge.EmbeddingDescriptor;
 import com.flowdesk.domain.knowledge.KnowledgeDocument;
 import com.flowdesk.domain.knowledge.KnowledgeDocumentChunkEmbedding;
 import com.flowdesk.domain.knowledge.KnowledgeDocumentId;
+import com.flowdesk.domain.knowledge.KnowledgeDocumentStatus;
+import com.flowdesk.domain.knowledge.KnowledgeIndexFailureCode;
 import com.flowdesk.infrastructure.knowledge.support.SystemKnowledgeTimeProvider;
 import java.time.Clock;
 import java.time.Instant;
@@ -151,6 +155,37 @@ class KnowledgeDocumentIndexingClaimConcurrencyTest {
         assertThat(versionOf(documentId)).isEqualTo(3L);
     }
 
+    @Test
+    void aFailedCompensationLeavesTheRowInIndexingWithoutPersistingAFailureCode() {
+        // FD-0010-R2 的准确契约：补偿 CAS 失败时，根异常与失败码不变、补偿异常只作为 suppressed，
+        // 而数据库可能仍是 INDEXING —— 这里用真实 H2 + 真实仓储证明「没有写入任何失败码」。
+        KnowledgeDocumentId documentId = parsedDocument("claim-key-3");
+        DocumentIndexingException providerFailure = new DocumentIndexingException(
+                KnowledgeIndexFailureCode.EMBEDDING_PROVIDER_FAILURE, "上游不可用");
+        RuntimeException compensationFailure = new IllegalStateException("补偿写库失败");
+
+        KnowledgeDocumentIndexingService failingService = new KnowledgeDocumentIndexingService(
+                new FailingCompensationRepository(fixture.repository(), compensationFailure), fixture.chunkStore(),
+                new FailingEmbeddingPort(providerFailure), new StubEmbeddingStore(),
+                new SystemKnowledgeTimeProvider(Clock.fixed(INDEXED_AT, ZoneOffset.UTC)),
+                true, DESCRIPTOR, 10);
+
+        RuntimeException thrown = (RuntimeException) org.assertj.core.api.Assertions.catchThrowable(
+                () -> failingService.index(new IndexKnowledgeDocumentCommand(documentId, 2L)));
+
+        // 根异常原样保留、失败码不变；补偿失败只作为 suppressed
+        assertThat(thrown).isSameAs(providerFailure);
+        assertThat(thrown.getSuppressed()).hasSize(1).allSatisfy(suppressed ->
+                assertThat(suppressed).isSameAs(compensationFailure));
+
+        // 真实数据库：补偿写入被拒 → 仍停在 INDEXING、没有失败码、版本不变
+        assertThat(statusOf(documentId)).as("补偿失败时数据库可能仍是 INDEXING").isEqualTo("INDEXING");
+        assertThat(indexFailureCodeOf(documentId))
+                .as("补偿失败时数据库里没有失败码，因此不能宣称与响应一致")
+                .isNull();
+        assertThat(versionOf(documentId)).isEqualTo(3L);
+    }
+
     // ---------- 辅助 ----------
 
     /** 上传 → 领取解析 → 完成解析：返回处于 PARSED（版本 2）的文档标识。 */
@@ -171,6 +206,61 @@ class KnowledgeDocumentIndexingClaimConcurrencyTest {
         Long version = jdbcClient.sql("SELECT version FROM knowledge_documents WHERE id = ?")
                 .param(1, documentId.value()).query(Long.class).single();
         return version == null ? -1L : version;
+    }
+
+    private static String indexFailureCodeOf(KnowledgeDocumentId documentId) {
+        return jdbcClient.sql("SELECT index_failure_code FROM knowledge_documents WHERE id = ?")
+                .param(1, documentId.value()).query(String.class).optional().orElse(null);
+    }
+
+    /**
+     * 只在「补偿写（{@code INDEX_FAILED}）」时失败的仓储包装：其余调用全部转发给真实 H2 仓储。
+     *
+     * <p>用来构造「领取成功、但失败补偿写库被拒」的真实数据库场景。</p>
+     */
+    private static final class FailingCompensationRepository implements KnowledgeDocumentRepository {
+
+        private final KnowledgeDocumentRepository delegate;
+
+        private final RuntimeException compensationFailure;
+
+        FailingCompensationRepository(KnowledgeDocumentRepository delegate, RuntimeException compensationFailure) {
+            this.delegate = delegate;
+            this.compensationFailure = compensationFailure;
+        }
+
+        @Override
+        public VersionedKnowledgeDocument insert(KnowledgeDocument document) {
+            return this.delegate.insert(document);
+        }
+
+        @Override
+        public java.util.Optional<VersionedKnowledgeDocument> findById(KnowledgeDocumentId documentId) {
+            return this.delegate.findById(documentId);
+        }
+
+        @Override
+        public VersionedKnowledgeDocument update(KnowledgeDocument document, long expectedVersion) {
+            if (document.status() == KnowledgeDocumentStatus.INDEX_FAILED) {
+                throw this.compensationFailure;
+            }
+            return this.delegate.update(document, expectedVersion);
+        }
+    }
+
+    /** 每次调用都失败的向量生成替身。 */
+    private static final class FailingEmbeddingPort implements KnowledgeEmbeddingPort {
+
+        private final RuntimeException failure;
+
+        FailingEmbeddingPort(RuntimeException failure) {
+            this.failure = failure;
+        }
+
+        @Override
+        public List<float[]> embedAll(List<String> texts, EmbeddingDescriptor descriptor) {
+            throw this.failure;
+        }
     }
 
     /** 向量生成替身：始终返回合法的 1024 维向量。 */

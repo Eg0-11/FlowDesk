@@ -1,6 +1,6 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0010-R1 —— 索引链路的凭证校验、乱序归位、日志脱敏、失败码与真实批处理（RAG 3/6 修订，已完成）**
+> **当前阶段：FD-0010-R2 —— 关闭 Embedding provider 血缘错配并修正文档契约（RAG 3/6 修订，已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
@@ -10,7 +10,8 @@
 > 文档解析（PDF/DOCX/Markdown/TXT，含 OOXML 包类型验证与显式关闭 OCR）+
 > 确定性切片 + 解析状态机与原子落库（FD-0009）、
 > 切片向量化（DashScope text-embedding-v4）+ pgvector 原子落库 + 索引状态机（FD-0010）、
-> 索引链路修订（Key fail-fast、按 index 归位、关闭依赖库正文日志、失败码贯通、真正的 JDBC 批处理）（FD-0010-R1）。
+> 索引链路修订（Key fail-fast、按 index 归位、关闭依赖库正文日志、失败码贯通、真正的 JDBC 批处理）（FD-0010-R1）、
+> provider 血缘校验与文档契约修正（只允许规范值 `dashscope`、Key 优先级改为模态级优先、失败码措辞不再绝对化）（FD-0010-R2）。
 > 尚未实现：向量相似度检索与 RAG 检索增强（含 Query Embedding 与 Rerank）、切片内容的公开读取接口、
 > 文档列表/下载/删除、孤立文件清理任务、`PARSING`/`INDEXING` 悬挂的恢复扫描、
 > 游标分页、PostgreSQL 全文检索与 pg_trgm、MCP 能力、Agent Graph、鉴权与前端。
@@ -706,6 +707,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0009 | 文档解析与确定性切片（RAG 2/6） | ✅ 已完成（含 R1/R2 两轮修复：OOXML 类型验证、OCR 关闭、提取上限语义、持久化端口防线、OPC 关系证明与 Unicode 流状态） |
 | FD-0010 | 切片 Embedding 与 pgvector 原子存储（RAG 3/6） | ✅ 已完成 |
 | FD-0010-R1 | 索引链路修订：Key fail-fast、按 index 归位、依赖库日志关闭、failureCode 贯通、真实 JDBC 批处理 | ✅ 已完成 |
+| FD-0010-R2 | provider 血缘校验（只允许规范值 dashscope）、Key 优先级说明修正、失败码契约措辞修正 | ✅ 已完成 |
 | 后续 | RAG 4/6：向量检索与引用结果 | 未开始 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm` | 未开始 |
 | 后续 | RAG：检索增强生成（含 Query Embedding 与 Rerank） | 未开始 |
@@ -720,7 +722,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | --- | --- | --- |
 | H2 集成 / HTTP 集成 | ✅ 已执行 | 真实 Spring 上下文、真实 JDBC、真实 Flyway 迁移（H2 执行 V1~V5；V6 为 PostgreSQL 专用 pgvector 迁移）、真实并发线程、真实文件系统、真实 multipart 上传，以及真实 PDF/DOCX 解析（夹具按规范现场生成） |
 | 本地 smoke（默认 profile） | ✅ 已执行 | 真实进程 + 真实 HTTP：multipart 上传、存储目录落盘校验（FD-0008）、文档解析与状态推进、伪装 XLSX/普通 ZIP 被拒（FD-0009 / R1）；向量化在默认环境关闭，索引接口 503（FD-0010） |
-| 索引链路修订证据（FD-0010-R1） | ✅ 已执行 | 真实嵌套 Spring 上下文：缺失/空/纯空白 Key 均启动失败、假 Key 与 `postgres,deepseek,dashscope-embedding` 组合可完成装配（不经真实数据库与模型）；真实 `DashScopeEmbeddingModel` 指向未监听的本机端口，证明关闭 logger 后切片正文不进入日志（并把 logger 临时打开做反证）；H2 影子表上观测到真实的 `addBatch`/`executeBatch`（无逐条 `executeUpdate`）与跨批次回滚；8 线程真实竞争下只有一个请求进入 `INDEXING` |
+| 索引链路修订证据（FD-0010-R1 / R2） | ✅ 已执行 | 真实嵌套 Spring 上下文：缺失/空/纯空白 Key 均启动失败、`provider` 非规范值（含 `openai`/大小写变体/前后空格）在创建适配器之前启动失败、假 Key 与 `postgres,deepseek,dashscope-embedding` 组合可完成装配（不经真实数据库与模型）；真实 `DashScopeEmbeddingModel` 指向未监听的本机端口，证明关闭 logger 后切片正文不进入日志（并把 logger 临时打开做反证）；H2 影子表上观测到真实的 `addBatch`/`executeBatch`（无逐条 `executeUpdate`）与跨批次回滚；8 线程真实竞争下只有一个请求进入 `INDEXING` |
 | PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证**；pgvector 集成测试（Testcontainers，镜像固定为带扩展版本的 `pgvector/pgvector:0.8.6-pg16`）在无 Docker 时跳过，报告标注 POSTGRESQL_PGVECTOR_IT=NOT_RUN |
 | 真实 DashScope Embedding | ⚠️ **DASHSCOPE_LIVE=NOT_RUN** | 无 DASHSCOPE_API_KEY，**未对真实向量服务发起过任何请求**；全部自动化测试都不访问真实上游 |
 | 真实 DeepSeek | ⚠️ **LIVE_SMOKE=NOT_RUN** | 无 `DEEPSEEK_API_KEY`，**未对真实模型发起过任何请求** |
@@ -1079,6 +1081,7 @@ Flyway **V4** 在 `knowledge_documents` 上新增 `parsed_at`、`parse_failed_at
 | 项 | 值 | 说明 |
 | --- | --- | --- |
 | 提供方 | `dashscope`（阿里云百炼） | DeepSeek 只负责 Chat/Agent，Embedding 走 DashScope |
+| provider 取值 | **只允许逐字 `dashscope`** | 会被持久化的**血缘字段**；启用时其他取值（含大小写变体与前后空格）一律启动失败（FD-0010-R2，见 17.8） |
 | 模型 | `text-embedding-v4` | 由 `flowdesk.knowledge.embedding.model` 显式指定 |
 | 维度 | `1024` | 与 `vector(1024)` 列、领域不变量三处一致 |
 | 语义 | `document` | 查询侧（下一阶段）才用 `query` |
@@ -1100,6 +1103,7 @@ Flyway **V4** 在 `knowledge_documents` 上新增 `parsed_at`、`parse_failed_at
 | 完整生产组合 | `--spring.profiles.active=postgres,deepseek,dashscope-embedding` | Chat 走 DeepSeek、Embedding 走 DashScope、向量落 pgvector |
 | 只启用向量化但没有 PostgreSQL | `--spring.profiles.active=dashscope-embedding` | **启动失败**并给出明确的配置错误（不会静默退回 H2 或内存向量库） |
 | 只启用向量化但 Key 缺失/空/纯空白 | `--spring.profiles.active=postgres,dashscope-embedding` | **启动失败**，错误信息只提 `DASHSCOPE_API_KEY` 与配置名（FD-0010-R1） |
+| provider 不是规范值 `dashscope`（如 `openai`） | 同上再加 `--flowdesk.knowledge.embedding.provider=openai` | **启动失败**，且在创建任何向量适配器之前就失败；错误信息只说明「当前版本只支持 dashscope」，不回显原值（FD-0010-R2） |
 
 ```powershell
 $env:DASHSCOPE_API_KEY = '<key>'
@@ -1112,9 +1116,20 @@ java -jar flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar `
 
 仓库中**不保存**任何真实 API Key、数据库密码或 Token：`api-key` 只读取 `${DASHSCOPE_API_KEY:}`
 （带空默认值是刻意的，见 17.8）。Key 的**真实值**由启动期校验读取并拒绝空值，
-因此「清掉环境变量后应用仍然启动」不会再发生。本项目只承认
-`spring.ai.dashscope.api-key`（回退 `spring.ai.dashscope.embedding.api-key`）这一条来源，
-**不**读取 starter 额外支持的 `AI_DASHSCOPE_API_KEY`：Key 从哪来必须能被启动期校验确定性地看到。
+因此「清掉环境变量后应用仍然启动」不会再发生。
+
+Key 的优先级与依赖 1.1.2.2 的真实行为一致 —— **模态级优先、通用兜底**：
+
+1. `spring.ai.dashscope.embedding.api-key` 有文本 → 用它；
+2. 否则回退 `spring.ai.dashscope.api-key`（profile 把它绑定到 `${DASHSCOPE_API_KEY:}`）；
+3. 依赖库只在选出的配置值为 `null` 时才尝试 `AI_DASHSCOPE_API_KEY` 环境变量；
+   **本项目不承认这条来源**（否则「Key 从哪来」无法被启动期校验确定性地看到），
+   缺失、空串与纯空白一律由项目校验器用自己的稳定异常拒绝。
+
+启用向量化时 `flowdesk.knowledge.embedding.provider` 必须**逐字**写成 `dashscope`：
+`null`、空白、`openai`、`DashScope`、`" dashscope "` 都会启动失败 ——
+它是会被持久化到文档与向量表的**血缘字段**，接受别的取值等于把 DashScope 生成的向量
+标注成别的来源。见 17.8。
 
 `dashscope-embedding` profile 同时把依赖库的日志关掉：
 
@@ -1166,9 +1181,17 @@ curl.exe -s -i -X POST "http://localhost:8080/api/v1/knowledge/documents/$($doc.
 | 切片数量或摘要与库中不一致 | 500 | `INTERNAL_SERVER_ERROR` + `failureCode=CHUNK_DATA_INVALID` |
 | 向量写入 / 批处理 / 事务提交失败 | 500 | `INTERNAL_SERVER_ERROR` + `failureCode=VECTOR_STORAGE_FAILURE` |
 
-**5xx 一定带 `failureCode`，而且与数据库里持久化的 `index_failure_code` 是同一个值**
-（FD-0010-R1 修正：FD-0010 里完成阶段的异常被统一包成 `METADATA_STORAGE_FAILURE`，
-在响应中丢掉了失败码）。响应始终是固定安全文案：不含 SQL、连接串、上游响应体、切片正文或异常类名。
+**失败码的准确契约**（FD-0010-R2 修正，不再宣称「永远一致」）：
+
+- **成功领取索引且补偿 CAS 成功**时，数据库里的 `index_failure_code` 与抛出的
+  `DocumentIndexingException.failureCode` 一致，HTTP 响应里的 `failureCode` 也是同一个值；
+- **补偿 CAS 失败**时，根异常与 HTTP `failureCode` **保持不变**，补偿异常只作为 suppressed 附加；
+  此时数据库可能仍停在 `INDEXING`，也可能已被并发请求改动 —— 这一条**不保证**数据库与响应一致；
+- **领取之前**（读文档、领取 CAS）的读取/存储失败**不写失败态**：文档还没被领取，
+  不存在可以安全持久化的 `INDEX_FAILED`，响应是项目自己的错误码（可能没有 `failureCode`）；
+- 版本冲突 / 状态不允许索引 / 文档不存在：仍然**不得**写失败态（412 / 409 / 404）。
+
+响应始终是固定安全文案：不含 SQL、连接串、上游响应体、切片正文或异常类名。
 
 ### 17.5 数据库结构（V5 + V6）
 
@@ -1227,7 +1250,9 @@ CREATE INDEX … USING hnsw (embedding vector_cosine_ops);
    （本机没有 Key、没有 PostgreSQL 与 Docker），自动化测试全部使用替身或 H2；
    pgvector 相关断言由 Testcontainers 测试覆盖，无 Docker 时跳过。
 
-### 17.8 FD-0010-R1：五个缺口的修复
+### 17.8 FD-0010-R1 与 FD-0010-R2：缺口的修复
+
+**FD-0010-R1（五个缺口）**
 
 | # | 缺口 | 修复位置 |
 | --- | --- | --- |
@@ -1237,10 +1262,22 @@ CREATE INDEX … USING hnsw (embedding vector_cosine_ops);
 | 4 | 真实向量写入失败在响应里没有 `failureCode` | 适配器抛 `DocumentIndexingException(VECTOR_STORAGE_FAILURE)` / `(CHUNK_DATA_INVALID)`；用例层对 `DocumentIndexingException` 原样保留，不再包装成 `METADATA_STORAGE_FAILURE` |
 | 5 | 循环 `executeUpdate()` 不是批处理 | `JdbcKnowledgeDocumentEmbeddingStore` 改用 `JdbcTemplate.batchUpdate(sql, collection, writeBatchSize, setter)`，批大小有界、与删除旧向量和状态 CAS 同事务 |
 
+**FD-0010-R2（三个缺口）**
+
+| # | 缺口 | 修复位置 |
+| --- | --- | --- |
+| 1 | `provider=openai` 也能启动 → 实际由 DashScope 生成向量却把来源标成 openai（**血缘错配**） | `KnowledgeEmbeddingConfigurationValidator.requireSupportedProvider(...)`：启用时要求 provider **逐字**等于 `dashscope`（不 trim、不改大小写）；由启动期校验 Bean 与 `knowledgeEmbeddingPort` 共同调用，两者都在创建适配器之前失败 |
+| 2 | Key 优先级说明写反（写成了「通用优先、模态兜底」） | 代码改为**模态级优先、通用兜底**（与 `DashScopeConnectionUtils` 一致），并新增 `resolveApiKey(...)` 直接断言优先级方向；Javadoc / README / ADR 测试命名同步修正 |
+| 3 | 「数据库 `index_failure_code` 与响应 `failureCode` 永远一致」的绝对表述不成立 | 用例层 Javadoc、README 17.4/17.6、ADR 改为按「补偿成功 / 补偿失败 / 领取之前 / 冲突类」四种情形分别陈述；补偿失败测试改为断根异常不变 + suppressed 存在，不再暗示数据库已写入同一失败码 |
+
 **为什么 Key 校验要读真实值**：DashScope 的自动配置条件是
 `@ConditionalOnProperty(name = "spring.ai.model.embedding", havingValue = "dashscope", matchIfMissing = true)`，
 「什么都不配」也会命中 —— Bean 能创建出来，可用性却取决于连接属性里的 Key，
 所以「Bean 存在」不构成有效防线。
+
+**为什么 provider 必须逐字匹配**：它是会被持久化的血缘字段。静默 trim 或改大小写会让
+「配置文件里写的」与「真正生效并被持久化的」不一致；而接受 `openai` 这类取值，
+会让检索阶段在判断「库里的向量由谁生成」时得到错误结论，且不会有任何报错。
 
 **为什么用 `OFF` 而不是只关 `ERROR`**：该依赖类有三个分支把
 `request.getInstructions()`（切片正文）当日志参数：`Error embedding request: {}`、

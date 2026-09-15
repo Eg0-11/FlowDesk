@@ -200,6 +200,8 @@ final class RecordingKnowledgePorts {
 
         private long version;
 
+        private int committedUpdates;
+
         @Override
         public VersionedKnowledgeDocument insert(KnowledgeDocument document) {
             this.calls.add("insert");
@@ -249,6 +251,7 @@ final class RecordingKnowledgePorts {
             }
             this.version = expectedVersion + 1L;
             this.found = new VersionedKnowledgeDocument(document, this.version);
+            this.committedUpdates++;
             return this.found;
         }
 
@@ -288,6 +291,13 @@ final class RecordingKnowledgePorts {
 
         List<Long> updatedExpectedVersions() {
             return List.copyOf(this.updatedExpectedVersions);
+        }
+
+        /**
+         * @return <b>成功落库</b>的 update 次数（失败的尝试不计入）
+         */
+        int committedUpdates() {
+            return this.committedUpdates;
         }
 
         int insertCalls() {

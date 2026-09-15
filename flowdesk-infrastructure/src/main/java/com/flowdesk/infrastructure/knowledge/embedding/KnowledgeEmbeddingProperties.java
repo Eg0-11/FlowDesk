@@ -4,7 +4,7 @@ import com.flowdesk.domain.knowledge.EmbeddingDescriptor;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /**
- * 文档向量化配置（FD-0010）。
+ * 文档向量化配置（FD-0010 / FD-0010-R2）。
  *
  * <p>默认值刻意是「关闭」：默认 profile 不创建 EmbeddingModel、不发生网络请求、
  * 也不需要任何 API Key（见 ADR 0007）。只有显式启用 {@code dashscope-embedding} profile
@@ -12,6 +12,10 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  *
  * <p>{@link #validate()} 在装配阶段执行，配置不合法就让应用启动失败，
  * 而不是等到某个请求打进来才报错。</p>
+ *
+ * <p>{@code provider} 是<b>血缘字段</b>（会持久化到文档与向量表），
+ * 启用状态下只允许 {@link KnowledgeEmbeddingConfigurationValidator#SUPPORTED_PROVIDER}；
+ * 该规则由配置校验器在启用时执行，见 FD-0010-R2。</p>
  */
 @ConfigurationProperties(prefix = "flowdesk.knowledge.embedding")
 public class KnowledgeEmbeddingProperties {
@@ -36,10 +40,16 @@ public class KnowledgeEmbeddingProperties {
 
     /**
      * 严格校验配置，任何不合法都抛异常让应用启动失败。
+     *
+     * <p>这里只做「与开关无关」的校验：provider / model 不能为空、维度必须是 1024、
+     * 批大小必须在范围内。<b>provider 是否为本版本唯一支持的取值</b>由
+     * {@link KnowledgeEmbeddingConfigurationValidator#requireSupportedProvider} 在启用状态下判定
+     * （关闭状态下 provider 只是一个不会被使用的字段，保持既有行为）。</p>
      */
     public void validate() {
         if (this.provider == null || this.provider.isBlank()) {
-            throw new IllegalStateException("flowdesk.knowledge.embedding.provider 不能为空");
+            throw new IllegalStateException("flowdesk.knowledge.embedding.provider 不能为空：当前版本只支持 "
+                    + KnowledgeEmbeddingConfigurationValidator.SUPPORTED_PROVIDER);
         }
         if (this.model == null || this.model.isBlank()) {
             throw new IllegalStateException("flowdesk.knowledge.embedding.model 不能为空");

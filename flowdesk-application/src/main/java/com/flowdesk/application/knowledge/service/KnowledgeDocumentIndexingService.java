@@ -44,22 +44,32 @@ import java.util.Objects;
  *       补偿失败只作为 suppressed 附加，绝不覆盖根因；版本冲突与「状态不允许索引」不写成失败态。</li>
  * </ol>
  *
- * <h2>失败码契约（FD-0010-R1）</h2>
- * <p>失败只有三种归宿，且<b>数据库里持久化的 {@code index_failure_code} 与对外响应里的
- * {@code failureCode} 永远一致</b>：</p>
+ * <h2>失败码契约（FD-0010-R1 / FD-0010-R2 修正）</h2>
+ * <p>失败有四种归宿。<b>只有在「成功领取了索引且失败补偿 CAS 成功」这一种情况下，
+ * 数据库里的 {@code index_failure_code} 才与抛出的
+ * {@link com.flowdesk.application.knowledge.index.DocumentIndexingException#failureCode()} 一致</b>
+ * （HTTP 层再把它映射成同名的 {@code failureCode}）。</p>
  * <table border="1">
  *   <caption>失败映射</caption>
- *   <tr><th>失败</th><th>补偿</th><th>对外</th></tr>
- *   <tr><td>版本冲突 / 状态不允许索引 / 文档不存在</td><td>不写失败态</td><td>412 / 409 / 404（原样上抛）</td></tr>
- *   <tr><td>向量服务失败、响应非法、切片不自洽、向量写入失败</td>
- *       <td>{@code INDEX_FAILED} + 对应失败码</td>
- *       <td>{@link com.flowdesk.application.knowledge.index.DocumentIndexingException}
- *           （<b>原样保留，不重新包装</b>）</td></tr>
- *   <tr><td>其它运行时异常</td><td>{@code INDEX_FAILED} + 兜底失败码</td>
- *       <td>包装成 {@code DocumentIndexingException}(兜底码, 原因只留在 cause)</td></tr>
+ *   <tr><th>失败</th><th>补偿</th><th>数据库</th><th>对外</th></tr>
+ *   <tr><td>版本冲突 / 状态不允许索引 / 文档不存在</td><td>不写失败态</td>
+ *       <td>保持原状态（如仍是 {@code INDEXING}）</td>
+ *       <td>412 / 409 / 404（原样上抛）</td></tr>
+ *   <tr><td>领取之前（读文档 / 领取 CAS）的读取或存储失败</td><td>不写失败态</td>
+ *       <td>没有任何 {@code INDEX_FAILED} 是安全可写的（文档还没被领取）</td>
+ *       <td>项目自己的错误码（如 500，<b>没有</b> {@code failureCode}）</td></tr>
+ *   <tr><td>领取之后的失败，补偿 CAS <b>成功</b></td><td>{@code INDEX_FAILED} + 失败码</td>
+ *       <td>{@code index_failure_code} == 对外 {@code failureCode}</td>
+ *       <td>{@code DocumentIndexingException}（已有失败码的原样保留，不重新包装）</td></tr>
+ *   <tr><td>领取之后的失败，补偿 CAS <b>失败</b></td>
+ *       <td>补偿异常只作为 suppressed 附加</td>
+ *       <td>可能仍是 {@code INDEXING}，也可能已被并发请求改动</td>
+ *       <td>根异常的失败码保持不变（补偿失败不影响对外结论）</td></tr>
  * </table>
  * <p>「不重新包装」是刻意的：FD-0010 曾经在这里把完成阶段的异常统一包成
  * {@code METADATA_STORAGE_FAILURE}，结果真实的向量写入失败在响应里丢掉了 {@code failureCode}。</p>
+ * <p>「补偿失败时数据库不一定与响应一致」也是刻意的表述：补偿本身就是一次可能失败的写操作，
+ * 宣称「永远一致」会把一个未被证明的结论写进文档。</p>
  *
  * <h2>内存占用</h2>
  * <p>切片正文<b>分批</b>读取（每批最多 {@code batchSize} 条），不会一次性把整篇文档的切片文本加载进来；
@@ -346,10 +356,21 @@ public final class KnowledgeDocumentIndexingService implements IndexKnowledgeDoc
     }
 
     /**
-     * 索引失败的统一处理（FD-0010-R1）：先决定「要不要写失败态」，再决定「对外抛出什么」。
+     * 索引失败的统一处理（FD-0010-R1 / FD-0010-R2 修正措辞）：先决定「要不要写失败态」，
+     * 再决定「对外抛出什么」。
      *
-     * <p>两者的<b>失败码必须一致</b>：数据库里持久化的 {@code index_failure_code} 与
-     * HTTP 响应里的 {@code failureCode} 是同一个值，否则运维看到的失败原因与重试依据会互相矛盾。</p>
+     * <p><b>准确的契约</b>（不宣称绝对的「永远一致」）：</p>
+     * <ul>
+     *   <li>补偿 CAS <b>成功</b>时，数据库里的 {@code index_failure_code} 与本方法返回的
+     *       {@link DocumentIndexingException#failureCode()} 是同一个值（HTTP 层再映射成同名
+     *       {@code failureCode}）；</li>
+     *   <li>补偿 CAS <b>失败</b>时，返回的根异常及其失败码<b>保持不变</b>，补偿异常只作为
+     *       {@code suppressed} 附加；此时数据库可能仍停在 {@code INDEXING}，
+     *       也可能已被并发请求改动 —— 这一条不保证数据库与响应一致；</li>
+     *   <li>版本冲突 / 状态不允许索引 / 文档不存在：不写失败态（412 / 409 / 404）。</li>
+     * </ul>
+     * <p>领取之前的读取或存储失败根本不进入本方法：那时文档还没被领取，
+     * 不存在可以安全持久化的 {@code INDEX_FAILED} 状态。</p>
      *
      * <h2>三类处理</h2>
      * <ol>

@@ -139,16 +139,22 @@ public class KnowledgeConfiguration {
     }
 
     /**
-     * 向量生成端口（FD-0010）。
+     * 向量生成端口（FD-0010 / FD-0010-R2）。
      *
      * <p>启用时使用 DashScope 适配器；关闭时使用「拒绝一切」的占位实现 ——
      * 两种情况下 Bean 都存在，因此用例服务与 HTTP 契约都不需要知道开关状态。</p>
      *
-     * <p>取 {@link EmbeddingModel} 之前先做一次 Key 校验（FD-0010-R1）：
-     * {@code EmbeddingModel} Bean 由依赖库的自动配置创建，而它的自动配置条件是
-     * {@code matchIfMissing=true}，所以「Bean 存在」并不代表「Key 可用」。
-     * 在这里先校验可以保证：无论容器先装配本 Bean 还是先装配启动期校验 Bean，
-     * 拿到的都是同一条只提配置名的稳定错误信息。</p>
+     * <p><b>本方法在创建 {@link DashScopeKnowledgeEmbeddingAdapter} 之前依次做两步校验</b>，
+     * 任何一步失败都不会创建出适配器：</p>
+     * <ol>
+     *   <li>provider 必须是本版本唯一支持的规范值（FD-0010-R2）：accepting 别的取值会让
+     *       「实际由 DashScope 生成的向量」被标注成别的提供方；</li>
+     *   <li>DashScope Key 必须非空（FD-0010-R1）：{@code EmbeddingModel} Bean 由依赖库的
+     *       自动配置创建，而它的条件是 {@code matchIfMissing=true}，所以「Bean 存在」
+     *       并不代表「Key 可用」。</li>
+     * </ol>
+     * <p>这两步同时也在启动期校验 Bean 里执行，因此无论容器先装配哪个 Bean，
+     * 拿到的都是同一条稳定且只提配置名的错误信息，也绝不会走到「创建了适配器」这一步。</p>
      *
      * @param embedding      向量化配置
      * @param embeddingModel EmbeddingModel 提供者（关闭时通常为空）
@@ -162,6 +168,7 @@ public class KnowledgeConfiguration {
         if (!embedding.isEnabled()) {
             return new DisabledKnowledgeEmbedding.Port();
         }
+        KnowledgeEmbeddingConfigurationValidator.requireSupportedProvider(embedding);
         KnowledgeEmbeddingConfigurationValidator.requireDashScopeApiKey(embedding, environment);
         EmbeddingModel model = embeddingModel.getIfAvailable();
         if (model == null) {
