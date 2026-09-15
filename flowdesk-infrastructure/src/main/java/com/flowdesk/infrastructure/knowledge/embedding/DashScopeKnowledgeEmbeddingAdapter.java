@@ -45,7 +45,9 @@ import org.springframework.ai.embedding.EmbeddingResponse;
  * 而不是依赖 starter 的默认值：默认值会随依赖版本变化，而「用哪个模型、多少维」是
  * 已经写进数据库的契约（{@code embedding_model} / {@code embedding_dimensions}）。</p>
  * <p>{@code textType=document} 是 DashScope 的检索语义约定：文档侧必须用 {@code document}，
- * 查询侧（RAG 4/6 的检索阶段，尚未实现）才用 {@code query}。</p>
+ * 查询侧必须用 {@code query}（已由 FD-0011 的
+ * {@link DashScopeKnowledgeQueryEmbeddingAdapter} 实现，见 ADR 0008）——
+ * 两者共用同一个 {@link EmbeddingModel} 与描述符，但语义分开。</p>
  *
  * <h2>不记录敏感内容</h2>
  * <p>本类不打印切片正文、向量数值、API Key 或完整响应。失败时只抛出携带<b>稳定失败码</b>的

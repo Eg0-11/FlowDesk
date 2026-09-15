@@ -387,17 +387,100 @@ class KnowledgeRetrievalServiceTest {
                 0, DEFAULT_TOP_K, MAX_TOP_K, DEFAULT_MIN_SCORE))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("maxQueryCodePoints");
         assertThatThrownBy(() -> new KnowledgeRetrievalService(this.queryPort, this.searchPort, true, DESCRIPTOR,
+                MAX_QUERY_CODE_POINTS + 1, DEFAULT_TOP_K, MAX_TOP_K, DEFAULT_MIN_SCORE))
+                .as("query 上限超过公开契约的 2000 必须被拒绝")
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("maxQueryCodePoints");
+        assertThatThrownBy(() -> new KnowledgeRetrievalService(this.queryPort, this.searchPort, true, DESCRIPTOR,
                 MAX_QUERY_CODE_POINTS, 0, MAX_TOP_K, DEFAULT_MIN_SCORE))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("defaultTopK");
         assertThatThrownBy(() -> new KnowledgeRetrievalService(this.queryPort, this.searchPort, true, DESCRIPTOR,
                 MAX_QUERY_CODE_POINTS, 6, 5, DEFAULT_MIN_SCORE))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("defaultTopK");
         assertThatThrownBy(() -> new KnowledgeRetrievalService(this.queryPort, this.searchPort, true, DESCRIPTOR,
-                MAX_QUERY_CODE_POINTS, DEFAULT_TOP_K, 51, DEFAULT_MIN_SCORE))
+                MAX_QUERY_CODE_POINTS, DEFAULT_TOP_K, MAX_TOP_K + 1, DEFAULT_MIN_SCORE))
+                .as("topK 上限超过公开契约的 20 必须被拒绝")
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("maxTopK");
         assertThatThrownBy(() -> new KnowledgeRetrievalService(this.queryPort, this.searchPort, true, DESCRIPTOR,
                 MAX_QUERY_CODE_POINTS, DEFAULT_TOP_K, MAX_TOP_K, Double.NaN))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("defaultMinScore");
+    }
+
+    @Test
+    void theConstructorRejectsLimitsBeyondThePublicContractEvenWhenSpringIsBypassed() {
+        // FD-0011-R1：硬上限写在用例构造器里，而不只依赖 Spring 配置类的 validate()
+        assertThatThrownBy(() -> new KnowledgeRetrievalService(this.queryPort, this.searchPort, true, DESCRIPTOR,
+                2001, 5, 20, 0.30))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("maxQueryCodePoints")
+                .hasMessageContaining("2000");
+        assertThatThrownBy(() -> new KnowledgeRetrievalService(this.queryPort, this.searchPort, true, DESCRIPTOR,
+                2000, 5, 21, 0.30))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("maxTopK")
+                .hasMessageContaining("20");
+    }
+
+    @Test
+    void aTightenedConfigurationStillRejectsBeyondTheTightenedLimits() {
+        // 配置收紧之后，请求必须受收紧后的限制约束（而不是回到公开上限）
+        KnowledgeRetrievalService tightened = new KnowledgeRetrievalService(this.queryPort, this.searchPort, true,
+                DESCRIPTOR, 10, 2, 3, 0.5);
+
+        // 未提供 topK / minScore：用收紧后的默认值 2 / 0.5
+        tightened.retrieve(new RetrieveKnowledgeQuery("a".repeat(10), null, null));
+        assertThat(this.queryPort.queries()).containsExactly("a".repeat(10));
+        assertThat(this.searchPort.topKs()).containsExactly(2);
+        assertThat(this.searchPort.minScores()).containsExactly(0.5);
+
+        // 收紧后的上限 3 是合法边界
+        tightened.retrieve(new RetrieveKnowledgeQuery("abc", 3, null));
+        assertThat(this.searchPort.topKs()).containsExactly(2, 3);
+
+        // 超过收紧后的上限 / query 上限一律 400
+        assertApplicationError(() -> tightened.retrieve(new RetrieveKnowledgeQuery("a".repeat(11), 3, 0.5)),
+                KnowledgeApplicationErrorCode.INVALID_RETRIEVAL_QUERY);
+        assertApplicationError(() -> tightened.retrieve(new RetrieveKnowledgeQuery("abc", 4, 0.5)),
+                KnowledgeApplicationErrorCode.INVALID_RETRIEVAL_QUERY);
+
+        // 显式传入的 minScore 只要在 0..1 内就合法（阈值是请求参数，不是相对默认值的约束）
+        tightened.retrieve(new RetrieveKnowledgeQuery("abc", 1, 0.1));
+        assertThat(this.searchPort.minScores()).as("未提供的两次用默认值 0.5，显式传入的用 0.1")
+                .containsExactly(0.5, 0.5, 0.1);
+    }
+
+    @Test
+    void thePublicContractBoundariesAreExactlyInclusive() {
+        // query 恰好 2000 个 code point、topK=20 都是合法边界（公开契约只允许到 20）
+        this.service.retrieve(new RetrieveKnowledgeQuery("a".repeat(2000), 20, null));
+        assertThat(this.searchPort.topKs()).containsExactly(20);
+
+        assertApplicationError(() -> this.service.retrieve(new RetrieveKnowledgeQuery("a".repeat(2001), 20, null)),
+                KnowledgeApplicationErrorCode.INVALID_RETRIEVAL_QUERY);
+        assertApplicationError(() -> this.service.retrieve(new RetrieveKnowledgeQuery("a".repeat(2000), 21, null)),
+                KnowledgeApplicationErrorCode.INVALID_RETRIEVAL_QUERY);
+    }
+
+    @Test
+    void aDomainExceptionLeakingFromTheSearchPortBecomesARetrievalFailure() {
+        // FD-0011-R1：行映射阶段的领域异常若泄漏到应用层，必须收敛为 500 而不是 400
+        this.searchPort.failWith(new com.flowdesk.domain.knowledge.KnowledgeDomainException(
+                com.flowdesk.domain.knowledge.KnowledgeErrorCode.INVALID_VECTOR, "摘要不合法"));
+
+        KnowledgeApplicationException thrown = (KnowledgeApplicationException) catchThrowable(
+                () -> this.service.retrieve(new RetrieveKnowledgeQuery("VPN", null, null)));
+
+        assertThat(thrown.errorCode()).as("不能落进 400 的领域异常映射")
+                .isEqualTo(KnowledgeApplicationErrorCode.KNOWLEDGE_RETRIEVAL_FAILURE);
+        assertThat(thrown.getCause()).isInstanceOf(
+                com.flowdesk.domain.knowledge.KnowledgeDomainException.class);
+    }
+
+    @Test
+    void anUnexpectedRuntimeExceptionFromTheSearchPortBecomesARetrievalFailure() {
+        this.searchPort.failWith(new IllegalStateException("结果集已关闭"));
+
+        assertApplicationError(() -> this.service.retrieve(new RetrieveKnowledgeQuery("VPN", null, null)),
+                KnowledgeApplicationErrorCode.KNOWLEDGE_RETRIEVAL_FAILURE);
     }
 
     // ---------- 辅助 ----------

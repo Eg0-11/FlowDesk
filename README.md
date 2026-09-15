@@ -1,6 +1,6 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0011 —— Query Embedding、pgvector 相似度检索与可审计引用结果（RAG 4/6，已完成）**
+> **当前阶段：FD-0011-R1 —— 检索硬上限、行映射错误分类与空请求体契约修复（RAG 4/6 修订，已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
@@ -13,7 +13,8 @@
 > 索引链路修订（Key fail-fast、按 index 归位、关闭依赖库正文日志、失败码贯通、真正的 JDBC 批处理）（FD-0010-R1）、
 > provider 血缘校验与文档契约修正（只允许规范值 `dashscope`、Key 优先级改为模态级优先、失败码措辞不再绝对化）（FD-0010-R2）、
 > 顺序契约统一与过期阶段说明清理（协议层归位 vs 持久化层拒绝错配，纯文档修订）（FD-0010-R3）、
-> 知识检索（Query Embedding + pgvector 余弦检索 + 稳定引用编号）（FD-0011）。
+> 知识检索（Query Embedding + pgvector 余弦检索 + 稳定引用编号）（FD-0011）、
+> 检索契约修订（公开硬上限写进用例构造器、行映射异常统一归类为内部失败、空请求体统一为检索契约）（FD-0011-R1）。
 > 尚未实现：Rerank、全文检索与混合检索、基于检索结果的答案生成、
 > 任意切片读取接口、文档列表/下载/删除、孤立文件清理任务、`PARSING`/`INDEXING` 悬挂的恢复扫描、
 > 游标分页、PostgreSQL 全文检索与 pg_trgm、MCP 能力、Agent Graph、鉴权与前端。
@@ -713,9 +714,10 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0010-R2 | provider 血缘校验（只允许规范值 dashscope）、Key 优先级说明修正、失败码契约措辞修正 | ✅ 已完成 |
 | FD-0010-R3 | 统一 Embedding 顺序契约（协议层归位 vs 持久化层拒绝错配）、清理过期阶段说明 | ✅ 已完成（仅文档与注释） |
 | FD-0011 | Query Embedding、pgvector 相似度检索与可审计引用结果（RAG 4/6） | ✅ 已完成 |
-| 后续 | RAG 4/6：向量检索与引用结果 | 未开始 |
-| 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm` | 未开始 |
-| 后续 | RAG：检索增强生成（含 Query Embedding 与 Rerank） | 未开始 |
+| FD-0011-R1 | 检索硬上限回归契约、行映射异常分类、空请求体契约、过期文档清理 | ✅ 已完成 |
+| 后续 | RAG 5/6：基于引用结果生成答案（引用只来自检索结果） | 未开始 |
+| 后续 | Rerank：对检索结果重排（需要区分「召回分」与「重排分」） | 未开始 |
+| 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm`（混合检索） | 未开始 |
 | 后续 | 孤立文件清理任务 | 未开始 |
 | 后续 | Tool 体系扩展：面向工单与知识的工具注册 | 未开始 |
 | 后续 | MCP：资产 MCP 服务与监控 MCP 服务的能力实现 | 未开始 |
@@ -728,7 +730,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | H2 集成 / HTTP 集成 | ✅ 已执行 | 真实 Spring 上下文、真实 JDBC、真实 Flyway 迁移（H2 执行 V1~V5；V6 为 PostgreSQL 专用 pgvector 迁移）、真实并发线程、真实文件系统、真实 multipart 上传，以及真实 PDF/DOCX 解析（夹具按规范现场生成） |
 | 本地 smoke（默认 profile） | ✅ 已执行 | 真实进程 + 真实 HTTP：multipart 上传、存储目录落盘校验（FD-0008）、文档解析与状态推进、伪装 XLSX/普通 ZIP 被拒（FD-0009 / R1）；向量化在默认环境关闭，索引接口 503（FD-0010）；**检索接口在同一进程返回 503 且不需要任何 Key**（FD-0011） |
 | 索引链路修订证据（FD-0010-R1 / R2） | ✅ 已执行 | 真实嵌套 Spring 上下文：缺失/空/纯空白 Key 均启动失败、`provider` 非规范值（含 `openai`/大小写变体/前后空格）在创建适配器之前启动失败、假 Key 与 `postgres,deepseek,dashscope-embedding` 组合可完成装配（不经真实数据库与模型）；真实 `DashScopeEmbeddingModel` 指向未监听的本机端口，证明关闭 logger 后切片正文不进入日志（并把 logger 临时打开做反证）；H2 影子表上观测到真实的 `addBatch`/`executeBatch`（无逐条 `executeUpdate`）与跨批次回滚；8 线程真实竞争下只有一个请求进入 `INDEXING` |
-| 检索链路证据（FD-0011） | ✅ 已执行 | 真实 Spring 上下文 + 真实 HTTP：完整成功 JSON、空 citations、非法字段 400（固定 detail）、上游失败 502、内部失败 500、415/406/坏 JSON、响应不含 query/向量/SQL/异常；真实用例服务上验证「先模型后数据库」「非法输入零端口调用」「关闭状态零模型零数据库」；JDBC 替身上验证 SQL 原样下发与 11 个参数绑定顺序；`PgVectorLiteral` 在土耳其语/德语 Locale 下仍输出点号小数点 |
+| 检索链路证据（FD-0011 / R1） | ✅ 已执行 | 真实 Spring 上下文 + 真实 HTTP：完整成功 JSON、空 citations、非法字段 400（固定 detail）、**空请求体 400（同一条检索契约，且零端口调用）**、坏 JSON 保留全局契约、上游失败 502、内部失败 500、415/406、响应不含 query/向量/SQL/异常；真实用例服务上验证「先模型后数据库」「非法输入零端口调用」「关闭状态零模型零数据库」「行映射领域异常收敛为 500 而非 400」；JDBC 替身上验证 SQL 原样下发与 11 个参数绑定顺序、以及四种映射期失败（非十六进制摘要 / 领域异常 / 结果集读取失败 / 数据库异常）全部归类为 `KNOWLEDGE_RETRIEVAL_FAILURE`；配置 `max-top-k=21`、`max-query-code-points=2001` 在真实上下文启动失败；`PgVectorLiteral` 在土耳其语/德语 Locale 下仍输出点号小数点 |
 | PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证**；pgvector 集成测试（Testcontainers，镜像固定为带扩展版本的 `pgvector/pgvector:0.8.6-pg16`）在无 Docker 时跳过（当前跳过 26 条：15 条索引写入 + 11 条相似度检索），报告标注 POSTGRESQL_PGVECTOR_IT=NOT_RUN |
 | 真实 DashScope Embedding | ⚠️ **DASHSCOPE_LIVE=NOT_RUN** | 无 DASHSCOPE_API_KEY，**未对真实向量服务发起过任何请求**；全部自动化测试都不访问真实上游 |
 | 真实 DeepSeek | ⚠️ **LIVE_SMOKE=NOT_RUN** | 无 `DEEPSEEK_API_KEY`，**未对真实模型发起过任何请求** |
@@ -1057,7 +1059,8 @@ Flyway **V4** 在 `knowledge_documents` 上新增 `parsed_at`、`parse_failed_at
 本阶段把「已解析的切片」变成「可检索的向量」：
 **分批读取切片 → 调用 DashScope `text-embedding-v4` 生成 1024 维向量 → 逐批校验 →
 单事务替换向量并把文档推进为 `INDEXED`**。
-**不做**向量相似度查询、Query Embedding、Rerank 与 RAG 问答（那是 RAG 4/6 及之后）。
+**FD-0010 当时不做**（阶段范围，其中多项已由后续任务交付）：向量相似度查询与 Query Embedding
+（**已由 FD-0011 交付，见第十八章**）、Rerank 与 RAG 问答（**仍未实现**）。
 
 ### 17.1 完整链路与状态机
 
@@ -1092,7 +1095,7 @@ Flyway **V4** 在 `knowledge_documents` 上新增 `parsed_at`、`parse_failed_at
 | provider 取值 | **只允许逐字 `dashscope`** | 会被持久化的**血缘字段**；启用时其他取值（含大小写变体与前后空格）一律启动失败（FD-0010-R2，见 17.8） |
 | 模型 | `text-embedding-v4` | 由 `flowdesk.knowledge.embedding.model` 显式指定 |
 | 维度 | `1024` | 与 `vector(1024)` 列、领域不变量三处一致 |
-| 语义 | `document` | 查询侧（RAG 4/6 的检索阶段，尚未实现）才用 `query` |
+| 语义 | `document` | 查询侧用 `query`（**已由 FD-0011 实现**，见 18.1） |
 | 单批上限 | `10` | `flowdesk.knowledge.embedding.batch-size`，配置校验拒绝 >10 |
 | 维度探测 | **禁止** | 适配器从不调用 `EmbeddingModel.dimensions()`（它可能发起远端请求） |
 | 结果归位 | 按 `Embedding.getIndex()` | **不**信任响应列表顺序（FD-0010-R1，见 17.8） |
@@ -1383,6 +1386,13 @@ curl.exe -s -X POST http://localhost:8080/api/v1/knowledge/search `
 | `topK` | 可选，默认 `default-top-k`（5）；必须在 `1..max-top-k`（默认 20）之间 |
 | `minScore` | 可选，默认 `default-min-score`（0.30）；必须是 `0.0..1.0` 的**有限**数值（含边界） |
 
+**公开硬上限是任务契约的一部分，配置只能收紧**（FD-0011-R1）：
+query 上限写死在用例服务的常量 `MAX_QUERY_CODE_POINTS_LIMIT = 2000`、topK 上限写死在
+`MAX_TOP_K_LIMIT = 20`；`flowdesk.knowledge.retrieval` 只能取更小的值
+（`1 <= max-query-code-points <= 2000`、`1 <= default-top-k <= max-top-k <= 20`），
+违反即在装配期启动失败；而且用例构造器<b>自身</b>也执行同一组校验，
+因此任何绕过 Spring 配置的装配方式都不能放大公开契约。
+
 响应约束：`citationId` 按最终顺序为 `K1`、`K2`……，`rank` 从 1 连续递增；
 **不回显 query**、不含向量、不含 SQL；无命中时返回 200 与空 `citations`（不是 404）。
 
@@ -1391,6 +1401,8 @@ curl.exe -s -X POST http://localhost:8080/api/v1/knowledge/search `
 | 场景 | HTTP | code |
 | --- | --- | --- |
 | query 缺失/空白/超长/含控制字符，topK 或 minScore 越界 | 400 | `INVALID_REQUEST`（detail 固定为「检索请求不合法」） |
+| **空请求体**（`Content-Length: 0`） | 400 | `INVALID_REQUEST`（同一条检索契约；不调用模型、不访问向量表） |
+| 请求体无法解析（坏 JSON 或只有空白） | 400 | `INVALID_REQUEST`（detail「请求体不是合法 JSON」，全局框架契约） |
 | 默认环境未启用向量化 | 503 | `KNOWLEDGE_EMBEDDING_DISABLED` |
 | 上游超时、限流、连接失败、5xx | 502 | `EMBEDDING_PROVIDER_ERROR` |
 | 模型响应结构非法 / 查询向量非法 / 数据库检索失败 / 结果契约被破坏 | 500 | `INTERNAL_SERVER_ERROR` |
@@ -1433,8 +1445,10 @@ flowdesk:
       default-min-score: 0.30       # 相似度阈值默认值
 ```
 
-装配期校验：`1 <= default-top-k <= max-top-k <= 50`；`default-min-score` 必须是 `0..1` 的
-有限数值；`max-query-code-points` 必须在合理正数范围内。应用服务只接收纯 Java 数值。
+装配期校验：`1 <= max-query-code-points <= 2000`；`1 <= default-top-k <= max-top-k <= 20`；
+`default-min-score` 必须是 `0..1` 的有限数值。**配置只能收紧，不能扩大公开契约**：
+上限本身来自应用层常量（见 18.2），配置文件只能取更小的值。应用服务只接收纯 Java 数值，
+并且它自己的构造器会再执行一次同样的硬上限检查。
 
 默认 profile（H2、未启用向量化）仍然**零依赖启动**：检索用例与接口都装配好了，
 有效请求得到 503；真实检索需要 `--spring.profiles.active=postgres,dashscope-embedding`。
@@ -1450,3 +1464,12 @@ flowdesk:
 6. **没有分页**：单次最多 `max-top-k` 条，不提供游标翻页；
 7. **真实上游与真实数据库**：`DASHSCOPE_LIVE=NOT_RUN`、`POSTGRESQL_PGVECTOR_IT=NOT_RUN`
    （本机没有 Key、没有 PostgreSQL 与 Docker），pgvector 断言由 Testcontainers 覆盖，无 Docker 时跳过。
+
+### 18.7 FD-0011-R1：四项契约修订
+
+| # | 问题 | 处理 |
+| --- | --- | --- |
+| 1 | 配置能把公开上限放大（`max-top-k` 允许到 50、`max-query-code-points` 允许到 100000） | 公开硬上限写进用例服务常量（`MAX_TOP_K_LIMIT=20`、`MAX_QUERY_CODE_POINTS_LIMIT=2000`），并**在用例构造器与配置校验两处**执行：`1 <= max-query-code-points <= 2000`、`1 <= default-top-k <= max-top-k <= 20`。配置只能收紧；`max-top-k=21` 或 `max-query-code-points=2001` 都让应用启动失败 |
+| 2 | 行映射阶段的领域异常（例如库里 `chunk_sha256` 不是合法十六进制）会以领域异常外泄，被全局映射接成 **400** | 适配器把**数据库查询 / 结果集读取 / 行映射**三个阶段的异常统一映射为 `KNOWLEDGE_RETRIEVAL_FAILURE`（HTTP 500），原始异常只作为 cause；用例服务对端口调用再兜一层（非 `KnowledgeApplicationException` 的运行期异常一律收敛为内部检索失败），保证「服务端数据问题」永远不会被说成「调用方输入错误」 |
+| 3 | 空请求体走「缺少请求体」的通用错误路径，与「缺 query」契约不一致 | 控制器把空 body 转成 `query=null` 交给用例 → 400 + `code=INVALID_REQUEST` + 固定 detail「检索请求不合法」，且不调用查询向量端口、不访问向量检索端口；**坏 JSON（含只有空白的 body）仍保留全局「请求体不是合法 JSON」契约** |
+| 4 | 过期文档：任务表里仍有「RAG 4/6 未开始」「查询侧尚未实现」 | README 任务表与第十七章、ADR 0007（阶段范围改为「FD-0010 当时不做」并标注后续进展）、`DashScopeKnowledgeEmbeddingAdapter` 与 `flowdesk-agent` 包注释全部更正；Rerank 与答案生成仍如实标注未实现 |

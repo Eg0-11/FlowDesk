@@ -7,6 +7,7 @@ import com.flowdesk.application.knowledge.KnowledgeApplicationErrorCode;
 import com.flowdesk.application.knowledge.KnowledgeApplicationException;
 import com.flowdesk.application.knowledge.port.out.KnowledgeVectorMatch;
 import com.flowdesk.domain.knowledge.EmbeddingDescriptor;
+import com.flowdesk.domain.knowledge.KnowledgeDomainException;
 import com.flowdesk.domain.knowledge.KnowledgeQueryEmbedding;
 import java.lang.reflect.Proxy;
 import java.sql.ResultSet;
@@ -39,6 +40,8 @@ class JdbcKnowledgeVectorSearchAdapterTest {
 
     private static final EmbeddingDescriptor DESCRIPTOR =
             EmbeddingDescriptor.of("dashscope", "text-embedding-v4");
+
+    private static final String DIGEST = "abcdef0123456789".repeat(4);
 
     private RecordingJdbc jdbc;
 
@@ -98,6 +101,87 @@ class JdbcKnowledgeVectorSearchAdapterTest {
                 .doesNotContain("jdbc:")
                 .doesNotContain("[");
         assertThat(thrown.getCause()).as("原始数据库异常只作为 cause 保留在服务端").isNotNull();
+    }
+
+    // ---------- 行映射阶段的失败也必须收敛为内部检索失败（FD-0011-R1） ----------
+
+    @Test
+    void mapsADigestThatIsNotHexadecimalIntoARetrievalFailure() {
+        // 长度 64、全小写，但含非十六进制字符：Sha256Digest 会抛领域异常
+        this.jdbc.willReturnRows(List.of(row("z".repeat(64), UUID.randomUUID(), 0.9)));
+
+        KnowledgeApplicationException thrown = searchFailure();
+
+        assertThat(thrown.errorCode()).isEqualTo(KnowledgeApplicationErrorCode.KNOWLEDGE_RETRIEVAL_FAILURE);
+        assertThat(thrown).as("领域异常必须只作为 cause").hasCauseInstanceOf(KnowledgeDomainException.class);
+        assertThat(thrown.getMessage())
+                .as("不得回显摘要原值、SQL 或数据库消息")
+                .doesNotContain("zzzz")
+                .doesNotContain("SELECT")
+                .doesNotContain("digest");
+    }
+
+    @Test
+    void mapsADomainFailureFromTheRowMapperIntoARetrievalFailure() {
+        // 库里没有文档标识：KnowledgeDocumentId.of(null) 抛领域异常
+        this.jdbc.willReturnRows(List.of(row(DIGEST, null, 0.9)));
+
+        KnowledgeApplicationException thrown = searchFailure();
+
+        assertThat(thrown.errorCode()).isEqualTo(KnowledgeApplicationErrorCode.KNOWLEDGE_RETRIEVAL_FAILURE);
+        assertThat(thrown).hasCauseInstanceOf(KnowledgeDomainException.class);
+    }
+
+    @Test
+    void mapsARuntimeFailureWhileReadingTheResultSetIntoARetrievalFailure() {
+        this.jdbc.willReturnRows(List.of(row(DIGEST, UUID.randomUUID(), 0.9)));
+        this.jdbc.willFailOnRead(new IllegalStateException("结果集已关闭（驱动层）"));
+
+        KnowledgeApplicationException thrown = searchFailure();
+
+        assertThat(thrown.errorCode()).isEqualTo(KnowledgeApplicationErrorCode.KNOWLEDGE_RETRIEVAL_FAILURE);
+        assertThat(thrown).hasCauseInstanceOf(IllegalStateException.class);
+        assertThat(thrown.getMessage()).doesNotContain("结果集已关闭").doesNotContain("驱动");
+    }
+
+    @Test
+    void aMappedRowStillProducesAMatchWhenTheDataIsValid() {
+        UUID documentId = UUID.randomUUID();
+        this.jdbc.willReturnRows(List.of(row(DIGEST, documentId, 0.42)));
+
+        List<KnowledgeVectorMatch> matches = this.adapter.search(queryEmbedding(), 0.0, 5);
+
+        assertThat(matches).hasSize(1);
+        assertThat(matches.get(0).documentId().value()).isEqualTo(documentId);
+        assertThat(matches.get(0).score()).isEqualTo(0.42);
+    }
+
+    /**
+     * @return 一次必然失败的检索抛出的应用层异常
+     */
+    private KnowledgeApplicationException searchFailure() {
+        return (KnowledgeApplicationException) org.assertj.core.api.Assertions
+                .catchThrowable(() -> this.adapter.search(queryEmbedding(), 0.0, 5));
+    }
+
+    /**
+     * 造一行检索结果。
+     *
+     * @param digest     摘要列的值
+     * @param documentId 文档标识列的值（可为 {@code null}）
+     * @param score      相似度列的值
+     * @return 行
+     */
+    private static Map<String, Object> row(String digest, UUID documentId, double score) {
+        Map<String, Object> row = new HashMap<>();
+        row.put("document_id", documentId);
+        row.put("document_version", 4L);
+        row.put("document_title", "VPN 故障处理手册");
+        row.put("chunk_index", 0);
+        row.put("chunk_sha256", digest);
+        row.put("content", "正文");
+        row.put("score", score);
+        return row;
     }
 
     @Test
@@ -239,8 +323,30 @@ class JdbcKnowledgeVectorSearchAdapterTest {
 
         private volatile java.sql.SQLException queryFailure;
 
+        private List<Map<String, Object>> rows = List.of();
+
+        private RuntimeException readFailure;
+
         void willFailOnQuery(java.sql.SQLException failure) {
             this.queryFailure = failure;
+        }
+
+        /**
+         * 让查询返回给定行（用于驱动行映射与映射期异常的验证）。
+         *
+         * @param rows 每行是「列名 → 值」
+         */
+        void willReturnRows(List<Map<String, Object>> rows) {
+            this.rows = List.copyOf(rows);
+        }
+
+        /**
+         * 让结果集在读取某一列时抛出运行期异常（模拟驱动/类型层面的读取失败）。
+         *
+         * @param failure 异常
+         */
+        void willFailOnRead(RuntimeException failure) {
+            this.readFailure = failure;
         }
 
         String preparedSql() {
@@ -290,7 +396,7 @@ class JdbcKnowledgeVectorSearchAdapterTest {
                             if (this.queryFailure != null) {
                                 throw this.queryFailure;
                             }
-                            return emptyResultSet();
+                            return resultSet();
                         }
                         if ("getUpdateCount".equals(name)) {
                             return -1;
@@ -306,15 +412,39 @@ class JdbcKnowledgeVectorSearchAdapterTest {
                     });
         }
 
-        private static ResultSet emptyResultSet() {
+        /**
+         * 逐行返回预先配置的行（未配置任何行时是空结果集），并按列名取值。
+         *
+         * @return ResultSet 替身
+         */
+        private ResultSet resultSet() {
+            java.util.Iterator<Map<String, Object>> iterator = this.rows.iterator();
+            java.util.concurrent.atomic.AtomicReference<Map<String, Object>> cursor =
+                    new java.util.concurrent.atomic.AtomicReference<>();
             return (ResultSet) Proxy.newProxyInstance(RecordingJdbc.class.getClassLoader(),
                     new Class<?>[] { ResultSet.class },
                     (proxy, method, args) -> {
-                        if ("next".equals(method.getName())) {
-                            return Boolean.FALSE;
+                        String name = method.getName();
+                        if ("next".equals(name)) {
+                            if (!iterator.hasNext()) {
+                                return Boolean.FALSE;
+                            }
+                            cursor.set(iterator.next());
+                            return Boolean.TRUE;
                         }
-                        if ("getWarnings".equals(method.getName())) {
+                        if ("getWarnings".equals(name)) {
                             return null;
+                        }
+                        if (name.startsWith("get") && args != null && args.length >= 1
+                                && args[0] instanceof String column) {
+                            if (this.readFailure != null) {
+                                throw this.readFailure;
+                            }
+                            Map<String, Object> row = cursor.get();
+                            if (row == null || !row.containsKey(column)) {
+                                throw new IllegalArgumentException("未定义的列: " + column);
+                            }
+                            return row.get(column);
                         }
                         return defaultValue(method.getReturnType());
                     });

@@ -188,12 +188,41 @@ class KnowledgeSearchWebTests {
     }
 
     @Test
-    void aMalformedJsonBodyReturns400() throws Exception {
-        this.mockMvc.perform(post(SEARCH_PATH)
+    void anEmptyBodyReturns400WithTheRetrievalContract() throws Exception {
+        // FD-0011-R1：空请求体不再走「缺少请求体」的通用错误路径，
+        // 而是与「缺 query」完全同一条契约：400 + INVALID_REQUEST + 固定 detail
+        MvcResult result = this.mockMvc.perform(post(SEARCH_PATH)
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"query\":"))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
+                        .content(""))
+                .andReturn();
+
+        assertThat(result.getResponse().getStatus()).isEqualTo(400);
+        assertThat(body(result))
+                .contains("\"code\":\"INVALID_REQUEST\"")
+                .contains("\"detail\":\"检索请求不合法\"")
+                .doesNotContain("缺少请求体");
+
+        assertThat(this.queryPort.calls()).as("空请求体不得调用 Query Embedding").isZero();
+        assertThat(this.searchPort.calls()).as("空请求体不得访问向量检索端口").isZero();
+    }
+
+    @Test
+    void aMalformedJsonBodyReturns400WithTheGlobalJsonContract() throws Exception {
+        // 坏 JSON 与「只有空白的 body」都保留全局契约：无法解析 → 「请求体不是合法 JSON」
+        for (String malformed : List.of("{\"query\":", "   ", "not-json")) {
+            MvcResult result = this.mockMvc.perform(post(SEARCH_PATH)
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(malformed))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.code").value("INVALID_REQUEST"))
+                    .andExpect(jsonPath("$.detail").value("请求体不是合法 JSON"))
+                    .andReturn();
+
+            assertThat(body(result)).as("body=[%s]", malformed).doesNotContain("not-json");
+        }
+
+        assertThat(this.queryPort.calls()).isZero();
+        assertThat(this.searchPort.calls()).isZero();
     }
 
     @Test
@@ -277,6 +306,41 @@ class KnowledgeSearchWebTests {
                         .content("{\"query\":\"VPN\",\"topK\":1}"))
                 .andExpect(status().isInternalServerError())
                 .andExpect(jsonPath("$.code").value("INTERNAL_SERVER_ERROR"));
+    }
+
+    @Test
+    void aDomainExceptionFromTheSearchPortReturns500Not400() throws Exception {
+        // FD-0011-R1：行映射阶段的领域异常（库里的摘要不合法等）属于服务端数据问题，
+        // 绝不能落进「领域异常 → 400」的全局映射，把服务端问题说成调用方输入错误
+        this.searchPort.failWith(new com.flowdesk.domain.knowledge.KnowledgeDomainException(
+                com.flowdesk.domain.knowledge.KnowledgeErrorCode.INVALID_VECTOR, "摘要不合法 sentinel-digest"));
+
+        MvcResult result = this.mockMvc.perform(post(SEARCH_PATH)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"query\":\"VPN\"}"))
+                .andExpect(status().isInternalServerError())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.code").value("INTERNAL_SERVER_ERROR"))
+                .andReturn();
+
+        assertThat(body(result))
+                .doesNotContain("sentinel-digest")
+                .doesNotContain("INVALID_VECTOR")
+                .doesNotContain("Exception");
+    }
+
+    @Test
+    void anUnexpectedRuntimeExceptionFromTheSearchPortReturns500() throws Exception {
+        this.searchPort.failWith(new IllegalStateException("结果集已关闭 sentinel-driver"));
+
+        MvcResult result = this.mockMvc.perform(post(SEARCH_PATH)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"query\":\"VPN\"}"))
+                .andExpect(status().isInternalServerError())
+                .andExpect(jsonPath("$.code").value("INTERNAL_SERVER_ERROR"))
+                .andReturn();
+
+        assertThat(body(result)).doesNotContain("sentinel-driver").doesNotContain("Exception");
     }
 
     // ---------- 辅助 ----------

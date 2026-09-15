@@ -3,7 +3,6 @@ package com.flowdesk.bootstrap.knowledge;
 import com.flowdesk.application.knowledge.port.in.RetrieveKnowledgeUseCase;
 import com.flowdesk.application.knowledge.query.RetrieveKnowledgeQuery;
 import com.flowdesk.application.knowledge.view.KnowledgeRetrievalView;
-import com.flowdesk.bootstrap.web.InvalidRequestException;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -45,19 +44,26 @@ public class KnowledgeSearchController {
     /**
      * 检索知识库中与问题最相关的切片。
      *
-     * <p>{@code query} 必填；{@code topK} 与 {@code minScore} 可省略（用服务端默认值）。
-     * 请求体为 {@code null}（空 body）时按「query 缺失」处理，返回 400 而不是 500。</p>
+     * <p>{@code query} 必填；{@code topK} 与 {@code minScore} 可省略（用服务端默认值）。</p>
      *
-     * @param request 检索请求体
+     * <p><b>空请求体走与「缺 query」完全相同的契约</b>（FD-0011-R1）：请求体缺失时不再抛
+     * 「缺少请求体」这类通用错误，而是把 {@code query=null} 交给用例 —— 于是得到
+     * 400 + {@code code=INVALID_REQUEST} + 固定 detail「检索请求不合法」，
+     * 且不调用查询向量端口、不访问向量检索端口。这样「空 body」和「{@code {}}」在
+     * 契约上没有任何区别，调用方不需要为两种「没给 query」的写法分别分支。
+     * 请求体无法解析（坏 JSON）仍然保留全局的「请求体不是合法 JSON」契约。</p>
+     *
+     * @param request 检索请求体（可为 {@code null}）
      * @return 200 OK + 检索结果（可能为空列表）
      */
     @PostMapping(path = "/search", consumes = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<KnowledgeSearchResponse> search(@RequestBody(required = false) KnowledgeSearchRequest request) {
-        if (request == null) {
-            throw new InvalidRequestException("缺少请求体");
-        }
-        KnowledgeRetrievalView view = this.retrieveKnowledgeUseCase.retrieve(
-                new RetrieveKnowledgeQuery(request.query(), request.topK(), request.minScore()));
+    public ResponseEntity<KnowledgeSearchResponse> search(
+            @RequestBody(required = false) KnowledgeSearchRequest request) {
+
+        RetrieveKnowledgeQuery query = request == null
+                ? new RetrieveKnowledgeQuery(null, null, null)
+                : new RetrieveKnowledgeQuery(request.query(), request.topK(), request.minScore());
+        KnowledgeRetrievalView view = this.retrieveKnowledgeUseCase.retrieve(query);
         return ResponseEntity.ok(KnowledgeSearchResponse.from(view));
     }
 }

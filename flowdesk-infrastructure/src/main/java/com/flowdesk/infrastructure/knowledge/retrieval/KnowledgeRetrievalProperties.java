@@ -10,18 +10,20 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * {@code max-top-k} 20、{@code default-min-score} 0.30。全部以 Unicode <b>code point</b>
  * 与「余弦相似度」为单位（相似度 = 1 - 余弦距离）。</p>
  *
+ * <h2>配置只能收紧，不能扩大公开契约（FD-0011-R1）</h2>
+ * <p>公开输入上限是<b>任务契约</b>的一部分，写在
+ * {@link KnowledgeRetrievalService} 的常量里（query 2000 个 code point、topK 1..20）；
+ * 这里的配置项只能取更小的值：{@code 1 <= max-query-code-points <= 2000}、
+ * {@code 1 <= default-top-k <= max-top-k <= 20}。既然「上限」来自应用层常量，
+ * 配置文件就不可能把公开契约放大。</p>
+ *
  * <p>{@link #validate()} 在装配阶段执行：配置不合法就让应用启动失败，
  * 而不是等到某次检索才在运行期暴露。应用层只接收纯 Java 数值，
- * 由装配层把这里读到的值传进 {@link KnowledgeRetrievalService} —— 用例服务不认识 Spring。</p>
+ * 由装配层把这里读到的值传进 {@link KnowledgeRetrievalService} —— 用例服务不认识 Spring，
+ * 而且它自己也会独立执行同一组硬上限校验。</p>
  */
 @ConfigurationProperties(prefix = "flowdesk.knowledge.retrieval")
 public class KnowledgeRetrievalProperties {
-
-    /** 单个 query 允许的最大 code point 数上限（硬约束，配置只能更小）。 */
-    public static final int MAX_QUERY_CODE_POINTS_LIMIT = 100_000;
-
-    /** 单个 query 的下限：至少要有 1 个 code point 才可能是有意义的问题。 */
-    public static final int MIN_QUERY_CODE_POINTS = 1;
 
     private int maxQueryCodePoints = 2000;
 
@@ -34,21 +36,24 @@ public class KnowledgeRetrievalProperties {
     /**
      * 严格校验配置，任何不合法都抛异常让应用启动失败。
      *
-     * <p>三条约束：{@code 1 <= default-top-k <= max-top-k <= 50}；
-     * {@code max-query-code-points} 在合理正数范围内；{@code default-min-score} 必须有限且在
+     * <p>三条约束：{@code 1 <= max-query-code-points <= 2000}；
+     * {@code 1 <= default-top-k <= max-top-k <= 20}；{@code default-min-score} 必须有限且在
      * {@code 0..1}。</p>
      */
     public void validate() {
-        if (this.maxQueryCodePoints < MIN_QUERY_CODE_POINTS
-                || this.maxQueryCodePoints > MAX_QUERY_CODE_POINTS_LIMIT) {
+        if (this.maxQueryCodePoints < KnowledgeRetrievalService.MIN_QUERY_CODE_POINTS
+                || this.maxQueryCodePoints > KnowledgeRetrievalService.MAX_QUERY_CODE_POINTS_LIMIT) {
             throw new IllegalStateException("flowdesk.knowledge.retrieval.max-query-code-points 必须在 "
-                    + MIN_QUERY_CODE_POINTS + ".." + MAX_QUERY_CODE_POINTS_LIMIT + " 之间");
+                    + KnowledgeRetrievalService.MIN_QUERY_CODE_POINTS + ".."
+                    + KnowledgeRetrievalService.MAX_QUERY_CODE_POINTS_LIMIT + " 之间"
+                    + "（公开契约只允许收紧，不允许扩大）");
         }
         if (this.maxTopK < KnowledgeRetrievalService.MIN_TOP_K
                 || this.maxTopK > KnowledgeRetrievalService.MAX_TOP_K_LIMIT) {
             throw new IllegalStateException("flowdesk.knowledge.retrieval.max-top-k 必须在 "
                     + KnowledgeRetrievalService.MIN_TOP_K + ".."
-                    + KnowledgeRetrievalService.MAX_TOP_K_LIMIT + " 之间");
+                    + KnowledgeRetrievalService.MAX_TOP_K_LIMIT + " 之间"
+                    + "（公开契约只允许收紧，不允许扩大）");
         }
         if (this.defaultTopK < KnowledgeRetrievalService.MIN_TOP_K || this.defaultTopK > this.maxTopK) {
             throw new IllegalStateException("flowdesk.knowledge.retrieval.default-top-k 必须在 "

@@ -33,7 +33,8 @@ import java.util.Set;
  *       这一步<b>不在任何数据库事务里</b>；</li>
  *   <li><b>领域校验</b>：把原始向量包装成 {@link KnowledgeQueryEmbedding}
  *       （维度、有限性、非全零，并做防御性复制）；</li>
- *   <li><b>向量检索</b>：{@link KnowledgeVectorSearchPort}（只读、单条 SQL）；</li>
+ *   <li><b>向量检索</b>：{@link KnowledgeVectorSearchPort}（只读、单条 SQL）；
+ *       端口调用失败（含行映射阶段的领域异常）统一收敛为内部检索失败；</li>
  *   <li><b>结果校验</b>：条数不超过 {@code topK}、分数有限且落在 {@code 0..1} 且不低于阈值、
  *       顺序满足「score 降序 → documentId 升序 → chunkIndex 升序」、无重复切片；</li>
  *   <li><b>生成引用</b>：按最终顺序编号 {@code K1}、{@code K2}……，{@code rank} 从 1 连续递增。</li>
@@ -58,8 +59,24 @@ public final class KnowledgeRetrievalService implements RetrieveKnowledgeUseCase
     /** {@code topK} 允许的最小值。 */
     public static final int MIN_TOP_K = 1;
 
-    /** {@code topK} 的硬上限（配置只能更小，不能更大）。 */
-    public static final int MAX_TOP_K_LIMIT = 50;
+    /**
+     * {@code topK} 的<b>公开硬上限</b>：配置可以收紧，但不允许扩大。
+     *
+     * <p>任务契约把公开输入限定为 {@code 1..20}；配置项
+     * {@code flowdesk.knowledge.retrieval.max-top-k} 只能取更小的值。</p>
+     */
+    public static final int MAX_TOP_K_LIMIT = 20;
+
+    /**
+     * 单个 query 的<b>公开硬上限</b>（Unicode code point）：配置可以收紧，但不允许扩大。
+     *
+     * <p>任务契约把公开输入限定为 2000 个 code point；配置项
+     * {@code flowdesk.knowledge.retrieval.max-query-code-points} 只能取更小的值。</p>
+     */
+    public static final int MAX_QUERY_CODE_POINTS_LIMIT = 2000;
+
+    /** 单个 query 的下限：至少要有 1 个 code point 才可能是有意义的问题。 */
+    public static final int MIN_QUERY_CODE_POINTS = 1;
 
     /** {@code minScore} 的合法下界（含边界）。 */
     public static final double MIN_MIN_SCORE = 0.0;
@@ -105,8 +122,12 @@ public final class KnowledgeRetrievalService implements RetrieveKnowledgeUseCase
         this.queryEmbeddingPort = Objects.requireNonNull(queryEmbeddingPort, "queryEmbeddingPort 不能为 null");
         this.vectorSearchPort = Objects.requireNonNull(vectorSearchPort, "vectorSearchPort 不能为 null");
         this.descriptor = Objects.requireNonNull(descriptor, "descriptor 不能为 null");
-        if (maxQueryCodePoints < 1) {
-            throw new IllegalArgumentException("maxQueryCodePoints 必须大于 0");
+        // 硬上限校验放在构造器里，而不是只依赖 Spring 配置类的 validate()：
+        // 直接构造用例（测试、其它装配方式）同样不能突破公开契约
+        if (maxQueryCodePoints < MIN_QUERY_CODE_POINTS
+                || maxQueryCodePoints > MAX_QUERY_CODE_POINTS_LIMIT) {
+            throw new IllegalArgumentException("maxQueryCodePoints 必须在 " + MIN_QUERY_CODE_POINTS + ".."
+                    + MAX_QUERY_CODE_POINTS_LIMIT + " 之间");
         }
         if (maxTopK < MIN_TOP_K || maxTopK > MAX_TOP_K_LIMIT) {
             throw new IllegalArgumentException("maxTopK 必须在 " + MIN_TOP_K + ".." + MAX_TOP_K_LIMIT + " 之间");
@@ -143,10 +164,7 @@ public final class KnowledgeRetrievalService implements RetrieveKnowledgeUseCase
         KnowledgeQueryEmbedding queryEmbedding = embedQuery(normalizedQuery);
 
         // ⑤ 向量检索（只读）
-        List<KnowledgeVectorMatch> matches = this.vectorSearchPort.search(queryEmbedding, minScore, topK);
-        if (matches == null) {
-            throw retrievalFailure("向量检索端口返回了 null");
-        }
+        List<KnowledgeVectorMatch> matches = search(queryEmbedding, minScore, topK);
 
         // ⑥ 结果契约校验：拒绝，而不是修正
         requireValidMatches(matches, topK, minScore);
@@ -154,6 +172,42 @@ public final class KnowledgeRetrievalService implements RetrieveKnowledgeUseCase
         // ⑦ 按最终顺序生成引用
         return new KnowledgeRetrievalView(this.descriptor.provider(), this.descriptor.model(),
                 this.descriptor.dimensions(), topK, minScore, cite(matches));
+    }
+
+    /**
+     * 调用向量检索端口，并把「端口没给出稳定错误码」的失败统一收敛为内部检索失败。
+     *
+     * <p>为什么这里还要再兜一层：检索端口返回的失败可能来自三个阶段 ——
+     * 数据库查询、结果集读取、行映射里的领域值构造。前两者在适配器内部已经映射，
+     * 但<b>行映射里的领域异常</b>（例如摘要不是合法十六进制）如果泄漏到 HTTP 层，
+     * 会被「领域异常 → 400」的全局映射接住，把一个<b>服务端内部问题</b>伪装成
+     * 「调用方输入错误」。因此这里保证：</p>
+     * <ul>
+     *   <li>已经带稳定错误码的 {@link KnowledgeApplicationException}（502 / 500）原样上抛；</li>
+     *   <li>其余任何运行期异常（含 {@link KnowledgeDomainException}）统一变成
+     *       {@code KNOWLEDGE_RETRIEVAL_FAILURE}（HTTP 500），原始异常只作为 cause 保留在服务端。</li>
+     * </ul>
+     *
+     * @param queryEmbedding 已校验的查询向量
+     * @param minScore       生效的阈值
+     * @param topK           生效的条数上限
+     * @return 命中结果（可能为空列表）
+     */
+    private List<KnowledgeVectorMatch> search(KnowledgeQueryEmbedding queryEmbedding, double minScore, int topK) {
+        List<KnowledgeVectorMatch> matches;
+        try {
+            matches = this.vectorSearchPort.search(queryEmbedding, minScore, topK);
+        }
+        catch (KnowledgeApplicationException ex) {
+            throw ex;
+        }
+        catch (RuntimeException ex) {
+            throw retrievalFailure("向量检索端口调用失败", ex);
+        }
+        if (matches == null) {
+            throw retrievalFailure("向量检索端口返回了 null");
+        }
+        return matches;
     }
 
     /**

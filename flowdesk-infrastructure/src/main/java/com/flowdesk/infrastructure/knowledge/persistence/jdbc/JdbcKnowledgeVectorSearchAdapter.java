@@ -6,6 +6,7 @@ import com.flowdesk.application.knowledge.port.out.KnowledgeVectorMatch;
 import com.flowdesk.application.knowledge.port.out.KnowledgeVectorSearchPort;
 import com.flowdesk.domain.knowledge.EmbeddingDescriptor;
 import com.flowdesk.domain.knowledge.KnowledgeDocumentId;
+import com.flowdesk.domain.knowledge.KnowledgeDomainException;
 import com.flowdesk.domain.knowledge.KnowledgeQueryEmbedding;
 import com.flowdesk.domain.knowledge.Sha256Digest;
 import java.util.List;
@@ -29,9 +30,14 @@ import org.springframework.jdbc.core.simple.JdbcClient;
  * 而模型调用发生在它之前、且不持有数据库连接。见 ADR 0008。</p>
  *
  * <h2>失败映射</h2>
- * <p>数据库异常统一映射为 {@code KNOWLEDGE_RETRIEVAL_FAILURE}（HTTP 500），
- * 原始异常只作为 cause 保留在服务端：消息与日志里不会出现 SQL、连接串、用户名、密码、
- * query 或向量 —— 这些都是构造响应时绝不使用的信息。</p>
+ * <p><b>数据库查询、结果集读取与行映射（领域值构造）三个阶段</b>的异常统一映射为
+ * {@code KNOWLEDGE_RETRIEVAL_FAILURE}（HTTP 500），原始异常只作为 cause 保留在服务端：
+ * 消息与日志里不会出现 SQL、连接串、用户名、密码、query、向量、摘要原值或数据库原始消息。</p>
+ * <p>尤其注意<b>行映射里的领域异常</b>（例如库里的 {@code chunk_sha256} 不是合法十六进制）：
+ * 它说明<b>库里的数据不自洽</b>，属于服务端问题；如果让它以 {@code KnowledgeDomainException}
+ * 的形态外泄，全局异常映射会把领域异常接成 400，把服务端数据问题伪装成调用方输入错误。</p>
+ * <p>调用参数（{@code minScore}、{@code topK}）的校验发生在访问数据库<b>之前</b>，
+ * 抛 {@link IllegalArgumentException}：调用方参数非法不能被伪装成数据库错误。</p>
  */
 public final class JdbcKnowledgeVectorSearchAdapter implements KnowledgeVectorSearchPort {
 
@@ -92,9 +98,31 @@ public final class JdbcKnowledgeVectorSearchAdapter implements KnowledgeVectorSe
                     .list();
         }
         catch (DataAccessException ex) {
-            // 细节（SQL、连接串、驱动信息）只留在 cause，绝不进入消息
-            throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.KNOWLEDGE_RETRIEVAL_FAILURE,
-                    "向量检索失败", ex);
+            // 数据库查询与结果集读取阶段的失败：细节（SQL、连接串、驱动信息）只留在 cause
+            throw retrievalFailure(ex);
         }
+        catch (KnowledgeDomainException ex) {
+            // 行映射阶段：库里的摘要不是合法 SHA-256、标识为空等，属于**数据不自洽**，
+            // 绝不能让它以领域异常的形态外泄 —— 全局映射会把领域异常接成 400，
+            // 把「服务端数据问题」伪装成「调用方输入错误」。
+            throw retrievalFailure(ex);
+        }
+        catch (RuntimeException ex) {
+            // 结果集读取或映射的其它运行期失败（驱动异常、类型不符等）同样收敛为内部检索失败
+            throw retrievalFailure(ex);
+        }
+    }
+
+    /**
+     * 统一的失败映射：对外只有一条固定文案，原始异常只作为 cause 保留在服务端。
+     *
+     * <p>消息里不含 SQL、连接串、用户名、密码、query、向量、摘要原值或数据库原始消息。</p>
+     *
+     * @param cause 原始失败
+     * @return 内部检索失败异常
+     */
+    private static KnowledgeApplicationException retrievalFailure(RuntimeException cause) {
+        return new KnowledgeApplicationException(KnowledgeApplicationErrorCode.KNOWLEDGE_RETRIEVAL_FAILURE,
+                "向量检索失败", cause);
     }
 }

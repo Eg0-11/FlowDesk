@@ -19,8 +19,11 @@ RAG 第 2 步把文档变成了切片，但切片本身还只是文本。第 3 �
 6. 为什么 PostgreSQL 专用迁移要单独放一个目录？
 7. 同步索引有什么限制？后续怎么异步化？
 
-本任务**不做**：向量相似度查询、RAG 问答、Query Embedding、Rerank、引用来源、
-MCP 改造、前端、鉴权、Redis/MQ、文档更新/删除/重新解析、已索引文档的主动重建。
+**FD-0010 当时不做**（阶段范围说明，不是当前状态）：向量相似度查询、RAG 问答、Query Embedding、
+Rerank、引用来源、MCP 改造、前端、鉴权、Redis/MQ、文档更新/删除/重新解析、已索引文档的主动重建。
+
+> 后续进展：**向量相似度查询与 Query Embedding 已由 [ADR 0008](0008-query-embedding-and-pgvector-similarity-search.md)
+> （FD-0011）交付**；Rerank、答案生成与引用来源仍未实现。
 
 ## 决策
 
@@ -239,8 +242,9 @@ knowledge_document_chunk_embeddings (
 ### 清理过期阶段说明
 
 向量化在 RAG 3/6 已经交付，因此不再把「供应商归位」「切片读取端口」等已实现能力
-描述为「下一阶段/将来」；检索增强（RAG 4/6：Query Embedding、Rerank、相似度检索）仍然**是**未来能力，
-相关表述保留但写明阶段名。历史章节保留其阶段范围说明，仅修正「现状」层面的过期断言。
+描述为「下一阶段/将来」。当时尚未交付的检索增强也已补齐：**Query Embedding 与相似度检索
+由 ADR 0008（FD-0011）交付**；Rerank 与答案生成仍未实现，相关表述保留并写明阶段名。
+历史章节保留其阶段范围说明，仅修正「现状」层面的过期断言。
 
 ## 修订（FD-0010-R1）：五个缺口的处理与理由
 
@@ -382,5 +386,7 @@ DOCX/PDF 解析之外的又一次「同步长请求」；`INDEXING` 悬挂需要
 
 1. 出现「索引耗时超过请求超时」的真实需求时，引入异步任务与状态轮询（同一套机制可解决悬挂问题）；
 2. 向量规模增长到 HNSW 内存不可接受时，评估 `ivfflat` 或分区；
-3. 需要 Query Embedding 与检索时（RAG 4/6），把 `text_type=query` 与 `document` 严格分开；
+3. ~~需要 Query Embedding 与检索时（RAG 4/6），把 `text_type=query` 与 `document` 严格分开~~
+   —— **已实现**：见 [ADR 0008](0008-query-embedding-and-pgvector-similarity-search.md)（FD-0011），
+   文档侧与查询侧用两个独立端口分别固定 `document` 与 `query` 语义；
 4. 需要更换 Embedding 模型时，先确认是否必须重算全部向量（维度或语义空间变化即必须重算）。

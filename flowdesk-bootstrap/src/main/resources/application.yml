@@ -105,7 +105,11 @@ flowdesk:
       #
       # 这些值都是「输入契约的一部分」：query 超过上限、topK 或 minScore 越界一律 400，
       # 而不是被静默截断或夹取。topK 与 minScore 可以在请求里覆盖，上限与 query 上限不可以。
-      # 约束：1 <= default-top-k <= max-top-k <= 50；default-min-score 必须是 0..1 的有限数值。
+      # 约束（FD-0011-R1）：配置只能**收紧**公开契约，不能扩大 ——
+      #   1 <= max-query-code-points <= 2000
+      #   1 <= default-top-k <= max-top-k <= 20
+      #   default-min-score 必须是 0..1 的有限数值
+      # 违反任一条都会让应用启动失败。
       max-query-code-points: 2000
       default-top-k: 5
       max-top-k: 20
