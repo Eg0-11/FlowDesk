@@ -17,6 +17,8 @@ import java.util.List;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 /**
  * 检索用例服务测试（RAG 4/6）。
@@ -204,14 +206,52 @@ class KnowledgeRetrievalServiceTest {
 
     @Test
     void aSearchFailureIsPropagatedWithoutLeakingTheQuery() {
-        this.searchPort.failWith(new KnowledgeApplicationException(
-                KnowledgeApplicationErrorCode.KNOWLEDGE_RETRIEVAL_FAILURE, "向量检索失败"));
+        KnowledgeApplicationException portFailure = new KnowledgeApplicationException(
+                KnowledgeApplicationErrorCode.KNOWLEDGE_RETRIEVAL_FAILURE, "向量检索失败");
+        this.searchPort.failWith(portFailure);
 
         KnowledgeApplicationException thrown = (KnowledgeApplicationException) catchThrowable(
                 () -> this.service.retrieve(new RetrieveKnowledgeQuery("SENTINEL-VPN-QUERY", null, null)));
 
+        assertThat(thrown).as("契约内的 KNOWLEDGE_RETRIEVAL_FAILURE 必须原样上抛（同一实例），不二次包装")
+                .isSameAs(portFailure);
         assertThat(thrown.errorCode()).isEqualTo(KnowledgeApplicationErrorCode.KNOWLEDGE_RETRIEVAL_FAILURE);
         assertThat(thrown.getMessage()).doesNotContain("SENTINEL-VPN-QUERY");
+    }
+
+    /**
+     * 检索端口抛出<b>契约之外的任何错误码</b>都必须被收敛为 {@code KNOWLEDGE_RETRIEVAL_FAILURE}。
+     *
+     * <p>用 {@link EnumSource} 覆盖<b>当前与将来</b>的全部错误码（仅排除检索端口唯一允许的
+     * {@code KNOWLEDGE_RETRIEVAL_FAILURE}）：新增错误码时，这条参数化测试会自动把它纳入，
+     * 从而锁死「端口违约不能穿透到 HTTP 层」的行为。</p>
+     *
+     * @param errorCode 端口违约时抛出的错误码
+     */
+    @ParameterizedTest(name = "端口违约错误码 {0} 必须收敛为 KNOWLEDGE_RETRIEVAL_FAILURE")
+    @EnumSource(value = KnowledgeApplicationErrorCode.class,
+            names = "KNOWLEDGE_RETRIEVAL_FAILURE", mode = EnumSource.Mode.EXCLUDE)
+    void anOutOfContractErrorCodeFromTheSearchPortIsCollapsedIntoARetrievalFailure(
+            KnowledgeApplicationErrorCode errorCode) {
+
+        String sentinel = "SENTINEL-PORT-DETAIL-绝不外泄";
+        KnowledgeApplicationException portFailure = new KnowledgeApplicationException(errorCode, sentinel);
+        this.searchPort.failWith(portFailure);
+
+        KnowledgeApplicationException thrown = (KnowledgeApplicationException) catchThrowable(
+                () -> this.service.retrieve(new RetrieveKnowledgeQuery("SENTINEL-VPN-QUERY", null, null)));
+
+        assertThat(thrown.errorCode())
+                .as("端口违约只能表现为 KNOWLEDGE_RETRIEVAL_FAILURE（HTTP 500），不能是 400/404/502/503")
+                .isEqualTo(KnowledgeApplicationErrorCode.KNOWLEDGE_RETRIEVAL_FAILURE);
+        assertThat(thrown).isNotSameAs(portFailure);
+        assertThat(thrown.getCause()).as("原异常必须作为 cause 保留").isSameAs(portFailure);
+        assertThat(thrown.getMessage())
+                .as("对外消息固定且不含原异常消息、query 或其它敏感信息")
+                .contains("向量检索")
+                .doesNotContain(sentinel)
+                .doesNotContain("SENTINEL-VPN-QUERY")
+                .doesNotContain(errorCode.name());
     }
 
     // ---------- 查询向量校验 ----------

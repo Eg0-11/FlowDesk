@@ -18,8 +18,13 @@ import java.util.List;
  *       顺序必须是<b>确定</b>的，否则引用编号会在同一份数据上抖动；</li>
  *   <li>返回条数不超过 {@code topK}，且每个命中的分数不低于 {@code minScore}（含边界）；</li>
  *   <li>调用期间<b>不得</b>持有数据库事务，也不得与模型调用共处一个事务；</li>
- *   <li>失败必须映射为 {@code KNOWLEDGE_RETRIEVAL_FAILURE}，消息与日志里
- *       <b>不得</b>出现 SQL、连接串、用户名、密码、query 或向量。</li>
+ *   <li><b>失败只有一种表达方式</b>：抛应用层的 {@code KNOWLEDGE_RETRIEVAL_FAILURE}
+ *       （HTTP 500）。数据库异常、结果集读取失败、行映射期的领域不变量失败都必须在实现内部
+ *       先映射成它；消息与日志里<b>不得</b>出现 SQL、连接串、用户名、密码、query、向量或摘要原值；</li>
+ *   <li>抛出任何<b>其它</b>错误码（例如 {@code INVALID_RETRIEVAL_QUERY}、
+ *       {@code KNOWLEDGE_DOCUMENT_NOT_FOUND}、{@code EMBEDDING_PROVIDER_ERROR}）
+ *       都视为<b>违反错误分类契约</b>：用例层会把它收敛为 {@code KNOWLEDGE_RETRIEVAL_FAILURE}，
+ *       以免内部故障在 HTTP 上表现为 400 / 404 / 502 / 503。</li>
  * </ul>
  */
 public interface KnowledgeVectorSearchPort {

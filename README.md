@@ -1,6 +1,6 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0011-R1 —— 检索硬上限、行映射错误分类与空请求体契约修复（RAG 4/6 修订，已完成）**
+> **当前阶段：FD-0011-R2 —— 收紧向量检索端口的应用异常分类（RAG 4/6 修订，已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
@@ -14,7 +14,8 @@
 > provider 血缘校验与文档契约修正（只允许规范值 `dashscope`、Key 优先级改为模态级优先、失败码措辞不再绝对化）（FD-0010-R2）、
 > 顺序契约统一与过期阶段说明清理（协议层归位 vs 持久化层拒绝错配，纯文档修订）（FD-0010-R3）、
 > 知识检索（Query Embedding + pgvector 余弦检索 + 稳定引用编号）（FD-0011）、
-> 检索契约修订（公开硬上限写进用例构造器、行映射异常统一归类为内部失败、空请求体统一为检索契约）（FD-0011-R1）。
+> 检索契约修订（公开硬上限写进用例构造器、行映射异常统一归类为内部失败、空请求体统一为检索契约）（FD-0011-R1）、
+> 检索端口错误分类收口（端口只允许 `KNOWLEDGE_RETRIEVAL_FAILURE`，其它错误码一律收敛为内部失败）（FD-0011-R2）。
 > 尚未实现：Rerank、全文检索与混合检索、基于检索结果的答案生成、
 > 任意切片读取接口、文档列表/下载/删除、孤立文件清理任务、`PARSING`/`INDEXING` 悬挂的恢复扫描、
 > 游标分页、PostgreSQL 全文检索与 pg_trgm、MCP 能力、Agent Graph、鉴权与前端。
@@ -715,6 +716,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0010-R3 | 统一 Embedding 顺序契约（协议层归位 vs 持久化层拒绝错配）、清理过期阶段说明 | ✅ 已完成（仅文档与注释） |
 | FD-0011 | Query Embedding、pgvector 相似度检索与可审计引用结果（RAG 4/6） | ✅ 已完成 |
 | FD-0011-R1 | 检索硬上限回归契约、行映射异常分类、空请求体契约、过期文档清理 | ✅ 已完成 |
+| FD-0011-R2 | 检索端口错误分类收口（只允许 `KNOWLEDGE_RETRIEVAL_FAILURE`，其它错误码收敛为内部失败） | ✅ 已完成 |
 | 后续 | RAG 5/6：基于引用结果生成答案（引用只来自检索结果） | 未开始 |
 | 后续 | Rerank：对检索结果重排（需要区分「召回分」与「重排分」） | 未开始 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm`（混合检索） | 未开始 |
@@ -1470,6 +1472,26 @@ flowdesk:
 | # | 问题 | 处理 |
 | --- | --- | --- |
 | 1 | 配置能把公开上限放大（`max-top-k` 允许到 50、`max-query-code-points` 允许到 100000） | 公开硬上限写进用例服务常量（`MAX_TOP_K_LIMIT=20`、`MAX_QUERY_CODE_POINTS_LIMIT=2000`），并**在用例构造器与配置校验两处**执行：`1 <= max-query-code-points <= 2000`、`1 <= default-top-k <= max-top-k <= 20`。配置只能收紧；`max-top-k=21` 或 `max-query-code-points=2001` 都让应用启动失败 |
-| 2 | 行映射阶段的领域异常（例如库里 `chunk_sha256` 不是合法十六进制）会以领域异常外泄，被全局映射接成 **400** | 适配器把**数据库查询 / 结果集读取 / 行映射**三个阶段的异常统一映射为 `KNOWLEDGE_RETRIEVAL_FAILURE`（HTTP 500），原始异常只作为 cause；用例服务对端口调用再兜一层（非 `KnowledgeApplicationException` 的运行期异常一律收敛为内部检索失败），保证「服务端数据问题」永远不会被说成「调用方输入错误」 |
+| 2 | 行映射阶段的领域异常（例如库里 `chunk_sha256` 不是合法十六进制）会以领域异常外泄，被全局映射接成 **400** | 适配器把**数据库查询 / 结果集读取 / 行映射**三个阶段的异常统一映射为 `KNOWLEDGE_RETRIEVAL_FAILURE`（HTTP 500），原始异常只作为 cause；用例服务在端口边界再收口一次（见下一条），保证「服务端数据问题」永远不会被说成「调用方输入错误」 |
 | 3 | 空请求体走「缺少请求体」的通用错误路径，与「缺 query」契约不一致 | 控制器把空 body 转成 `query=null` 交给用例 → 400 + `code=INVALID_REQUEST` + 固定 detail「检索请求不合法」，且不调用查询向量端口、不访问向量检索端口；**坏 JSON（含只有空白的 body）仍保留全局「请求体不是合法 JSON」契约** |
 | 4 | 过期文档：任务表里仍有「RAG 4/6 未开始」「查询侧尚未实现」 | README 任务表与第十七章、ADR 0007（阶段范围改为「FD-0010 当时不做」并标注后续进展）、`DashScopeKnowledgeEmbeddingAdapter` 与 `flowdesk-agent` 包注释全部更正；Rerank 与答案生成仍如实标注未实现 |
+
+### 18.8 FD-0011-R2：检索端口的错误分类收口
+
+`KnowledgeVectorSearchPort` 的契约只允许一种失败表达：`KNOWLEDGE_RETRIEVAL_FAILURE`。
+此前用例层把**所有** `KnowledgeApplicationException` 都原样上抛，于是端口的未来实现或错误装配
+（例如抛出 `INVALID_RETRIEVAL_QUERY`、`KNOWLEDGE_DOCUMENT_NOT_FOUND`、`EMBEDDING_PROVIDER_ERROR`）
+会穿透到 HTTP 层，表现为 400 / 404 / 502 / 503 —— 把内部故障说成调用方输入错误、文档不存在或上游不可用。
+
+现在端口边界只有三种归宿：
+
+| 端口抛出 | 处理 |
+| --- | --- |
+| `KNOWLEDGE_RETRIEVAL_FAILURE`（契约内） | **原样上抛**（同一实例，不二次包装） |
+| 其它 `KnowledgeApplicationException`（契约违约） | 包装成 `KNOWLEDGE_RETRIEVAL_FAILURE`，原异常作为 cause；对外固定文案「向量检索失败」 |
+| `KnowledgeDomainException` 或其它 `RuntimeException` | 同上 |
+
+因此检索链路的对外失败只有两种形态：**400（调用方输入，在调用端口之前判定）**与 **500（服务端）**。
+查询向量端口的 `EMBEDDING_PROVIDER_ERROR`（502）不受影响：它发生在 `embedQuery` 链路，
+与本收口无关。回归测试用 `@EnumSource`（排除 `KNOWLEDGE_RETRIEVAL_FAILURE`）遍历**当前与将来**的
+全部错误码，锁死新错误码的默认行为。

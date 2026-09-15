@@ -33,8 +33,9 @@ import java.util.Set;
  *       这一步<b>不在任何数据库事务里</b>；</li>
  *   <li><b>领域校验</b>：把原始向量包装成 {@link KnowledgeQueryEmbedding}
  *       （维度、有限性、非全零，并做防御性复制）；</li>
- *   <li><b>向量检索</b>：{@link KnowledgeVectorSearchPort}（只读、单条 SQL）；
- *       端口调用失败（含行映射阶段的领域异常）统一收敛为内部检索失败；</li>
+ *   <li><b>向量检索</b>：{@link KnowledgeVectorSearchPort}（只读、单条 SQL）。
+ *       该端口只允许用 {@code KNOWLEDGE_RETRIEVAL_FAILURE} 表达失败；任何其它错误码、
+ *       领域异常或运行期异常都在端口边界被收敛为它（见 {@link #search});</li>
  *   <li><b>结果校验</b>：条数不超过 {@code topK}、分数有限且落在 {@code 0..1} 且不低于阈值、
  *       顺序满足「score 降序 → documentId 升序 → chunkIndex 升序」、无重复切片；</li>
  *   <li><b>生成引用</b>：按最终顺序编号 {@code K1}、{@code K2}……，{@code rank} 从 1 连续递增。</li>
@@ -175,18 +176,32 @@ public final class KnowledgeRetrievalService implements RetrieveKnowledgeUseCase
     }
 
     /**
-     * 调用向量检索端口，并把「端口没给出稳定错误码」的失败统一收敛为内部检索失败。
+     * 调用向量检索端口，并把该端口边界上的所有失败收敛到<b>端口契约允许的那一个错误码</b>。
      *
-     * <p>为什么这里还要再兜一层：检索端口返回的失败可能来自三个阶段 ——
-     * 数据库查询、结果集读取、行映射里的领域值构造。前两者在适配器内部已经映射，
-     * 但<b>行映射里的领域异常</b>（例如摘要不是合法十六进制）如果泄漏到 HTTP 层，
-     * 会被「领域异常 → 400」的全局映射接住，把一个<b>服务端内部问题</b>伪装成
-     * 「调用方输入错误」。因此这里保证：</p>
+     * <h2>检索端口的错误分类契约</h2>
+     * <p>{@link KnowledgeVectorSearchPort} 只允许用一种方式表达失败：
+     * {@link KnowledgeApplicationErrorCode#KNOWLEDGE_RETRIEVAL_FAILURE}（HTTP 500）。
+     * 因此本方法的分支是：</p>
      * <ul>
-     *   <li>已经带稳定错误码的 {@link KnowledgeApplicationException}（502 / 500）原样上抛；</li>
-     *   <li>其余任何运行期异常（含 {@link KnowledgeDomainException}）统一变成
-     *       {@code KNOWLEDGE_RETRIEVAL_FAILURE}（HTTP 500），原始异常只作为 cause 保留在服务端。</li>
+     *   <li><b>{@code KNOWLEDGE_RETRIEVAL_FAILURE} 原样上抛</b> —— 这是端口契约允许的失败类别，
+     *       不二次包装（保留原始异常实例，便于测试与排障）；</li>
+     *   <li><b>其余任何 {@link KnowledgeApplicationException}</b>（例如
+     *       {@code INVALID_RETRIEVAL_QUERY}、{@code KNOWLEDGE_DOCUMENT_NOT_FOUND}、
+     *       {@code KNOWLEDGE_EMBEDDING_DISABLED}、{@code EMBEDDING_PROVIDER_ERROR}，
+     *       以及将来新增的错误码）表示端口<b>违反错误分类契约</b>，统一包装成
+     *       {@code KNOWLEDGE_RETRIEVAL_FAILURE}，原异常作为 cause 保留；</li>
+     *   <li><b>其它运行期异常</b>（含 {@link KnowledgeDomainException}、驱动异常、
+     *       行映射期的领域不变量失败）同样收敛为 {@code KNOWLEDGE_RETRIEVAL_FAILURE}。</li>
      * </ul>
+     * <p>为什么必须这样收口：如果让端口的任意错误码穿透到 HTTP 层，
+     * 一个「端口实现或装配出了问题」的内部故障就可能表现为 <b>400 / 404 / 502 / 503</b> ——
+     * 把服务端内部问题说成调用方输入错误、文档不存在或上游不可用。
+     * 收口之后，检索链路上的失败只有两种对外形态：400（<b>调用方输入</b>，在调用本方法之前判定）
+     * 与 500（<b>服务端</b>）。</p>
+     * <p>对外文案固定为「向量检索失败」：不含 query、向量、SQL、连接串、摘要原值，
+     * 也不含端口原始异常的消息。</p>
+     * <p>本方法只收紧<b>检索端口</b>的边界：查询向量端口（{@link #embedQuery(String)}）的
+     * {@code EMBEDDING_PROVIDER_ERROR}（HTTP 502）不受影响。</p>
      *
      * @param queryEmbedding 已校验的查询向量
      * @param minScore       生效的阈值
@@ -199,7 +214,11 @@ public final class KnowledgeRetrievalService implements RetrieveKnowledgeUseCase
             matches = this.vectorSearchPort.search(queryEmbedding, minScore, topK);
         }
         catch (KnowledgeApplicationException ex) {
-            throw ex;
+            if (ex.errorCode() == KnowledgeApplicationErrorCode.KNOWLEDGE_RETRIEVAL_FAILURE) {
+                // 端口契约允许的唯一失败类别：原样上抛，不二次包装
+                throw ex;
+            }
+            throw retrievalFailure("向量检索端口返回了非法错误类别", ex);
         }
         catch (RuntimeException ex) {
             throw retrievalFailure("向量检索端口调用失败", ex);

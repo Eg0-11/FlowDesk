@@ -1,6 +1,7 @@
 package com.flowdesk.bootstrap.knowledge;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -71,6 +72,9 @@ class KnowledgeSearchWebTests {
 
     @Autowired
     private StubVectorSearchPort searchPort;
+
+    @Autowired
+    private com.flowdesk.application.knowledge.port.in.RetrieveKnowledgeUseCase retrieveUseCase;
 
     @BeforeEach
     void resetStubs() {
@@ -341,6 +345,38 @@ class KnowledgeSearchWebTests {
                 .andReturn();
 
         assertThat(body(result)).doesNotContain("sentinel-driver").doesNotContain("Exception");
+    }
+
+    @Test
+    void anOutOfContractErrorCodeFromTheSearchPortReturns500Not400() throws Exception {
+        // FD-0011-R2：检索端口抛出契约之外的错误码（这里是 INVALID_RETRIEVAL_QUERY）时，
+        // 不能被当成「调用方输入不合法」——那会把内部故障说成 400
+        String sentinel = "SENTINEL-PORT-DETAIL-绝不外泄";
+        this.searchPort.failWith(new KnowledgeApplicationException(
+                KnowledgeApplicationErrorCode.INVALID_RETRIEVAL_QUERY, sentinel));
+
+        MvcResult result = this.mockMvc.perform(post(SEARCH_PATH)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"query\":\"VPN\"}"))
+                .andExpect(status().isInternalServerError())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.status").value(500))
+                .andExpect(jsonPath("$.code").value("INTERNAL_SERVER_ERROR"))
+                .andReturn();
+
+        assertThat(result.getResponse().getStatus())
+                .as("端口违约不得表现为 400").isNotEqualTo(400);
+        assertThat(body(result))
+                .doesNotContain(sentinel)
+                .doesNotContain("INVALID_RETRIEVAL_QUERY")
+                .doesNotContain("Exception");
+
+        // 应用层的分类也必须是 KNOWLEDGE_RETRIEVAL_FAILURE（HTTP 500 的全部 500 都走这一条契约）
+        assertThatThrownBy(() -> this.retrieveUseCase.retrieve(
+                new com.flowdesk.application.knowledge.query.RetrieveKnowledgeQuery("VPN", null, null)))
+                .isInstanceOf(KnowledgeApplicationException.class)
+                .extracting(thrown -> ((KnowledgeApplicationException) thrown).errorCode())
+                .isEqualTo(KnowledgeApplicationErrorCode.KNOWLEDGE_RETRIEVAL_FAILURE);
     }
 
     // ---------- 辅助 ----------
