@@ -211,11 +211,24 @@ class KnowledgeIndexWebTests {
                 .andExpect(content().contentType("application/problem+json"))
                 .andExpect(jsonPath("$.code").value("EMBEDDING_PROVIDER_ERROR"))
                 .andExpect(jsonPath("$.failureCode").value("EMBEDDING_PROVIDER_FAILURE"))
+                // FD-0012-R3：逐字段断言固定文案（title / detail / type / status / instance），
+                // 这才是「上游异常信息不外泄」的判据，也不再依赖对完整响应体的数字片段搜索
+                .andExpect(jsonPath("$.title").value("向量服务不可用"))
+                .andExpect(jsonPath("$.detail").value("向量服务暂时不可用，请稍后重试"))
+                .andExpect(jsonPath("$.type").value("urn:flowdesk:problem:embedding-provider-error"))
+                .andExpect(jsonPath("$.status").value(502))
+                .andExpect(jsonPath("$.instance").value(BASE_PATH + "/" + documentId + "/index"))
                 .andReturn();
 
-        assertThat(result.getResponse().getContentAsString(StandardCharsets.UTF_8))
+        // 泄漏保护只使用「唯一且不会与随机 UUID 碰撞」的哨兵文本。
+        //
+        // 注意：普通数字片段（例如 "429"）不能用于完整响应体的泄漏断言 —— instance 字段里是本次
+        // 请求路径，其中包含随机 document UUID，UUID 完全可能合法地包含 "429" 这样的三连数字，
+        // 于是断言会随机失败（FD-0012-R3 修复的正是这一点）。上游信息是否外泄改由上面的
+        // 字段级断言 + 下面的哨兵文本共同证明。
+        assertThat(bodyOf(result))
+                .doesNotContain("sentinel-http-429")
                 .doesNotContain("sentinel")
-                .doesNotContain("429")
                 .doesNotContain("Timeout");
 
         // 失败补偿：文档必须落到可重试的 INDEX_FAILED
@@ -369,6 +382,14 @@ class KnowledgeIndexWebTests {
 
     private JsonNode body(MvcResult result) throws Exception {
         return this.objectMapper.readTree(result.getResponse().getContentAsString(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * @param result 一次请求结果
+     * @return 响应体原文（UTF-8）
+     */
+    private static String bodyOf(MvcResult result) throws Exception {
+        return result.getResponse().getContentAsString(StandardCharsets.UTF_8);
     }
 
     private String statusOf(String documentId) {

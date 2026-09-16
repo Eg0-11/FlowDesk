@@ -1773,7 +1773,7 @@ java -jar flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar `
 | # | 缺口 | 处理 |
 | --- | --- | --- |
 | 1 | **规范化问题没有传递**：检索用 `NFC + strip` 后的 query 生成向量，生成阶段却从 `command.query()` 取回**原始字符串**送进提示词 —— 两者可能不同，而且大量首尾空白不计入 2000 code point 上限却完整进入提示词 | 抽出 application 层的纯 Java 规范化组件 `KnowledgeQueryNormalizer`（NFC + strip，无校验、无异常、幂等），检索与问答**共用同一实现**：`KnowledgeRetrievalService` 把它送给查询向量端口，`GroundedKnowledgeAnswerService` 用它对同一个原字符串取值写进提示词。问答层**不复制**任何校验规则（合法性仍只由检索用例判定），`query` 也**没有**加入任何 HTTP 响应 |
-| 2 | **引用形态可绕过**：正则只扫描 `\[K(\d*)\]`，`[K-1]`、`[K1a]`、`[K 2]`、`[k9]` 等未匹配的畸形引用被当成普通文字忽略，与合法 `[K1]` 混在一起时整次答案被判成功 | 改为两阶段扫描：先对答案里**每一个**左方括号（含嵌套）判定「引用意图」（`k`/`K` 开头且其后不是 ASCII 字母），再逐个判定是否恰好是「大写 K + 无前导零正整数」；**任何**畸形引用（含未闭合 `[K1`）都使整次作答失败。`[Known]` 仍是普通文本，`[K999]` 仍是 `UNKNOWN_CITATION` |
+| 2 | **引用形态可绕过**：正则只扫描 `\[K(\d*)\]`，`[K-1]`、`[K1a]`、`[K 2]`、`[k9]` 等未匹配的畸形引用被当成普通文字忽略，与合法 `[K1]` 混在一起时整次答案被判成功 | 改为两阶段扫描：先对答案里**每一个**左方括号（含嵌套）判定「引用意图」（当时的判据是 `k`/`K` 开头且其后不是 ASCII 字母），再逐个判定是否恰好是「大写 K + 无前导零正整数」；畸形引用（含未闭合 `[K1`）使整次作答失败。`[Known]` 仍是普通文本，`[K999]` 仍是 `UNKNOWN_CITATION`。**该意图判据随后被 FD-0012-R2 收紧为「至少两个 ASCII 字母的完整单词」，见 19.9** |
 | 3 | **证据可逃逸行协议**：`[K1] documentTitle=…` / `content:` / `---` 的行协议里，数据与结构共用字符，正文中的换行、`---`、伪造字段名能在文本上「长成」新字段或新证据块 | 问题、`allowedCitationIds`、`evidence` 改为序列化成**确定性 JSON**（字段顺序固定的 `LinkedHashMap`），引号/反斜杠/CR/LF/`---`/Markdown/XML/伪造字段名全部成为字符串内容；全局边界标记保留，数据中的同名标记被中和，最终各只出现一次。`flowdesk-agent` **显式声明** `jackson-databind` 依赖（不依赖 Spring AI 偶然带入的传递依赖） |
 | 4 | **审计快照不完整**：`KnowledgeAnswerResult` 复制了 `usedCitationIds`，但 `retrieval.citations()` 仍可能指向外部可变列表，「证据」在校验之后还能被改 | `KnowledgeRetrievalView` 紧凑构造器统一执行 `citations = List.copyOf(...)`（并拒绝 `null`），检索与问答两条链路都得到不可变证据快照；HTTP JSON 结构不变（两个响应 DTO 都是显式映射） |
 

@@ -141,8 +141,8 @@ public final class GroundedCitationValidator {
     /**
      * 判断方括号内的文本是否表达了「引用意图」。
      *
-     * <p>规则（FD-0012-R2）：整体是 ASCII 字母单词（{@code [A-Za-z]+}）时按普通文本处理；
-     * 否则只要 {@code inner.strip()} 以 {@code K}/{@code k} 开头，就认为存在引用意图。
+     * <p>规则（FD-0012-R2）：整体是 ASCII 字母单词（{@code [A-Za-z]{2,}}，即至少两个 ASCII 字母）
+     * 时按普通文本处理；否则只要 {@code inner.strip()} 以 {@code K}/{@code k} 开头，就认为存在引用意图。
      * {@code strip()} 只用于这一步判断，<b>不</b>参与规范判定。</p>
      *
      * @param inner 方括号之间的文本（未闭合时为左括号之后的全部内容）
