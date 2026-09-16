@@ -51,7 +51,8 @@ class KnowledgeRetrievalViewTest {
 
     @Test
     void rejectsANullEvidenceList() {
-        assertThatThrownBy(() -> new KnowledgeRetrievalView("dashscope", "text-embedding-v4", 1024, 5, 0.30, null))
+        assertThatThrownBy(() -> KnowledgeRetrievalView.vectorOrdered("dashscope", "text-embedding-v4",
+                1024, 5, 0.30, null))
                 .isInstanceOf(NullPointerException.class);
     }
 
@@ -70,14 +71,65 @@ class KnowledgeRetrievalViewTest {
                 .isInstanceOf(UnsupportedOperationException.class);
     }
 
+    // ---------- 排序模式与重排分必须自洽（RAG 6/6）----------
+
+    @Test
+    void rejectsARerankModeWithoutAModelOrWithoutRerankScores() {
+        assertThatThrownBy(() -> new KnowledgeRetrievalView("dashscope", "text-embedding-v4", 1024, 5, 0.30,
+                KnowledgeRankingMode.RERANK, null, List.of(citation("K1"))))
+                .as("声称经过重排却没给出重排模型")
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new KnowledgeRetrievalView("dashscope", "text-embedding-v4", 1024, 5, 0.30,
+                KnowledgeRankingMode.RERANK, "qwen3-rerank", List.of(citation("K1"))))
+                .as("声称经过重排却没有重排分")
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new KnowledgeRetrievalView("dashscope", "text-embedding-v4", 1024, 5, 0.30,
+                KnowledgeRankingMode.VECTOR_SIMILARITY, "qwen3-rerank", List.of(citation("K1"))))
+                .as("没有使用重排却给出重排模型")
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void rejectsRerankScoresWhenTheModeIsVectorSimilarity() {
+        KnowledgeCitationView withScore = new KnowledgeCitationView("K1", 1, DOCUMENT_ID, 4L, "标题", 0,
+                "0".repeat(64), "正文", 0.9, 0.8);
+
+        assertThatThrownBy(() -> KnowledgeRetrievalView.vectorOrdered("dashscope", "text-embedding-v4",
+                1024, 5, 0.30, List.of(withScore)))
+                .as("未使用重排时引用不得带重排分")
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void rejectsANullRankingMode() {
+        assertThatThrownBy(() -> new KnowledgeRetrievalView("dashscope", "text-embedding-v4", 1024, 5, 0.30,
+                null, null, List.of(citation("K1"))))
+                .isInstanceOf(NullPointerException.class);
+    }
+
+    @Test
+    void acceptsARerankViewWhereEveryCitationCarriesItsScore() {
+        KnowledgeCitationView reranked = new KnowledgeCitationView("K1", 1, DOCUMENT_ID, 4L, "标题", 0,
+                "0".repeat(64), "正文", 0.9, 0.8);
+
+        KnowledgeRetrievalView view = new KnowledgeRetrievalView("dashscope", "text-embedding-v4", 1024, 5,
+                0.30, KnowledgeRankingMode.RERANK, "qwen3-rerank", List.of(reranked));
+
+        assertThat(view.rankingMode()).isEqualTo(KnowledgeRankingMode.RERANK);
+        assertThat(view.rerankModel()).isEqualTo("qwen3-rerank");
+        assertThat(view.citations()).extracting(KnowledgeCitationView::rerankScore).containsExactly(0.8);
+        assertThat(view.citations()).extracting(KnowledgeCitationView::score)
+                .as("向量分不被重排分覆盖").containsExactly(0.9);
+    }
+
     // ---------- 辅助 ----------
 
     private static KnowledgeRetrievalView view(List<KnowledgeCitationView> citations) {
-        return new KnowledgeRetrievalView("dashscope", "text-embedding-v4", 1024, 5, 0.30, citations);
+        return KnowledgeRetrievalView.vectorOrdered("dashscope", "text-embedding-v4", 1024, 5, 0.30, citations);
     }
 
     private static KnowledgeCitationView citation(String citationId) {
-        return new KnowledgeCitationView(citationId, 1, DOCUMENT_ID, 4L, "VPN 故障处理手册", 0,
+        return KnowledgeCitationView.vectorOnly(citationId, 1, DOCUMENT_ID, 4L, "VPN 故障处理手册", 0,
                 "0".repeat(64), "正文", 0.9);
     }
 }

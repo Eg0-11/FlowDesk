@@ -387,16 +387,16 @@ class GroundedKnowledgeAnswerServiceTest {
         static FakeRetrieval withCitations(int count) {
             List<KnowledgeCitationView> citations = new ArrayList<>();
             for (int index = 1; index <= count; index++) {
-                citations.add(new KnowledgeCitationView("K" + index, index, DOCUMENT_ID, 4L,
+                citations.add(KnowledgeCitationView.vectorOnly("K" + index, index, DOCUMENT_ID, 4L,
                         "VPN 故障处理手册", index - 1, DIGEST, "第 " + index + " 段正文", 0.9 - index * 0.1));
             }
-            return new FakeRetrieval(new KnowledgeRetrievalView("dashscope", "text-embedding-v4", 1024, 5, 0.30,
-                    List.copyOf(citations)), null);
+            return new FakeRetrieval(KnowledgeRetrievalView.vectorOrdered("dashscope", "text-embedding-v4",
+                    1024, 5, 0.30, List.copyOf(citations)), null);
         }
 
         static FakeRetrieval empty() {
-            return new FakeRetrieval(new KnowledgeRetrievalView("dashscope", "text-embedding-v4", 1024, 5, 0.30,
-                    List.of()), null);
+            return new FakeRetrieval(KnowledgeRetrievalView.vectorOrdered("dashscope", "text-embedding-v4",
+                    1024, 5, 0.30, List.of()), null);
         }
 
         static FakeRetrieval failing(KnowledgeApplicationException failure) {

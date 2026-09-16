@@ -8,6 +8,7 @@ import com.flowdesk.application.knowledge.port.out.KnowledgeVectorMatch;
 import com.flowdesk.application.knowledge.query.RetrieveKnowledgeQuery;
 import com.flowdesk.application.knowledge.service.KnowledgeRetrievalService;
 import com.flowdesk.application.knowledge.view.KnowledgeCitationView;
+import com.flowdesk.application.knowledge.view.KnowledgeRankingMode;
 import com.flowdesk.application.knowledge.view.KnowledgeRetrievalView;
 import com.flowdesk.domain.knowledge.EmbeddingDescriptor;
 import com.flowdesk.domain.knowledge.KnowledgeDocumentId;
@@ -50,6 +51,8 @@ class KnowledgeRetrievalServiceTest {
 
     private RecordingRetrievalPorts.RecordingVectorSearchPort searchPort;
 
+    private RecordingRetrievalPorts.RecordingRerankPort rerankPort;
+
     private KnowledgeRetrievalService service;
 
     @BeforeEach
@@ -57,13 +60,58 @@ class KnowledgeRetrievalServiceTest {
         this.ports = new RecordingRetrievalPorts();
         this.queryPort = this.ports.new RecordingQueryEmbeddingPort();
         this.searchPort = this.ports.new RecordingVectorSearchPort();
+        this.rerankPort = this.ports.new RecordingRerankPort();
         this.queryPort.willReturn(RecordingRetrievalPorts.vector(0.5f));
         this.service = service(true);
     }
 
     private KnowledgeRetrievalService service(boolean enabled) {
-        return new KnowledgeRetrievalService(this.queryPort, this.searchPort, enabled, DESCRIPTOR,
+        return service(enabled, false);
+    }
+
+    /**
+     * @param enabled       是否启用向量化
+     * @param rerankEnabled 是否启用重排（本类默认关闭：既有 RAG 4/6 行为必须保持不变）
+     * @return 用例服务
+     */
+    private KnowledgeRetrievalService service(boolean enabled, boolean rerankEnabled) {
+        return new KnowledgeRetrievalService(this.queryPort, this.searchPort, this.rerankPort, enabled,
+                rerankEnabled, rerankEnabled ? "qwen3-rerank" : null, DESCRIPTOR,
                 MAX_QUERY_CODE_POINTS, DEFAULT_TOP_K, MAX_TOP_K, DEFAULT_MIN_SCORE);
+    }
+
+    /**
+     * 直接构造用例（绕过 Spring）以验证构造期的硬上限校验；向量化启用、重排关闭。
+     *
+     * @param maxQueryCodePoints 单个 query 的 code point 上限
+     * @param defaultTopK        topK 默认值
+     * @param maxTopK            topK 上限
+     * @param defaultMinScore    相似度下限默认值
+     * @return 用例服务
+     */
+    private KnowledgeRetrievalService serviceWith(int maxQueryCodePoints, int defaultTopK, int maxTopK,
+            double defaultMinScore) {
+        return new KnowledgeRetrievalService(this.queryPort, this.searchPort, this.rerankPort, true, false,
+                null, DESCRIPTOR, maxQueryCodePoints, defaultTopK, maxTopK, defaultMinScore);
+    }
+
+    // ---------- 重排关闭：既有行为完全不变（RAG 6/6）----------
+
+    @Test
+    void whenRerankIsDisabledThePortIsNeverCalledAndTheModeStaysVectorSimilarity() {
+        this.searchPort.willReturn(List.of(
+                RecordingRetrievalPorts.match(FIRST_DOCUMENT, 0, 0.9),
+                RecordingRetrievalPorts.match(SECOND_DOCUMENT, 1, 0.8)));
+
+        KnowledgeRetrievalView view = this.service.retrieve(new RetrieveKnowledgeQuery("VPN", null, null));
+
+        assertThat(this.rerankPort.calls()).as("关闭重排时端口调用次数必须为 0").isZero();
+        assertThat(this.ports.callOrder()).containsExactly("query", "search");
+        assertThat(view.rankingMode()).isEqualTo(KnowledgeRankingMode.VECTOR_SIMILARITY);
+        assertThat(view.rerankModel()).isNull();
+        assertThat(view.citations()).extracting(KnowledgeCitationView::rerankScore).containsOnlyNulls();
+        assertThat(view.citations()).extracting(KnowledgeCitationView::citationId)
+                .containsExactly("K1", "K2");
     }
 
     // ---------- 输入边界 ----------
@@ -423,38 +471,30 @@ class KnowledgeRetrievalServiceTest {
 
     @Test
     void rejectsInconsistentRetrievalConfigurationAtConstruction() {
-        assertThatThrownBy(() -> new KnowledgeRetrievalService(this.queryPort, this.searchPort, true, DESCRIPTOR,
-                0, DEFAULT_TOP_K, MAX_TOP_K, DEFAULT_MIN_SCORE))
+        assertThatThrownBy(() -> serviceWith(0, DEFAULT_TOP_K, MAX_TOP_K, DEFAULT_MIN_SCORE))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("maxQueryCodePoints");
-        assertThatThrownBy(() -> new KnowledgeRetrievalService(this.queryPort, this.searchPort, true, DESCRIPTOR,
-                MAX_QUERY_CODE_POINTS + 1, DEFAULT_TOP_K, MAX_TOP_K, DEFAULT_MIN_SCORE))
+        assertThatThrownBy(() -> serviceWith(MAX_QUERY_CODE_POINTS + 1, DEFAULT_TOP_K, MAX_TOP_K, DEFAULT_MIN_SCORE))
                 .as("query 上限超过公开契约的 2000 必须被拒绝")
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("maxQueryCodePoints");
-        assertThatThrownBy(() -> new KnowledgeRetrievalService(this.queryPort, this.searchPort, true, DESCRIPTOR,
-                MAX_QUERY_CODE_POINTS, 0, MAX_TOP_K, DEFAULT_MIN_SCORE))
+        assertThatThrownBy(() -> serviceWith(MAX_QUERY_CODE_POINTS, 0, MAX_TOP_K, DEFAULT_MIN_SCORE))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("defaultTopK");
-        assertThatThrownBy(() -> new KnowledgeRetrievalService(this.queryPort, this.searchPort, true, DESCRIPTOR,
-                MAX_QUERY_CODE_POINTS, 6, 5, DEFAULT_MIN_SCORE))
+        assertThatThrownBy(() -> serviceWith(MAX_QUERY_CODE_POINTS, 6, 5, DEFAULT_MIN_SCORE))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("defaultTopK");
-        assertThatThrownBy(() -> new KnowledgeRetrievalService(this.queryPort, this.searchPort, true, DESCRIPTOR,
-                MAX_QUERY_CODE_POINTS, DEFAULT_TOP_K, MAX_TOP_K + 1, DEFAULT_MIN_SCORE))
+        assertThatThrownBy(() -> serviceWith(MAX_QUERY_CODE_POINTS, DEFAULT_TOP_K, MAX_TOP_K + 1, DEFAULT_MIN_SCORE))
                 .as("topK 上限超过公开契约的 20 必须被拒绝")
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("maxTopK");
-        assertThatThrownBy(() -> new KnowledgeRetrievalService(this.queryPort, this.searchPort, true, DESCRIPTOR,
-                MAX_QUERY_CODE_POINTS, DEFAULT_TOP_K, MAX_TOP_K, Double.NaN))
+        assertThatThrownBy(() -> serviceWith(MAX_QUERY_CODE_POINTS, DEFAULT_TOP_K, MAX_TOP_K, Double.NaN))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("defaultMinScore");
     }
 
     @Test
     void theConstructorRejectsLimitsBeyondThePublicContractEvenWhenSpringIsBypassed() {
         // FD-0011-R1：硬上限写在用例构造器里，而不只依赖 Spring 配置类的 validate()
-        assertThatThrownBy(() -> new KnowledgeRetrievalService(this.queryPort, this.searchPort, true, DESCRIPTOR,
-                2001, 5, 20, 0.30))
+        assertThatThrownBy(() -> serviceWith(2001, 5, 20, 0.30))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("maxQueryCodePoints")
                 .hasMessageContaining("2000");
-        assertThatThrownBy(() -> new KnowledgeRetrievalService(this.queryPort, this.searchPort, true, DESCRIPTOR,
-                2000, 5, 21, 0.30))
+        assertThatThrownBy(() -> serviceWith(2000, 5, 21, 0.30))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("maxTopK")
                 .hasMessageContaining("20");
@@ -463,8 +503,7 @@ class KnowledgeRetrievalServiceTest {
     @Test
     void aTightenedConfigurationStillRejectsBeyondTheTightenedLimits() {
         // 配置收紧之后，请求必须受收紧后的限制约束（而不是回到公开上限）
-        KnowledgeRetrievalService tightened = new KnowledgeRetrievalService(this.queryPort, this.searchPort, true,
-                DESCRIPTOR, 10, 2, 3, 0.5);
+        KnowledgeRetrievalService tightened = serviceWith(10, 2, 3, 0.5);
 
         // 未提供 topK / minScore：用收紧后的默认值 2 / 0.5
         tightened.retrieve(new RetrieveKnowledgeQuery("a".repeat(10), null, null));

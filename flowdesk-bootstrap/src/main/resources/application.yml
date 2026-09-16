@@ -114,3 +114,24 @@ flowdesk:
       default-top-k: 5
       max-top-k: 20
       default-min-score: 0.30
+    rerank:
+      # 文本重排（RAG 6/6）：对向量检索的候选做二次排序，默认**关闭**。
+      #
+      # 关闭时：不要求任何 Key/Endpoint、不发起任何请求，检索与问答行为与之前完全一致
+      # （响应的 rankingMode 为 VECTOR_SIMILARITY，且不输出 rerankModel / rerankScore）。
+      #
+      # 开启需要三件东西，缺一即启动失败：
+      #   1. model 必须逐字为 qwen3-rerank（本版本只实现它的扁平请求/响应协议）；
+      #   2. endpoint 没有默认值 —— 它包含账号自己的业务空间 ID，必须由部署方显式提供；
+      #   3. DashScope API Key 可用（或直接配 spring.ai.dashscope.rerank.api-key）。
+      # 另外：重排建立在向量检索之上，因此开启重排时 flowdesk.knowledge.embedding.enabled 必须为 true。
+      #
+      # 语义边界：只重排本次 topK 候选，不扩大初召回池，因此不可能找回向量检索未召回的切片；
+      # 重排失败**不会**静默退回向量排序（那是另一条 502 或 500）。
+      enabled: false
+      model: qwen3-rerank
+      # 示例（请替换 <workspace-id> 与地域；仓库中不保存任何真实业务空间 ID）：
+      #   https://<workspace-id>.ap-southeast-1.maas.aliyuncs.com/compatible-api/v1/reranks
+      endpoint: ""
+      connect-timeout: 3s
+      read-timeout: 10s

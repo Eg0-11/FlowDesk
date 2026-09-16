@@ -10,6 +10,7 @@ import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentIdGenerator;
 import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentRepository;
 import com.flowdesk.application.knowledge.port.out.KnowledgeEmbeddingPort;
 import com.flowdesk.application.knowledge.port.out.KnowledgeQueryEmbeddingPort;
+import com.flowdesk.application.knowledge.port.out.KnowledgeRerankPort;
 import com.flowdesk.application.knowledge.port.out.KnowledgeTimeProvider;
 import com.flowdesk.application.knowledge.port.out.KnowledgeVectorSearchPort;
 import com.flowdesk.infrastructure.knowledge.chunking.DeterministicDocumentChunker;
@@ -25,9 +26,14 @@ import com.flowdesk.infrastructure.knowledge.persistence.jdbc.JdbcKnowledgeDocum
 import com.flowdesk.infrastructure.knowledge.persistence.jdbc.JdbcKnowledgeDocumentRepository;
 import com.flowdesk.infrastructure.knowledge.persistence.jdbc.JdbcKnowledgeVectorSearchAdapter;
 import com.flowdesk.infrastructure.knowledge.retrieval.KnowledgeRetrievalProperties;
+import com.flowdesk.infrastructure.knowledge.rerank.DashScopeKnowledgeRerankAdapter;
+import com.flowdesk.infrastructure.knowledge.rerank.DisabledKnowledgeRerank;
+import com.flowdesk.infrastructure.knowledge.rerank.KnowledgeRerankConfigurationValidator;
+import com.flowdesk.infrastructure.knowledge.rerank.KnowledgeRerankProperties;
 import com.flowdesk.infrastructure.knowledge.storage.LocalFileSystemKnowledgeContentStore;
 import com.flowdesk.infrastructure.knowledge.support.SystemKnowledgeTimeProvider;
 import com.flowdesk.infrastructure.knowledge.support.UuidKnowledgeDocumentIdGenerator;
+import java.net.URI;
 import java.time.Clock;
 import javax.sql.DataSource;
 import org.springframework.ai.embedding.EmbeddingModel;
@@ -65,7 +71,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 @Configuration(proxyBeanMethods = false)
 @EnableConfigurationProperties({ KnowledgeUploadProperties.class, KnowledgeStorageProperties.class,
         KnowledgeChunkingProperties.class, KnowledgeEmbeddingProperties.class,
-        KnowledgeRetrievalProperties.class })
+        KnowledgeRetrievalProperties.class, KnowledgeRerankProperties.class })
 public class KnowledgeConfiguration {
 
     /**
@@ -254,6 +260,60 @@ public class KnowledgeConfiguration {
             return new DisabledKnowledgeEmbedding.Search();
         }
         return new JdbcKnowledgeVectorSearchAdapter(jdbcClient);
+    }
+
+    /**
+     * 启动期校验重排配置（RAG 6/6）。
+     *
+     * <p>Bean 在装配阶段创建，因此配置错误（模型名不符、Endpoint 缺失或含未替换的业务空间占位符、
+     * Key 缺失、超时非法、启用了重排却没启用向量化）会让应用<b>启动失败</b>，
+     * 而不是等到某次检索才表现为 502/500。校验只读配置：<b>不</b>连接、<b>不</b>发请求、
+     * <b>不</b>回显凭证。</p>
+     *
+     * @param rerank    重排配置
+     * @param embedding 向量化配置（用于校验「重排必须建立在向量检索之上」）
+     * @param environment 配置环境（用于读取 DashScope 连接属性中的真实 Key）
+     * @return 校验通过标记
+     */
+    @Bean
+    public Boolean knowledgeRerankConsistency(KnowledgeRerankProperties rerank,
+            KnowledgeEmbeddingProperties embedding, Environment environment) {
+
+        KnowledgeRerankConfigurationValidator.requireValidConfiguration(rerank);
+        KnowledgeRerankConfigurationValidator.requireEmbeddingEnabled(rerank, embedding.isEnabled());
+        KnowledgeRerankConfigurationValidator.requireDashScopeApiKey(rerank, environment);
+        return Boolean.TRUE;
+    }
+
+    /**
+     * 文本重排端口（RAG 6/6）：DashScope qwen3-rerank 的扁平 HTTP 适配器。
+     *
+     * <p>关闭时返回「拒绝一切」的占位实现 —— 与向量化一致，Bean 始终存在，
+     * 因此检索用例的构造与开关判断不需要处理「端口可能缺失」。端口只在
+     * {@code flowdesk.knowledge.rerank.enabled=true} 且候选多于 1 条时被调用。</p>
+     *
+     * <p>模型名、Endpoint 与 Key 在这里再校验一次：本方法是在创建适配器之前的最后一道闸门，
+     * 无论容器以什么顺序装配 Bean，都不会在配置不合法时创建出调用上游的适配器。</p>
+     *
+     * @param rerank      重排配置
+     * @param environment 配置环境（读取 API Key）
+     * @return 重排端口
+     */
+    @Bean
+    public KnowledgeRerankPort knowledgeRerankPort(KnowledgeRerankProperties rerank,
+            Environment environment) {
+
+        if (!rerank.isEnabled()) {
+            return new DisabledKnowledgeRerank.Port();
+        }
+        KnowledgeRerankConfigurationValidator.requireValidConfiguration(rerank);
+        KnowledgeRerankConfigurationValidator.requireDashScopeApiKey(rerank, environment);
+        return new DashScopeKnowledgeRerankAdapter(
+                URI.create(rerank.getEndpoint()),
+                rerank.getModel(),
+                KnowledgeRerankConfigurationValidator.resolveApiKey(environment),
+                rerank.getConnectTimeout(),
+                rerank.getReadTimeout());
     }
 
     /**

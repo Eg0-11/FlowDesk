@@ -1,6 +1,8 @@
 package com.flowdesk.application.knowledge;
 
 import com.flowdesk.application.knowledge.port.out.KnowledgeQueryEmbeddingPort;
+import com.flowdesk.application.knowledge.port.out.KnowledgeRerankPort;
+import com.flowdesk.application.knowledge.port.out.KnowledgeRerankResult;
 import com.flowdesk.application.knowledge.port.out.KnowledgeVectorMatch;
 import com.flowdesk.application.knowledge.port.out.KnowledgeVectorSearchPort;
 import com.flowdesk.domain.knowledge.EmbeddingDescriptor;
@@ -145,10 +147,76 @@ final class RecordingRetrievalPorts {
     }
 
     /**
-     * @return 调用顺序（{@code query} / {@code search}）
+     * @return 调用顺序（{@code query} / {@code search} / {@code rerank}）
      */
     List<String> callOrder() {
         return List.copyOf(this.callOrder);
+    }
+
+    /**
+     * 重排替身（RAG 6/6）：记录收到的 query 与候选正文，可返回预置结果或注入失败。
+     *
+     * <p>刻意记录<b>收到的候选正文</b>而不只是条数：端口契约要求「只发送规范化后的 query 与候选正文」，
+     * 只有把实参记下来才能断言没有多余字段（文档标识、摘要、向量……）被发出去。</p>
+     */
+    final class RecordingRerankPort implements KnowledgeRerankPort {
+
+        private final List<String> queries = new ArrayList<>();
+
+        private final List<List<String>> documents = new ArrayList<>();
+
+        private List<KnowledgeRerankResult> results;
+
+        private RuntimeException failure;
+
+        @Override
+        public List<KnowledgeRerankResult> rerank(String normalizedQuery, List<String> candidateContents) {
+            callOrder.add("rerank");
+            this.queries.add(normalizedQuery);
+            this.documents.add(List.copyOf(candidateContents));
+            if (this.failure != null) {
+                throw this.failure;
+            }
+            return this.results;
+        }
+
+        /**
+         * 按候选顺序给出一组分数（下标自动为 0..n-1）。
+         *
+         * @param scores 每个候选的重排分
+         */
+        void willReturnScores(double... scores) {
+            List<KnowledgeRerankResult> next = new ArrayList<>(scores.length);
+            for (int index = 0; index < scores.length; index++) {
+                next.add(new KnowledgeRerankResult(index, scores[index]));
+            }
+            this.results = next;
+        }
+
+        /**
+         * 直接给出结果列表（用于构造非法下标、重复下标、缺分数等违约响应）。
+         *
+         * @param results 结果（可为 {@code null}，表示端口返回 null）
+         */
+        void willReturn(List<KnowledgeRerankResult> results) {
+            this.results = results == null ? null : new ArrayList<>(results);
+        }
+
+        void failWith(RuntimeException failure) {
+            this.failure = failure;
+        }
+
+        List<String> queries() {
+            return List.copyOf(this.queries);
+        }
+
+        List<List<String>> documents() {
+            return List.copyOf(this.documents);
+        }
+
+        int calls() {
+            return this.queries.size();
+        }
     }
 
     /**

@@ -36,6 +36,15 @@ public enum KnowledgeApplicationErrorCode {
     /** 上游向量服务失败：超时、限流、5xx、连接失败等。 */
     EMBEDDING_PROVIDER_ERROR,
 
+    /**
+     * 上游重排服务失败（RAG 6/6）：超时、限流、5xx、鉴权失败等。
+     *
+     * <p>与 {@link #EMBEDDING_PROVIDER_ERROR} 分开是刻意的：两者是<b>不同的上游</b>
+     * （向量化与重排），合并成一个错误码后「哪一段上游出问题」就只能在日志里猜。
+     * 两者都是 502，且同样<b>不会</b>静默降级成别的排序方式。</p>
+     */
+    RERANK_PROVIDER_ERROR,
+
     /** 检索请求本身不合法：query 缺失/空白/超长/含控制字符，或 topK、minScore 越界。 */
     INVALID_RETRIEVAL_QUERY,
 

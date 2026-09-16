@@ -10,6 +10,7 @@ import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentIdGenerator;
 import com.flowdesk.application.knowledge.port.out.KnowledgeDocumentRepository;
 import com.flowdesk.application.knowledge.port.out.KnowledgeEmbeddingPort;
 import com.flowdesk.application.knowledge.port.out.KnowledgeQueryEmbeddingPort;
+import com.flowdesk.application.knowledge.port.out.KnowledgeRerankPort;
 import com.flowdesk.application.knowledge.port.out.KnowledgeTimeProvider;
 import com.flowdesk.application.knowledge.port.out.KnowledgeVectorSearchPort;
 import com.flowdesk.application.knowledge.service.KnowledgeDocumentApplicationService;
@@ -18,6 +19,7 @@ import com.flowdesk.application.knowledge.service.KnowledgeDocumentParsingServic
 import com.flowdesk.application.knowledge.service.KnowledgeRetrievalService;
 import com.flowdesk.infrastructure.knowledge.KnowledgeUploadProperties;
 import com.flowdesk.infrastructure.knowledge.embedding.KnowledgeEmbeddingProperties;
+import com.flowdesk.infrastructure.knowledge.rerank.KnowledgeRerankProperties;
 import com.flowdesk.infrastructure.knowledge.retrieval.KnowledgeRetrievalProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -116,29 +118,38 @@ public class KnowledgeApplicationConfiguration {
     }
 
     /**
-     * 知识检索用例服务（RAG 4/6）。
+     * 知识检索用例服务（RAG 4/6，RAG 6/6 增加可选重排）。
      *
      * <p>开关与模型参数从配置取出后以纯值注入：应用层只认识 {@code boolean}、描述符与几个数值，
-     * 不认识 Spring 的配置类型。关闭状态下两个端口都由「拒绝一切」的占位实现提供，
+     * 不认识 Spring 的配置类型。关闭状态下三个端口都由「拒绝一切」的占位实现提供，
      * 用例服务本身仍然存在 —— 这样 HTTP 契约（503 {@code KNOWLEDGE_EMBEDDING_DISABLED}）
      * 在默认环境也成立，而不是变成「Bean 缺失」导致的启动失败。</p>
      *
+     * <p><b>重排只在这里装配一次</b>：检索接口与问答接口都通过同一个检索用例取得证据，
+     * 因此两者必然使用<b>同一份最终排序</b>，不需要（也不允许）各自实现一套重排逻辑。</p>
+     *
      * @param queryEmbeddingPort 查询向量生成端口
      * @param vectorSearchPort   向量检索端口
+     * @param rerankPort         重排端口（关闭重排时不会被调用）
      * @param embedding          向量化配置（提供开关与描述符）
      * @param retrieval          检索配置（提供 query 上限、topK 与阈值默认值/上限）
+     * @param rerank             重排配置（提供开关与模型标识）
      * @return 检索用例服务
      */
     @Bean
     public KnowledgeRetrievalService knowledgeRetrievalService(
             KnowledgeQueryEmbeddingPort queryEmbeddingPort,
             KnowledgeVectorSearchPort vectorSearchPort,
+            KnowledgeRerankPort rerankPort,
             KnowledgeEmbeddingProperties embedding,
-            KnowledgeRetrievalProperties retrieval) {
+            KnowledgeRetrievalProperties retrieval,
+            KnowledgeRerankProperties rerank) {
 
         retrieval.validate();
-        return new KnowledgeRetrievalService(queryEmbeddingPort, vectorSearchPort, embedding.isEnabled(),
-                embedding.descriptor(), retrieval.getMaxQueryCodePoints(), retrieval.getDefaultTopK(),
+        rerank.validate();
+        return new KnowledgeRetrievalService(queryEmbeddingPort, vectorSearchPort, rerankPort,
+                embedding.isEnabled(), rerank.isEnabled(), rerank.getModel(), embedding.descriptor(),
+                retrieval.getMaxQueryCodePoints(), retrieval.getDefaultTopK(),
                 retrieval.getMaxTopK(), retrieval.getDefaultMinScore());
     }
 }

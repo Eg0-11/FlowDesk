@@ -54,8 +54,13 @@ import org.springframework.ai.chat.client.ChatClient;
  * 归一（详见 {@link GroundedCitationValidator} 的「已知边界」）。</p>
  *
  * <h2>不做的事</h2>
- * <p>不生成流式输出、不做 Rerank、不拼接多轮会话记忆、不注册任何工具；
+ * <p>不生成流式输出、不拼接多轮会话记忆、不注册任何工具；
  * 也不修改检索阶段的 SQL、排序、阈值或引用编号。</p>
+ *
+ * <p><b>重排（RAG 6/6）不在本层</b>：候选的二次排序由检索用例完成（见 ADR 0010），
+ * 本层只是消费它给出的最终顺序 —— 因此提示词里的证据顺序、{@code allowedCitationIds}
+ * 与响应里的 {@code citations} 天然一致，本层不需要（也不允许）自己再排一次。
+ * 重排分也不会进入提示词：模型只需要「问题 + 候选正文 + 允许的编号」。</p>
  *
  * <h2>日志</h2>
  * <p>成功只记录 {@code operation}、{@code requestId}、{@code grounded}、

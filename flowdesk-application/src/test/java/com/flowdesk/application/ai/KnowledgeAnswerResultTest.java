@@ -175,7 +175,8 @@ class KnowledgeAnswerResultTest {
         for (String citationId : citationIds) {
             citations.add(citation(citationId, rank++));
         }
-        return new KnowledgeRetrievalView("dashscope", "text-embedding-v4", 1024, 5, 0.30, List.copyOf(citations));
+        return KnowledgeRetrievalView.vectorOrdered("dashscope", "text-embedding-v4", 1024, 5, 0.30,
+                List.copyOf(citations));
     }
 
     /**
@@ -183,7 +184,7 @@ class KnowledgeAnswerResultTest {
      * @return 证据视图
      */
     private static KnowledgeRetrievalView retrieval(List<KnowledgeCitationView> citations) {
-        return new KnowledgeRetrievalView("dashscope", "text-embedding-v4", 1024, 5, 0.30, citations);
+        return KnowledgeRetrievalView.vectorOrdered("dashscope", "text-embedding-v4", 1024, 5, 0.30, citations);
     }
 
     private static KnowledgeCitationView citation(String citationId) {
@@ -191,6 +192,7 @@ class KnowledgeAnswerResultTest {
     }
 
     private static KnowledgeCitationView citation(String citationId, int rank) {
-        return new KnowledgeCitationView(citationId, rank, DOCUMENT_ID, 4L, "标题", rank, "0".repeat(64), "正文", 0.9);
+        return KnowledgeCitationView.vectorOnly(citationId, rank, DOCUMENT_ID, 4L, "标题", rank,
+                "0".repeat(64), "正文", 0.9);
     }
 }

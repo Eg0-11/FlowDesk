@@ -82,3 +82,13 @@ flowdesk:
       model: text-embedding-v4
       dimensions: 1024
       batch-size: 10
+    # 文本重排（FD-0013，RAG 6/6）：默认关闭，本 profile 不替使用者做决定。
+    # 需要时在启动参数里显式打开（Endpoint 含账号自己的业务空间 ID，仓库里不保存）：
+    #   --flowdesk.knowledge.rerank.enabled=true
+    #   --flowdesk.knowledge.rerank.endpoint=https://<workspace-id>.<region>.maas.aliyuncs.com/compatible-api/v1/reranks
+    # 重排复用本 profile 绑定的 DASHSCOPE_API_KEY（也可用重排的模态级连接属性覆盖，见 README 20.6）。
+    # 开启重排要求 embedding.enabled=true（重排只对向量检索的候选生效），否则应用启动失败。
+    # 注意：本 profile 里仍然只有一处凭证占位符，重排不引入第二个。
+    rerank:
+      enabled: false
+      model: qwen3-rerank

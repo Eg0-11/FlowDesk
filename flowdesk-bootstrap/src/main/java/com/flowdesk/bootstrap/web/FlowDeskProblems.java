@@ -94,6 +94,14 @@ public final class FlowDeskProblems {
     /** 上游向量服务失败：超时、限流、5xx、连接失败等。 */
     public static final String CODE_EMBEDDING_PROVIDER_ERROR = "EMBEDDING_PROVIDER_ERROR";
 
+    /**
+     * 上游重排服务失败（RAG 6/6）：超时、限流、5xx、鉴权失败等。
+     *
+     * <p>与 {@link #CODE_EMBEDDING_PROVIDER_ERROR} 分开：两者是<b>不同的上游</b>，
+     * 合并成一个错误码后「哪一段上游出问题」只能在日志里猜。</p>
+     */
+    public static final String CODE_RERANK_PROVIDER_ERROR = "RERANK_PROVIDER_ERROR";
+
     /** 文档无法解析：内容损坏、加密、与声明格式不符，或提取不到文本。 */
     public static final String CODE_DOCUMENT_PARSE_FAILED = "DOCUMENT_PARSE_FAILED";
 

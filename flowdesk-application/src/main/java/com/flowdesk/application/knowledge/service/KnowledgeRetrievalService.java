@@ -4,16 +4,20 @@ import com.flowdesk.application.knowledge.KnowledgeApplicationErrorCode;
 import com.flowdesk.application.knowledge.KnowledgeApplicationException;
 import com.flowdesk.application.knowledge.port.in.RetrieveKnowledgeUseCase;
 import com.flowdesk.application.knowledge.port.out.KnowledgeQueryEmbeddingPort;
+import com.flowdesk.application.knowledge.port.out.KnowledgeRerankPort;
+import com.flowdesk.application.knowledge.port.out.KnowledgeRerankResult;
 import com.flowdesk.application.knowledge.port.out.KnowledgeVectorMatch;
 import com.flowdesk.application.knowledge.port.out.KnowledgeVectorSearchPort;
 import com.flowdesk.application.knowledge.query.KnowledgeQueryNormalizer;
 import com.flowdesk.application.knowledge.query.RetrieveKnowledgeQuery;
 import com.flowdesk.application.knowledge.view.KnowledgeCitationView;
+import com.flowdesk.application.knowledge.view.KnowledgeRankingMode;
 import com.flowdesk.application.knowledge.view.KnowledgeRetrievalView;
 import com.flowdesk.domain.knowledge.EmbeddingDescriptor;
 import com.flowdesk.domain.knowledge.KnowledgeDomainException;
 import com.flowdesk.domain.knowledge.KnowledgeQueryEmbedding;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
@@ -38,8 +42,22 @@ import java.util.Set;
  *       领域异常或运行期异常都在端口边界被收敛为它（见 {@link #search});</li>
  *   <li><b>结果校验</b>：条数不超过 {@code topK}、分数有限且落在 {@code 0..1} 且不低于阈值、
  *       顺序满足「score 降序 → documentId 升序 → chunkIndex 升序」、无重复切片；</li>
- *   <li><b>生成引用</b>：按最终顺序编号 {@code K1}、{@code K2}……，{@code rank} 从 1 连续递增。</li>
+ *   <li><b>可选重排</b>（RAG 6/6）：仅在启用且候选多于 1 条时调用一次
+ *       {@link KnowledgeRerankPort}，只重排<b>本次候选</b>，不扩大初召回池；</li>
+ *   <li><b>重排结果校验</b>：下标完整覆盖候选且不重复、分数是 {@code 0..1} 的有限数值，
+ *       违反即失败（不猜测、不补齐）；</li>
+ *   <li><b>生成引用</b>：按<b>最终顺序</b>编号 {@code K1}、{@code K2}……，{@code rank} 从 1 连续递增；
+ *       {@code score} 始终是向量相似度，重排分放在 {@code rerankScore}。</li>
  * </ol>
+ *
+ * <h2>重排只改顺序，不改召回</h2>
+ * <p>重排的输入是向量检索<b>已经返回</b>的那几条候选，因此它<b>不可能</b>找回向量检索没有召回的切片。
+ * 本阶段刻意不扩大初召回池（例如「检索 100 条再重排取 5 条」）：那会改变 topK 与阈值这两条
+ * 已经公开的契约，属于另一个阶段的设计。</p>
+ *
+ * <h2>不降级</h2>
+ * <p>重排失败（上游 502，或响应违反契约 500）时整次检索失败，<b>不会</b>悄悄退回向量排序：
+ * 静默降级会让调用方以为这份顺序已经过重排，而实际上没有 —— 那比直接失败更难发现。</p>
  *
  * <h2>为什么结果校验是「拒绝」而不是「修正」</h2>
  * <p>第 6 步<b>不</b>排序、<b>不</b>去重、<b>不</b>截断、<b>不</b>修正：</p>
@@ -89,7 +107,15 @@ public final class KnowledgeRetrievalService implements RetrieveKnowledgeUseCase
 
     private final KnowledgeVectorSearchPort vectorSearchPort;
 
+    private final KnowledgeRerankPort rerankPort;
+
     private final boolean embeddingEnabled;
+
+    /** 是否启用重排（RAG 6/6）；关闭时 {@link #rerankPort} 永远不会被调用。 */
+    private final boolean rerankEnabled;
+
+    /** 重排模型标识：只在重排真正决定顺序时写进结果，用于审计。 */
+    private final String rerankModel;
 
     private final EmbeddingDescriptor descriptor;
 
@@ -104,7 +130,10 @@ public final class KnowledgeRetrievalService implements RetrieveKnowledgeUseCase
     /**
      * @param queryEmbeddingPort  查询向量生成端口
      * @param vectorSearchPort    向量相似度检索端口
+     * @param rerankPort          重排端口（关闭重排时不会被调用）
      * @param embeddingEnabled    当前环境是否启用向量化
+     * @param rerankEnabled       当前环境是否启用重排
+     * @param rerankModel         重排模型标识（用于审计；关闭重排时可为 {@code null}）
      * @param descriptor          与文档侧共用的向量描述符
      * @param maxQueryCodePoints  单个 query 允许的最大 code point 数
      * @param defaultTopK         {@code topK} 默认值
@@ -113,7 +142,10 @@ public final class KnowledgeRetrievalService implements RetrieveKnowledgeUseCase
      */
     public KnowledgeRetrievalService(KnowledgeQueryEmbeddingPort queryEmbeddingPort,
             KnowledgeVectorSearchPort vectorSearchPort,
+            KnowledgeRerankPort rerankPort,
             boolean embeddingEnabled,
+            boolean rerankEnabled,
+            String rerankModel,
             EmbeddingDescriptor descriptor,
             int maxQueryCodePoints,
             int defaultTopK,
@@ -122,6 +154,7 @@ public final class KnowledgeRetrievalService implements RetrieveKnowledgeUseCase
 
         this.queryEmbeddingPort = Objects.requireNonNull(queryEmbeddingPort, "queryEmbeddingPort 不能为 null");
         this.vectorSearchPort = Objects.requireNonNull(vectorSearchPort, "vectorSearchPort 不能为 null");
+        this.rerankPort = Objects.requireNonNull(rerankPort, "rerankPort 不能为 null");
         this.descriptor = Objects.requireNonNull(descriptor, "descriptor 不能为 null");
         // 硬上限校验放在构造器里，而不是只依赖 Spring 配置类的 validate()：
         // 直接构造用例（测试、其它装配方式）同样不能突破公开契约
@@ -140,8 +173,14 @@ public final class KnowledgeRetrievalService implements RetrieveKnowledgeUseCase
                 || defaultMinScore > MAX_MIN_SCORE) {
             throw new IllegalArgumentException("defaultMinScore 必须是 0.0..1.0 之间的有限数值");
         }
+        // 启用重排却没有模型标识，会让「这份顺序是哪个重排模型给的」无从审计，因此直接拒绝
+        if (rerankEnabled && (rerankModel == null || rerankModel.isBlank())) {
+            throw new IllegalArgumentException("启用重排时必须给出重排模型标识");
+        }
 
         this.embeddingEnabled = embeddingEnabled;
+        this.rerankEnabled = rerankEnabled;
+        this.rerankModel = rerankEnabled ? rerankModel : null;
         this.maxQueryCodePoints = maxQueryCodePoints;
         this.defaultTopK = defaultTopK;
         this.maxTopK = maxTopK;
@@ -170,9 +209,70 @@ public final class KnowledgeRetrievalService implements RetrieveKnowledgeUseCase
         // ⑥ 结果契约校验：拒绝，而不是修正
         requireValidMatches(matches, topK, minScore);
 
-        // ⑦ 按最终顺序生成引用
+        // ⑦ 可选重排：只重排本次 topK 候选，不扩大初召回池
+        boolean reranked = this.rerankEnabled && matches.size() > 1;
+        List<RankedMatch> ranked = reranked ? rerank(normalizedQuery, matches) : vectorOrder(matches);
+
+        // ⑧ 按最终顺序生成引用（citationId 与 rank 都基于最终顺序）
         return new KnowledgeRetrievalView(this.descriptor.provider(), this.descriptor.model(),
-                this.descriptor.dimensions(), topK, minScore, cite(matches));
+                this.descriptor.dimensions(), topK, minScore,
+                reranked ? KnowledgeRankingMode.RERANK : KnowledgeRankingMode.VECTOR_SIMILARITY,
+                reranked ? this.rerankModel : null,
+                cite(ranked));
+    }
+
+    /**
+     * 一条候选及其最终排序依据（RAG 6/6）。
+     *
+     * <p>{@code rerankScore} 为 {@code null} 表示本次没有使用重排（开关关闭或候选不足）。
+     * 把「向量命中」与「重排分」绑在同一个对象上，是为了避免两条并行列表被错位使用 ——
+     * 那正是引用与被引用内容错配的典型来源。</p>
+     *
+     * @param match       向量检索命中
+     * @param rerankScore 重排分；未使用重排时为 {@code null}
+     */
+    private record RankedMatch(KnowledgeVectorMatch match, Double rerankScore) {
+    }
+
+    /**
+     * 保持向量顺序（不使用重排）。
+     *
+     * @param matches 已校验的命中
+     * @return 按原顺序排列的候选
+     */
+    private static List<RankedMatch> vectorOrder(List<KnowledgeVectorMatch> matches) {
+        List<RankedMatch> ranked = new ArrayList<>(matches.size());
+        for (KnowledgeVectorMatch match : matches) {
+            ranked.add(new RankedMatch(match, null));
+        }
+        return ranked;
+    }
+
+    /**
+     * 调用重排端口重排本次候选（RAG 6/6）。
+     *
+     * <p>只发送<b>规范化后的 query 与候选正文</b>：文档标识、版本、摘要、向量与任何数据库信息
+     * 都不属于重排的输入。返回结果按 {@code index} 绑回候选，然后按重排分降序排列；
+     * 同分时保持<b>原向量排名</b>（排序是稳定的，比较器在分数相等时返回 0）。</p>
+     *
+     * @param normalizedQuery 规范化后的用户问题
+     * @param matches         已校验的向量命中（按向量顺序）
+     * @return 按重排分降序排列的候选
+     */
+    private List<RankedMatch> rerank(String normalizedQuery, List<KnowledgeVectorMatch> matches) {
+        List<String> contents = new ArrayList<>(matches.size());
+        for (KnowledgeVectorMatch match : matches) {
+            contents.add(match.content());
+        }
+        List<KnowledgeRerankResult> results = callRerankPort(normalizedQuery, contents);
+        double[] scores = requireValidRerankScores(results, matches.size());
+
+        List<RankedMatch> ranked = new ArrayList<>(matches.size());
+        for (int index = 0; index < matches.size(); index++) {
+            ranked.add(new RankedMatch(matches.get(index), scores[index]));
+        }
+        ranked.sort(Comparator.comparingDouble((RankedMatch entry) -> entry.rerankScore()).reversed());
+        return ranked;
     }
 
     /**
@@ -229,6 +329,94 @@ public final class KnowledgeRetrievalService implements RetrieveKnowledgeUseCase
             throw retrievalFailure("向量检索端口返回了 null");
         }
         return matches;
+    }
+
+    /**
+     * 调用重排端口，并把该端口边界上的失败收敛到契约允许的两种形态（RAG 6/6）。
+     *
+     * <h2>重排端口的错误分类契约</h2>
+     * <ul>
+     *   <li><b>{@code RERANK_PROVIDER_ERROR} 原样上抛</b>（HTTP 502）—— 这是端口唯一允许用来表达
+     *       「上游不可用」的错误码（超时、限流、5xx、鉴权失败），不二次包装；</li>
+     *   <li><b>其余任何 {@link KnowledgeApplicationException}</b> 表示端口<b>违反错误分类契约</b>，
+     *       统一收敛为 {@code KNOWLEDGE_RETRIEVAL_FAILURE}（HTTP 500），原异常作为 cause 保留；</li>
+     *   <li><b>其它运行期异常</b>（含驱动异常与非法响应解析失败）同样收敛为
+     *       {@code KNOWLEDGE_RETRIEVAL_FAILURE}。</li>
+     * </ul>
+     * <p>为什么必须这样收口：端口的任意错误码穿透到 HTTP 层，会让「重排内部出了问题」表现为
+     * 400 / 404 / 503 之类的语义，把那一段故障说成调用方输入错误或功能未启用。
+     * 收口之后重排链路上的失败只有两种对外形态：<b>502（上游重排服务不可用）</b>
+     * 与 <b>500（服务端内部/契约失败）</b>。</p>
+     *
+     * <p>注意：这里<b>没有</b>任何「失败就用原向量排序」的分支 —— 静默降级会让调用方以为
+     * 重排已经生效，而实际顺序没有变，这正是本阶段要排除的假象。</p>
+     *
+     * @param normalizedQuery 规范化后的用户问题
+     * @param contents        候选正文（顺序即向量顺序）
+     * @return 端口返回的重排结果（可能为 {@code null}，由契约校验拒绝）
+     */
+    private List<KnowledgeRerankResult> callRerankPort(String normalizedQuery, List<String> contents) {
+        try {
+            return this.rerankPort.rerank(normalizedQuery, contents);
+        }
+        catch (KnowledgeApplicationException ex) {
+            if (ex.errorCode() == KnowledgeApplicationErrorCode.RERANK_PROVIDER_ERROR) {
+                // 端口契约允许的失败类别：原样上抛，不二次包装
+                throw ex;
+            }
+            throw retrievalFailure("重排端口返回了非法错误类别", ex);
+        }
+        catch (RuntimeException ex) {
+            throw retrievalFailure("重排端口调用失败", ex);
+        }
+    }
+
+    /**
+     * 重排结果契约校验：下标必须完整覆盖候选且不重复，分数必须是 {@code 0..1} 的有限数值。
+     *
+     * <p>校验规则（任何一条不满足即整次检索失败，<b>不</b>猜测、<b>不</b>补齐、<b>不</b>丢弃）：</p>
+     * <ul>
+     *   <li>结果列表非 {@code null}；</li>
+     *   <li>条数恰好等于候选数（少一条说明有候选没有分数，多一条说明来源不明）；</li>
+     *   <li>每条的下标非 {@code null}、非负、小于候选数；</li>
+     *   <li>下标不重复 —— 重复意味着「同一个候选被打了两次分」，而另一个候选没有分数；</li>
+     *   <li>分数非 {@code null}、非 {@code NaN}/±{@code Infinity}，且落在 {@code 0.0..1.0}。</li>
+     * </ul>
+     *
+     * @param results        端口返回的结果
+     * @param candidateCount 本次候选数
+     * @return 按候选顺序对齐的分数数组（{@code scores[i]} 是第 {@code i} 个候选的重排分）
+     */
+    private static double[] requireValidRerankScores(List<KnowledgeRerankResult> results, int candidateCount) {
+        if (results == null) {
+            throw retrievalFailure("重排服务返回了 null");
+        }
+        if (results.size() != candidateCount) {
+            throw retrievalFailure("重排服务返回的条数与候选数不一致");
+        }
+        double[] scores = new double[candidateCount];
+        boolean[] seen = new boolean[candidateCount];
+        for (KnowledgeRerankResult result : results) {
+            if (result == null) {
+                throw retrievalFailure("重排服务返回了空结果");
+            }
+            Integer index = result.index();
+            if (index == null || index < 0 || index >= candidateCount) {
+                throw retrievalFailure("重排服务返回的候选下标非法");
+            }
+            if (seen[index]) {
+                throw retrievalFailure("重排服务返回了重复的候选下标");
+            }
+            seen[index] = true;
+
+            Double score = result.score();
+            if (score == null || !Double.isFinite(score)
+                    || score < MIN_MIN_SCORE || score > MAX_MIN_SCORE) {
+                throw retrievalFailure("重排服务返回的分数必须是 0.0 到 1.0 之间的有限数值");
+            }
+            scores[index] = score;
+        }
+        return scores;
     }
 
     /**
@@ -399,16 +587,21 @@ public final class KnowledgeRetrievalService implements RetrieveKnowledgeUseCase
     /**
      * 生成引用编号：{@code K1}、{@code K2}……与 {@code rank} 1、2……按最终顺序确定。
      *
-     * @param matches 已校验的命中
+     * <p>{@code citationId} 与 {@code rank} 按<b>最终顺序</b>生成：重排之后 {@code K1} 指的是
+     * 重排分最高的那一条，而不是向量相似度最高的那一条。同时，{@code score} 仍然是<b>向量分数</b>，
+     * 重排分单独放在 {@code rerankScore} 里 —— 两个分数各有来源，不能互相顶替。</p>
+     *
+     * @param ranked 按最终顺序排列的候选（含重排分，未使用重排时为 {@code null}）
      * @return 引用列表
      */
-    private static List<KnowledgeCitationView> cite(List<KnowledgeVectorMatch> matches) {
-        List<KnowledgeCitationView> citations = new ArrayList<>(matches.size());
+    private static List<KnowledgeCitationView> cite(List<RankedMatch> ranked) {
+        List<KnowledgeCitationView> citations = new ArrayList<>(ranked.size());
         int rank = 1;
-        for (KnowledgeVectorMatch match : matches) {
+        for (RankedMatch entry : ranked) {
+            KnowledgeVectorMatch match = entry.match();
             citations.add(new KnowledgeCitationView("K" + rank, rank, match.documentId().value(),
                     match.documentVersion(), match.documentTitle(), match.chunkIndex(),
-                    match.chunkSha256().value(), match.content(), match.score()));
+                    match.chunkSha256().value(), match.content(), match.score(), entry.rerankScore()));
             rank++;
         }
         return List.copyOf(citations);

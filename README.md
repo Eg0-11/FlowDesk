@@ -1,6 +1,6 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0012-R2 —— 关闭剩余的引用意图识别绕过（RAG 5/6 修订，已完成）**
+> **当前阶段：FD-0013 —— 可审计的知识检索重排（RAG 6/6，已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
@@ -20,8 +20,10 @@
 > 问答链路修订（规范化问题贯通检索与生成、畸形引用形态全部拦截、证据改为结构化 JSON 序列化、
 > 证据不可变快照）（FD-0012-R1）、
 > 引用意图识别收口（普通文本例外只留给完整的纯 ASCII 字母单词，`[Kx1]`/`[Ka-1]`/`[Known1]` 等
-> 一律按畸形引用失败）（FD-0012-R2）。
-> 尚未实现：Rerank、全文检索与混合检索、任意切片读取接口、文档列表/下载/删除、
+> 一律按畸形引用失败）（FD-0012-R2）、
+> 可审计的知识检索重排（可选 qwen3-rerank、检索与问答共用同一份最终排序、重排分与向量分分离）
+> （FD-0013）。
+> 尚未实现：全文检索与混合检索、任意切片读取接口、文档列表/下载/删除、
 > 孤立文件清理任务、`PARSING`/`INDEXING` 悬挂的恢复扫描、问答的流式输出与会话记忆、
 > 游标分页、PostgreSQL 全文检索与 pg_trgm、MCP 能力、Agent Graph、鉴权与前端。
 
@@ -30,7 +32,7 @@
 FlowDesk 面向企业 IT 服务与运营场景，规划能力包括：智能化工单流转、知识库运营、RAG 检索增强、
 Tool 调用、MCP 资产/监控服务以及基于 Agent Graph 的自动化编排。
 
-当前仓库已经完成七件事：一是打通的 AI 垂直链路
+当前仓库已经完成八件事：一是打通的 AI 垂直链路
 （**HTTP → 用例 → Agent 编排 → Spring AI ChatClient → DeepSeek（OpenAI 兼容传输）→
 本地只读工具 → 模型汇总 → HTTP 响应**），二是纯 Java 的工单领域核心
 （工单聚合与生命周期状态机）与完整的工单 REST 链路（ETag 乐观并发、分页与条件搜索），
@@ -40,6 +42,8 @@ Tool 调用、MCP 资产/监控服务以及基于 Agent Graph 的自动化编排
 六是**知识检索**（Query Embedding（textType=query）→ pgvector 余弦检索 → 稳定引用编号 K1、K2……），
 七是**基于检索证据的可审计回答**（无证据不调用模型 → 受约束提示词 → DeepSeek 答案 → 引用后校验 →
 答案 + 实际引用 + 完整证据），
+八是**可选的检索重排**（DashScope qwen3-rerank 对本次候选二次排序，检索与问答共用同一份最终证据，
+向量分与重排分分别可审计），
 并保留了清晰的模块边界、单向依赖方向与统一的版本基线。
 
 ## 二、模块职责
@@ -48,9 +52,9 @@ Tool 调用、MCP 资产/监控服务以及基于 Agent Graph 的自动化编排
 | --- | --- | --- |
 | `flowdesk-shared` | 通用异常、基础类型、工具类 | 仅模块与 `package-info.java` |
 | `flowdesk-domain` | 领域实体、值对象、领域规则（**不依赖 Spring**） | 已实现工单聚合与生命周期状态机（`com.flowdesk.domain.ticket`）、知识文档聚合与解析/索引状态机、切片与向量不变量、查询向量（`com.flowdesk.domain.knowledge`） |
-| `flowdesk-application` | 用例服务、输入输出端口 | 已实现 AI 用例（`…application.ai`，含 `KnowledgeAnswerUseCase` 与 `KnowledgeAnswerResult`）、工单用例 + 乐观并发契约（`…application.ticket`）、知识文档上传/查询/解析/索引用例与端口（`…application.knowledge`，含 `KnowledgeEmbeddingPort`）、知识检索用例与端口（`…application.knowledge`，含 `KnowledgeQueryEmbeddingPort` 与 `KnowledgeVectorSearchPort`） |
+| `flowdesk-application` | 用例服务、输入输出端口 | 已实现 AI 用例（`…application.ai`，含 `KnowledgeAnswerUseCase` 与 `KnowledgeAnswerResult`）、工单用例 + 乐观并发契约（`…application.ticket`）、知识文档上传/查询/解析/索引用例与端口（`…application.knowledge`，含 `KnowledgeEmbeddingPort`）、知识检索用例与端口（`…application.knowledge`，含 `KnowledgeQueryEmbeddingPort`、`KnowledgeVectorSearchPort` 与 `KnowledgeRerankPort`） |
 | `flowdesk-agent` | AI 编排：实现 application 的 AI 用例，用 ChatClient 编排提示词与本地工具 | 已实现普通聊天、工具冒烟，以及知识库问答编排（提示词构造 + 引用校验 + 无证据降级） |
-| `flowdesk-infrastructure` | 持久化与模型适配器 | 已提供 JDBC 工单存储（`…ticket.persistence.jdbc`）、DeepSeek 传输适配，以及知识文档的 JDBC 存储、本地文件系统内容读写、Tika 解析适配器、确定性切片器、DashScope 文档/查询 Embedding 适配器、pgvector 向量写入与相似度检索适配器（`…knowledge.*`） |
+| `flowdesk-infrastructure` | 持久化与模型适配器 | 已提供 JDBC 工单存储（`…ticket.persistence.jdbc`）、DeepSeek 传输适配，以及知识文档的 JDBC 存储、本地文件系统内容读写、Tika 解析适配器、确定性切片器、DashScope 文档/查询 Embedding 适配器、pgvector 向量写入与相似度检索适配器、DashScope 文本重排适配器（`…knowledge.*`） |
 | `flowdesk-bootstrap` | FlowDesk 主服务启动模块（Web + Validation + Actuator + AI 接口 + 工单 REST 接口 + 知识文档 REST 接口 + 知识检索接口 + 知识问答接口） | 可启动，端口 8080 |
 | `flowdesk-mcp-asset` | 独立资产 MCP 服务（Web + Actuator） | 可启动，端口 8091 |
 | `flowdesk-mcp-monitoring` | 独立监控 MCP 服务（Web + Actuator） | 可启动，端口 8092 |
@@ -585,6 +589,8 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | 知识文档：超过大小限制（含容器侧 multipart 超限） | 413 | `DOCUMENT_TOO_LARGE` |
 | 知识文档：格式不受支持或声明与实际内容不一致 | 415 | `UNSUPPORTED_DOCUMENT_TYPE` |
 | 知识文档不存在 | 404 | `KNOWLEDGE_DOCUMENT_NOT_FOUND` |
+| 上游向量服务失败（索引/检索/查询向量化） | 502 | `EMBEDDING_PROVIDER_ERROR` |
+| 上游重排服务失败（RAG 6/6，开启重排时） | 502 | `RERANK_PROVIDER_ERROR` |
 | 路径不存在 | 404 | `ENDPOINT_NOT_FOUND` |
 | 路径存在但方法不支持 | 405 | `METHOD_NOT_ALLOWED`（保留标准 `Allow` 头） |
 | `Accept` 无法被满足 | 406 | `NOT_ACCEPTABLE` |
@@ -701,8 +707,8 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 - 不使用 Lombok。
 - 不创建空的 Controller、Service、Repository、Entity 占位类。
 - 不提前实现业务功能；不引入 Redis、MQ、鉴权或前端依赖；RAG 与向量存储**只按阶段引入**
-  （RAG 1/6~5/6 已交付：上传、解析切片、Embedding + pgvector 业务表、相似度检索、
-  基于检索证据的可审计回答；不使用通用向量库抽象）。
+  （RAG 1/6~6/6 已交付：上传、解析切片、Embedding + pgvector 业务表、相似度检索、
+  基于检索证据的可审计回答、可选文本重排；不使用通用向量库抽象）。
 - 不使用通配符版本；子模块不重复声明受 BOM 管理的版本。
 - 不隐藏编译警告，不跳过测试；全部文件使用 UTF-8。
 
@@ -729,7 +735,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0012 | 基于检索证据的 DeepSeek 可审计回答（RAG 5/6） | ✅ 已完成 |
 | FD-0012-R1 | 规范化问题贯通检索与生成、引用形态绕过收口、证据结构化 JSON、证据不可变快照 | ✅ 已完成 |
 | FD-0012-R2 | 引用意图识别收口：普通文本例外收紧为完整 ASCII 字母单词 | ✅ 已完成 |
-| 后续 | Rerank：对检索结果重排（需要区分「召回分」与「重排分」） | 未开始 |
+| FD-0013 | 可审计的知识检索重排（RAG 6/6）：DashScope qwen3-rerank、检索与问答共用同一份最终排序 | ✅ 已完成 |
 | 后续 | 问答流式输出与会话记忆（当前为一次性完整响应、无历史轮次） | 未开始 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm`（混合检索） | 未开始 |
 | 后续 | 孤立文件清理任务 | 未开始 |
@@ -748,6 +754,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | 问答链路证据（FD-0012） | ✅ 已执行 | 真实 Spring 上下文 + 真实 HTTP + 真实 Spring AI ChatClient（模型端为本机合成端点，**不是** DeepSeek）：成功 JSON（答案 + `usedCitationIds` + 完整 `citations`）、**无命中时零模型调用**且返回固定降级文案、非法输入 400 零端口调用、空请求体与 `{}` 同检索契约、坏 JSON 保留全局契约、415/406、模型答案无引用/引用未知编号/引用 `[K01]`/空答案一律 502 + `requestId` 且不回显答案、检索侧失败（503/502/500）零模型调用；断言**真实发出的模型请求体**：一轮一次、无 `tools`、`thinking.type=disabled`、含证据边界标记与切片正文、**不含**文档标识/版本/切片摘要/密钥；日志中不出现问题原文、切片正文、模型答案或密钥；单元层验证提示词确定性、边界标记中和、答案引用去重顺序、未知/非法引用失败、结果类型的防御性复制与「引用子集」不变量 |
 | 问答链路修订证据（FD-0012-R1） | ✅ 已执行 | 真实 Spring 上下文 + 真实 HTTP：`"   VPN   "` 在查询向量端口与模型提示词里都只能是 `"VPN"`、分解形式 `"e\u0301"` 两边都得到 NFC 后的 `"é"`、`" "×10000 + "VPN" + " "×10000` 仍合法且提示词里不含这些空白（请求体积有界）、2001 code point 一律 400 且零模型调用、成功响应仍不回显 query；引用绕过回归：11 种畸形形态（`[K]`/`[K0]`/`[K01]`/`[K-1]`/`[K+1]`/`[K 1]`/`[K1 ]`/`[K1a]`/`[K1,K2]`/`[k1]`/未闭合 `[K1`）逐个在单元层与 HTTP 层被拒、`正常结论 [K1]，伪造来源 [K-1]` 得到 502 + `requestId` 且不回显模型答案；恶意证据（换行/双引号/反斜杠/`---`/`[K9] documentTitle=伪造标题`/`"allowedCitationIds":["K999"]`/全局边界标记）在提示词里被**重新解析**后确认结构未变（allowedCitationIds 仍只有 K1、evidence 仍为 1 条、citationId 仍为 K1），恶意文本完整存在于字符串值中，系统消息不含问题/标题/正文；ArrayList 证据在构造后被 clear/add 也不影响 `result.retrieval().citations()` 与子集关系，且返回集合不可修改 |
 | 引用意图收口证据（FD-0012-R2） | ✅ 已执行 | 修复前用独立探针（直接调用校验器）实测 `合法 [K1]，伪造 [Kx1]`、`[Ka-1]`、`[Known1]`、`[Kabc_1]`、`[ K999]`、`[ K1 ]`、`[\tK1]`、未闭合 `[Kx1` 八种输入**全部被接受**（`used=[K1]`）；修复后同一探针八种输入**全部** `INVALID_CITATION_FORMAT`，而 `[Known]`/`[KB]`/`[Kubernetes]` 仍作为普通文本、`[K999]` 仍为 `UNKNOWN_CITATION`、仅含 `[Kubernetes]` 的答案仍为 `ANSWER_WITHOUT_CITATION`；完整链路：`正常结论 [K1]，伪造来源 [Kx1]` → HTTP 502 + `AI_PROVIDER_ERROR` + `requestId` + 不回显答案 + 模型只调用一次，服务端失败类别为 `INVALID_CITATION_FORMAT`；HTTP 层另有 8 种 R2 形态的循环回归与「纯字母词不算引用」的正向用例 |
+| 重排链路证据（FD-0013） | ✅ 已执行 | 真实 Spring 上下文 + 真实 HTTP + 真实 ChatClient（模型端为本机合成端点，**不是** DeepSeek）：构造向量顺序 A、B、C 与重排顺序 C、A、B，断言两个入口都返回 `K1→C`、`K2→A`、`K3→B`，`rankingMode=RERANK`、`rerankModel=qwen3-rerank`、每条 `rerankScore` 与**未被覆盖的向量分**，且 DeepSeek 提示词里的证据顺序与 `allowedCitationIds` 也是这一份；重排端口只收到规范化 query 与三个候选正文；空命中与单候选时**重排与模型都不被调用**且模式为 `VECTOR_SIMILARITY`；关闭重排时端口调用为 0、响应里不出现 `rerankModel`/`rerankScore`；`RERANK_PROVIDER_ERROR` → 502 + 固定 `title`/`detail`/`instance` 且响应不含 query/正文/上游原文/`citations`，重排失败时不再调用模型；违约重排响应（重复下标）→ 500；适配器层用**本机合成 HTTP 端点**验证真实请求体（只有 `model`/`query`/`documents` 三字段、无 `top_n`/`input`/标识/向量）、`Authorization: Bearer <假 Key>`、按 `index` 绑定、缺字段透传为 `null`、非数字/缺 `results`/非 JSON → 500、429/500/502/503/401 → 502、读取超时 → 502 且**只发一次请求**、日志不含问题/正文/Key/地址；配置 fail-fast：关闭时不要求任何 Key/Endpoint、启用时缺 Endpoint/占位符 Endpoint/非 `qwen3-rerank` 模型/缺 Key/未启用向量化全部启动失败，完整配置可装配真实适配器 |
 | PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证**；pgvector 集成测试（Testcontainers，镜像固定为带扩展版本的 `pgvector/pgvector:0.8.6-pg16`）在无 Docker 时跳过（当前跳过 26 条：15 条索引写入 + 11 条相似度检索），报告标注 POSTGRESQL_PGVECTOR_IT=NOT_RUN |
 | 真实 DashScope Embedding | ⚠️ **DASHSCOPE_LIVE=NOT_RUN** | 无 DASHSCOPE_API_KEY，**未对真实向量服务发起过任何请求**；全部自动化测试都不访问真实上游 |
 | 真实 DeepSeek | ⚠️ **LIVE_SMOKE=NOT_RUN** | 无 `DEEPSEEK_API_KEY`，**未对真实模型发起过任何请求** |
@@ -1077,7 +1084,8 @@ Flyway **V4** 在 `knowledge_documents` 上新增 `parsed_at`、`parse_failed_at
 **分批读取切片 → 调用 DashScope `text-embedding-v4` 生成 1024 维向量 → 逐批校验 →
 单事务替换向量并把文档推进为 `INDEXED`**。
 **FD-0010 当时不做**（阶段范围，其中多项已由后续任务交付）：向量相似度查询与 Query Embedding
-（**已由 FD-0011 交付，见第十八章**）、Rerank 与 RAG 问答（**仍未实现**）。
+（**已由 FD-0011 交付，见第十八章**）、Rerank（**已由 FD-0013 交付，见第二十章**）
+与 RAG 问答（**已由 FD-0012 交付，见第十九章**）。
 
 ### 17.1 完整链路与状态机
 
@@ -1338,7 +1346,8 @@ CREATE INDEX … USING hnsw (embedding vector_cosine_ops);
 
 本阶段把「用户问题」变成「可审计的引用结果」：
 **规范化问题 → 生成查询向量（textType=query）→ pgvector 余弦检索 → 结果契约校验 → 引用编号 K1、K2……**。
-**不做**：调用 DeepSeek Chat、生成自然语言答案、Rerank、全文/混合检索、接入 Agent/MCP、
+**FD-0011 当时不做**（其中多项已由后续任务交付）：调用 DeepSeek Chat、生成自然语言答案
+（**FD-0012 已交付，见第十九章**）、Rerank（**FD-0013 已交付，见第二十章**）、全文/混合检索、接入 Agent/MCP、
 修改任何文档状态或向量。
 
 ### 18.1 完整链路与固定时序
@@ -1472,7 +1481,8 @@ flowdesk:
 
 ### 18.6 已知边界
 
-1. **无 Rerank**：只按向量相似度排序，没有重排兜底；
+1. **无 Rerank（FD-0011 阶段的边界）**：只按向量相似度排序，没有重排兜底 ——
+   可选重排已由 **FD-0013** 交付（默认关闭，见第二十章）；
 2. **无混合检索**：没有 BM25 / 全文检索 / `pg_trgm` 融合，纯向量召回；
 3. **不生成答案**：只返回引用片段，不调用 Chat 模型；
 4. **没有任意切片读取接口**：切片只能通过检索返回，且受 `topK` 与 `minScore` 限制；
@@ -1524,8 +1534,9 @@ flowdesk:
 2. **检索失败不调用模型**，并按检索自己的错误契约返回（400 / 503 / 502 / 500）；
 3. **答案里出现的引用必须落在本次证据内**，否则整次作答失败（502，不修正、不补齐、不重试）。
 
-**不做**：Rerank、Agent Graph / ReactAgent、MCP、混合检索、流式输出、会话记忆、前端、鉴权、
-数据库迁移，也**不**修改 FD-0011 的检索 SQL、排序、阈值与引用编号规则。
+**FD-0012 当时不做**（Rerank 已由 FD-0013 交付，见第二十章）：Rerank、Agent Graph / ReactAgent、MCP、
+混合检索、流式输出、会话记忆、前端、鉴权、数据库迁移，
+也**不**修改 FD-0011 的检索 SQL、排序、阈值与引用编号规则。
 
 ### 19.1 完整链路与固定时序
 
@@ -1749,7 +1760,9 @@ java -jar flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar `
 
 ### 19.7 已知边界
 
-1. **不做 Rerank**：证据顺序完全来自检索（分数降序 + 稳定 tie-break）；
+1. **不做 Rerank（FD-0012 阶段的边界）**：证据顺序完全来自检索（分数降序 + 稳定 tie-break）；
+   FD-0013 之后可以开启重排，开启时本层的证据顺序就是重排后的顺序（见第二十章），
+   语义与编号规则不变；
 2. **不接入 Agent Graph / MCP**：一次问答就是「检索 + 一次生成」，没有多节点编排、没有工具调用；
 3. **无流式输出**：响应是一次性完整 JSON（当前设计依赖「先校验、后返回」，与流式天然冲突）；
 4. **无会话记忆**：每次请求独立，不带历史轮次，也不保存对话状态；
@@ -1796,3 +1809,172 @@ java -jar flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar `
 | 新增回归 | 单元层：`[Kx1]`、`[Ka-1]`、`[Known1]`、`[Kabc_1]`、`[ K999]`、`[ K1 ]`、`[\tK1]`、`[\nK1]`、未闭合 `[Kx1` 逐个（含与合法 `[K1]` 混排）；服务层：上述形态混合后失败类别为 `INVALID_CITATION_FORMAT`；HTTP 层：`正常结论 [K1]，伪造来源 [Kx1]` → 502 + `AI_PROVIDER_ERROR` + `requestId` + 不回显答案 + 模型只调用一次，另有 8 种 R2 形态的 HTTP 循环回归 |
 | 保留不变 | `[Known]`/`[KB]`/`[Kubernetes]` 仍是普通文本（HTTP 层另有正向用例）；`[K999]` 仍是 `UNKNOWN_CITATION`；`[K-1]`/`[K1a]`/`[k1]` 等 R1 用例全部保留；`usedCitationIds` 仍按首次出现顺序去重 |
 | 文档 | 19.4 重写为「ASCII 方括号引用协议」，19.7 增加协议边界说明；`GroundedCitationValidator`、`GroundedKnowledgeAnswerService`、`flowdesk-agent` `package-info`、ADR 0009 同步；顺带修正 `KnowledgeAnswerResultTest` 中「规范化只有检索用例那一处实现」的过期描述（改为「规范化由检索与问答共用的 `KnowledgeQueryNormalizer` 实现」，测试行为不变） |
+
+## 二十、可审计的知识检索重排（RAG 6/6）
+
+设计取舍见 [`docs/adr/0010-optional-knowledge-rerank.md`](docs/adr/0010-optional-knowledge-rerank.md)。
+
+本阶段在「Query Embedding → pgvector 检索」之后增加**可选**重排：
+**检索候选 → 一次 Rerank（qwen3-rerank）→ 重排结果校验 → 按最终顺序重新编号 K1..Kn → 搜索响应或 DeepSeek 问答**。
+
+三条硬承诺：
+
+1. **默认关闭**：不要求 Endpoint、不要求 Key、不发起任何请求，检索与问答的行为与 FD-0012 完全一致；
+2. **两个入口共用同一份最终排序**：检索接口与问答接口都走同一个检索用例，
+   因此顺序、编号、重排分与向量分必然一致（不是靠约定，而是只有一条路径）；
+3. **失败不降级**：上游不可用返回 502、重排响应违约返回 500，**绝不**悄悄退回向量排序。
+
+> **一句话说清语义边界**：重排只改变**本次已召回候选**的顺序，因此**不可能**找回向量检索没有召回的切片
+> （本阶段不扩大初召回池）；`rerankScore` 是**当前请求内的相对分**，只用于对本次候选排序，
+> **不是**可以跨请求比较的绝对质量分。
+
+### 20.1 固定链路
+
+```
+POST /api/v1/knowledge/search  或  POST /api/v1/ai/knowledge-answer
+  └─ ① 输入校验与规范化（NFC + strip；与模型/重排看到的是同一个字符串）
+  └─ ② 一次 Query Embedding（textType=query）
+  └─ ③ 一次向量检索（只读 SQL，topK + minScore）
+  └─ ④ 向量结果校验（条数 / 分数 / 顺序 / 去重，违反即 500）
+  └─ ⑤ 可选一次 Rerank：仅当开关打开**且候选多于 1 条**时调用
+  └─ ⑥ 重排结果校验（下标完整覆盖且不重复、分数 ∈ 0..1 的有限数值，违反即 500）
+  └─ ⑦ 按最终顺序重新编号 K1..Kn（rank 从 1 连续）
+  └─ ⑧ 搜索响应 / DeepSeek 问答（两者使用同一份证据快照）
+```
+
+- 候选只有 0 或 1 条时**不调用**重排（顺序不可能改变，避免无意义的付费调用），
+  响应里如实报告 `rankingMode = VECTOR_SIMILARITY`；
+- 重排分不进入 DeepSeek 提示词：模型只需要「问题 + 候选正文 + 允许的编号」。
+
+### 20.2 接口与响应字段
+
+两个接口的请求**都没有变化**；响应新增三个可审计字段（关闭重排时不输出后两个）：
+
+| 字段 | 位置 | 说明 |
+| --- | --- | --- |
+| `rankingMode` | 顶层 | 本次证据顺序**由什么决定**：`VECTOR_SIMILARITY` 或 `RERANK`（始终输出） |
+| `rerankModel` | 顶层 | 实际使用的重排模型；未使用重排时**不输出** |
+| `rerankScore` | 每条 `citations[]` | 该切片的重排分；未使用重排时**不输出** |
+| `score` | 每条 `citations[]` | **仍然是向量余弦相似度**，不因重排而改变 |
+
+```powershell
+# 检索（重排开启时按重排分排序）
+curl.exe -s -X POST http://localhost:8080/api/v1/knowledge/search `
+  -H "Content-Type: application/json" -d '{\"query\":\"VPN 无法连接\",\"topK\":5}'
+```
+
+```json
+{
+  "provider": "dashscope",
+  "model": "text-embedding-v4",
+  "dimensions": 1024,
+  "topK": 5,
+  "minScore": 0.30,
+  "rankingMode": "RERANK",
+  "rerankModel": "qwen3-rerank",
+  "citations": [
+    {
+      "citationId": "K1",
+      "rank": 1,
+      "documentId": "4fac368c-8d3f-4a4e-9b1f-6f0b1f2a77aa",
+      "documentVersion": 4,
+      "documentTitle": "VPN 故障处理手册",
+      "chunkIndex": 2,
+      "chunkSha256": "9f2c…（64 位小写十六进制）",
+      "content": "第一步：检查隧道状态，确认预共享密钥未过期",
+      "score": 0.541200,
+      "rerankScore": 0.933452
+    }
+  ]
+}
+```
+
+关闭重排（默认）时，同一请求的响应里没有 `rerankModel` 与 `rerankScore`，
+`rankingMode` 为 `VECTOR_SIMILARITY`，其余字段与 FD-0012 逐字段一致。
+
+### 20.3 重排协议与请求内容
+
+采用官方 **qwen3-rerank 的扁平协议**（请求体里 `model`/`query`/`documents` 同级，
+响应的 `results` 直接位于顶层，每项含 `index` 与 `relevance_score`）：
+
+```json
+{"model": "qwen3-rerank", "query": "VPN 无法连接", "documents": ["切片正文 1", "切片正文 2"]}
+```
+
+```json
+{"object": "list", "results": [{"index": 1, "relevance_score": 0.9334}, {"index": 0, "relevance_score": 0.3410}],
+ "model": "qwen3-rerank", "usage": {"total_tokens": 79}}
+```
+
+- **不发送** `documentId`、`documentVersion`、`chunkSha256`、向量、数据库信息或密钥：
+  重排只需要「问题 + 候选正文」；
+- **不发送** `top_n`（要给全部候选打分）、`instruct`、`return_documents`；
+- 结果按 **`index`** 绑定回候选，**不**按响应到达顺序猜位置；
+- 只接受顶层 `results`；嵌套 `output.results`（另一种协议）会被判为「无法解释的响应」而不是被兼容。
+
+### 20.4 排序与分数语义
+
+| 规则 | 说明 |
+| --- | --- |
+| 降序 | 按 `rerankScore` 降序 |
+| 同分确定性 | 分数相同时保持**原向量排名**（稳定排序），因此同样的输入永远得到同样的顺序 |
+| 重新编号 | `citationId` 与 `rank` 按最终顺序重新生成：重排之后 `K1` 是重排分最高的那一条 |
+| 分数不混用 | `score` 始终是向量分；重排分单独放在 `rerankScore`，两者都返回、都可审计 |
+| 证据快照 | 提示词、`allowedCitationIds`、`usedCitationIds`、HTTP `citations` 引用的是**同一份**最终证据 |
+
+### 20.5 错误矩阵
+
+| 场景 | HTTP | code | 是否降级 |
+| --- | --- | --- | --- |
+| 重排上游超时、连接失败、被中断 | 502 | `RERANK_PROVIDER_ERROR` | **不降级**（不返回任何引用） |
+| 重排上游返回 429 / 5xx / 401 / 403 | 502 | `RERANK_PROVIDER_ERROR` | **不降级** |
+| 重排响应不是合法 JSON / 缺少顶层 `results` / 元素不是对象 / 类型不对 | 500 | `INTERNAL_SERVER_ERROR` | **不降级** |
+| `index` 缺失、负数、越界、重复、条数不全 | 500 | `INTERNAL_SERVER_ERROR` | **不降级** |
+| `relevance_score` 为 `NaN`/`±Infinity`/超出 `0..1` | 500 | `INTERNAL_SERVER_ERROR` | **不降级** |
+| 重排端口抛出契约之外的错误码或运行期异常 | 500 | `INTERNAL_SERVER_ERROR` | **不降级** |
+| 命中 0 条 / 只有 1 条 | 200 | —（`rankingMode=VECTOR_SIMILARITY`） | 不调用重排 |
+
+错误响应只包含固定安全文案：不含 query、候选正文、上游响应体、Endpoint、Key、SQL 或异常类名。
+重排服务的 `title` 是「重排服务不可用」、`detail` 是「重排服务暂时不可用，请稍后重试」，
+与向量服务的 `EMBEDDING_PROVIDER_ERROR` 分开 —— 两者是**不同的上游**。
+
+### 20.6 配置与开关
+
+```yaml
+flowdesk:
+  knowledge:
+    rerank:
+      enabled: false          # 默认关闭
+      model: qwen3-rerank     # 本版本只实现它的协议（逐字匹配）
+      endpoint: ""            # 没有默认值：含账号自己的业务空间 ID，必须显式配置
+      connect-timeout: 3s
+      read-timeout: 10s
+```
+
+| 环境 | 结果 |
+| --- | --- |
+| 默认（H2，重排关闭） | 正常启动；**不需要 Endpoint、不需要 Key**；重排端口是「拒绝一切」的占位实现 |
+| `enabled=true` 但没有 `flowdesk.knowledge.embedding.enabled=true` | **启动失败**：重排只对向量检索的候选生效，该配置永远不生效 |
+| `enabled=true` 但 Endpoint 为空 / 非法 / 仍含 `{WorkspaceId}` 占位符 | **启动失败**（Endpoint 包含业务空间 ID，因此仓库里不提供默认值） |
+| `enabled=true` 但模型名不是逐字 `qwen3-rerank` | **启动失败**（只实现了这一种协议） |
+| `enabled=true` 但 DashScope Key 缺失/空/纯空白 | **启动失败**，信息只提配置名与环境变量名 |
+| `enabled=true` + 合法 Endpoint + Key | 装配 DashScope 适配器（装配本身不发任何请求） |
+
+Key 复用向量化的凭证原则：`spring.ai.dashscope.rerank.api-key`（模态级，优先）→
+`spring.ai.dashscope.api-key`（通用，兜底，`dashscope-embedding` profile 绑定 `${DASHSCOPE_API_KEY:}`）；
+刻意不读 `AI_DASHSCOPE_API_KEY`。仓库中**不保存**任何真实 Key 或业务空间 ID；
+Endpoint 示例在配置注释里写作 `https://<workspace-id>.<region>.maas.aliyuncs.com/compatible-api/v1/reranks`。
+本阶段**不做**内部重试：一次检索只调用一次重排，失败即失败。
+
+### 20.7 已知边界
+
+1. **只重排已召回候选**：不扩大初召回池（没有「先取 100 条再重排取 5 条」），
+   因此**不能**宣称找回向量检索未召回的切片 —— 那需要改变 topK/minScore 这两条公开契约；
+2. **`rerankScore` 不是绝对质量分**：它是当前请求内的相对分，跨请求不可比
+   （上游文档亦明确此点）；不要把不同问题、不同候选集合下的分数放在一起比较；
+3. **重排不改变阈值语义**：`minScore` 仍然作用在**向量相似度**上（发生在重排之前），
+   重排不会把低于阈值的切片拉回来；
+4. **不做重排结果截断**：候选已经是 topK 条，重排只换顺序，不丢弃；
+5. **失败即失败**：没有「上游挂了就用向量排序」的降级路径，调用方会明确拿到 502/500；
+6. **真实上游未验证**：`DASHSCOPE_LIVE=NOT_RUN`、`RERANK_LIVE=NOT_RUN`（本机无 Key），
+   适配器测试全部使用本机合成 HTTP 端点（不访问真实付费接口）。

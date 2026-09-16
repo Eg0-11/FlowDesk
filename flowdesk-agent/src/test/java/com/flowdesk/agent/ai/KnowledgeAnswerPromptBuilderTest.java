@@ -286,8 +286,8 @@ class KnowledgeAnswerPromptBuilderTest {
     }
 
     private static KnowledgeCitationView citation(String citationId, String title, int chunkIndex, String content) {
-        return new KnowledgeCitationView(citationId, chunkIndex + 1, DOCUMENT_ID, 4L, title, chunkIndex, DIGEST,
-                content, 0.87 - chunkIndex * 0.1);
+        return KnowledgeCitationView.vectorOnly(citationId, chunkIndex + 1, DOCUMENT_ID, 4L, title, chunkIndex,
+                DIGEST, content, 0.87 - chunkIndex * 0.1);
     }
 
     /**

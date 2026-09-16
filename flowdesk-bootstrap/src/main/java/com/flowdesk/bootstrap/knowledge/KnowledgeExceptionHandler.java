@@ -97,6 +97,11 @@ public class KnowledgeExceptionHandler {
             case EMBEDDING_PROVIDER_ERROR -> problem(HttpStatus.BAD_GATEWAY,
                     FlowDeskProblems.CODE_EMBEDDING_PROVIDER_ERROR, "向量服务不可用",
                     "向量服务暂时不可用，请稍后重试", request);
+            // 重排是另一个上游：用独立错误码与文案，避免把「重排服务不可用」说成「向量服务不可用」。
+            // 同样是 502，且没有静默降级 —— 前端看到这个错误就知道本次没有按重排顺序返回结果。
+            case RERANK_PROVIDER_ERROR -> problem(HttpStatus.BAD_GATEWAY,
+                    FlowDeskProblems.CODE_RERANK_PROVIDER_ERROR, "重排服务不可用",
+                    "重排服务暂时不可用，请稍后重试", request);
             case KNOWLEDGE_DOCUMENT_ALREADY_EXISTS, INVALID_PERSISTED_DOCUMENT, CONTENT_STORAGE_FAILURE,
                     METADATA_STORAGE_FAILURE, DOCUMENT_CONTENT_UNREADABLE, KNOWLEDGE_INTERNAL_ERROR,
                     KNOWLEDGE_RETRIEVAL_FAILURE -> problem(

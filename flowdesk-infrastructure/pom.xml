@@ -50,6 +50,16 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-jdbc</artifactId>
     </dependency>
+
+    <!--
+      文本重排（FD-0013）的请求/响应序列化：qwen3-rerank 的扁平 HTTP 协议用 Jackson 读写 JSON。
+      这里显式声明直接依赖，而不是依赖其它 starter 偶然带进来的传递依赖。
+      版本由 spring-boot-dependencies 管理，此处不写版本。
+    -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
     <dependency>
       <groupId>org.flywaydb</groupId>
       <artifactId>flyway-core</artifactId>
