@@ -10,9 +10,12 @@ import com.flowdesk.application.ai.KnowledgeAnswerResult;
 import com.flowdesk.application.knowledge.KnowledgeApplicationErrorCode;
 import com.flowdesk.application.knowledge.KnowledgeApplicationException;
 import com.flowdesk.application.knowledge.port.in.RetrieveKnowledgeUseCase;
+import com.flowdesk.application.knowledge.query.KnowledgeQueryNormalizer;
 import com.flowdesk.application.knowledge.query.RetrieveKnowledgeQuery;
 import com.flowdesk.application.knowledge.view.KnowledgeCitationView;
 import com.flowdesk.application.knowledge.view.KnowledgeRetrievalView;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -36,6 +39,8 @@ import org.springframework.ai.chat.prompt.Prompt;
  * 而且能断言「模型究竟收到了什么」以及「什么情况下<b>根本不该</b>调用模型」。</p>
  */
 class GroundedKnowledgeAnswerServiceTest {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private static final UUID DOCUMENT_ID = UUID.fromString("11111111-2222-3333-4444-555555555555");
 
@@ -65,12 +70,12 @@ class GroundedKnowledgeAnswerServiceTest {
 
         assertThat(model.calls()).as("一轮问答只调用一次模型，不做内部重试").isEqualTo(1);
         assertThat(retrieval.queries())
-                .as("问题原样交给检索用例，规范化与校验只有那一处实现")
+                .as("原始问题原样交给检索用例，合法性校验只有那一处实现")
                 .containsExactly(QUESTION);
     }
 
     @Test
-    void sendsExactlyTwoMessagesWithoutToolsAndWithoutMemory() {
+    void sendsExactlyTwoMessagesWithoutToolsAndWithoutMemory() throws Exception {
         FakeChatModel model = new FakeChatModel("结论 [K1]。");
         KnowledgeAnswerUseCaseFixture fixture = new KnowledgeAnswerUseCaseFixture(
                 FakeRetrieval.withCitations(1), model);
@@ -84,8 +89,60 @@ class GroundedKnowledgeAnswerServiceTest {
         assertThat(messages).extracting(Message::getMessageType)
                 .containsExactly(MessageType.SYSTEM, MessageType.USER);
         assertThat(messages.get(1).getText())
-                .contains(KnowledgeAnswerPromptBuilder.EVIDENCE_BEGIN)
-                .contains(QUESTION);
+                .contains(KnowledgeAnswerPromptBuilder.DATA_BEGIN)
+                .contains(KnowledgeAnswerPromptBuilder.DATA_END);
+        assertThat(promptQuestion(messages.get(1).getText())).isEqualTo(QUESTION);
+    }
+
+    // ---------- 规范化问题：检索与生成必须是同一个字符串（FD-0012-R1）----------
+
+    @Test
+    void asksTheModelTheSameNormalizedQuestionThatRetrievalReceived() throws Exception {
+        for (String raw : List.of("   VPN   ", "e\u0301", "\tVPN\n")) {
+            FakeChatModel model = new FakeChatModel("结论 [K1]。");
+            KnowledgeAnswerUseCaseFixture fixture = new KnowledgeAnswerUseCaseFixture(
+                    FakeRetrieval.withCitations(1), model);
+
+            fixture.answer(new KnowledgeAnswerCommand(raw, null, null));
+
+            String promptQuestion = promptQuestion(model.prompts().get(0).getInstructions().get(1).getText());
+            assertThat(promptQuestion)
+                    .as("raw=[%s]", raw)
+                    .isEqualTo(KnowledgeQueryNormalizer.normalize(raw));
+        }
+
+        assertThat(KnowledgeQueryNormalizer.normalize("e\u0301"))
+                .as("分解形式必须折叠成单个 NFC 字符")
+                .isEqualTo("\u00e9");
+    }
+
+    @Test
+    void doesNotLetUnboundedLeadingAndTrailingWhitespaceIntoThePrompt() throws Exception {
+        String raw = " ".repeat(10_000) + "VPN" + " ".repeat(10_000);
+        FakeChatModel model = new FakeChatModel("结论 [K1]。");
+        KnowledgeAnswerUseCaseFixture fixture = new KnowledgeAnswerUseCaseFixture(
+                FakeRetrieval.withCitations(1), model);
+
+        fixture.answer(new KnowledgeAnswerCommand(raw, null, null));
+
+        String userPrompt = model.prompts().get(0).getInstructions().get(1).getText();
+        assertThat(promptQuestion(userPrompt)).isEqualTo("VPN");
+        assertThat(userPrompt)
+                .as("两万个空白不得进入提示词")
+                .doesNotContain(" ".repeat(2))
+                .hasSizeLessThan(1_000);
+    }
+
+    @Test
+    void keepsTheRawQuestionOutOfTheRetrievalCallOnlyUpToThePortContract() {
+        // 原始字符串原样交给检索用例（它负责规范化与合法性），本层不重复实现这套规则
+        FakeRetrieval retrieval = FakeRetrieval.withCitations(1);
+        KnowledgeAnswerUseCaseFixture fixture = new KnowledgeAnswerUseCaseFixture(
+                retrieval, new FakeChatModel("结论 [K1]。"));
+
+        fixture.answer(new KnowledgeAnswerCommand("  VPN  ", null, null));
+
+        assertThat(retrieval.queries()).containsExactly("  VPN  ");
     }
 
     @Test
@@ -204,7 +261,13 @@ class GroundedKnowledgeAnswerServiceTest {
                 "结论是重启服务。",
                 "结论 [K0]。",
                 "结论 [K99]。",
-                "结论 [K1] 与 [K99]。")) {
+                "结论 [K1] 与 [K99]。",
+                // FD-0012-R1：合法引用与畸形引用混合时，整次作答同样失败
+                "合法 [K1]，伪造 [K-1]。",
+                "合法 [K1]，伪造 [K1a]。",
+                "合法 [K1]，伪造 [K 2]。",
+                "合法 [K1]，伪造 [k9]。",
+                "合法 [K1]，伪造 [K1。")) {
 
             KnowledgeAnswerUseCaseFixture fixture = new KnowledgeAnswerUseCaseFixture(
                     FakeRetrieval.withCitations(1), new FakeChatModel(answer));
@@ -223,6 +286,21 @@ class GroundedKnowledgeAnswerServiceTest {
     }
 
     @Test
+    void reportsTheInvalidCitationFormatFailureCategoryForAMixedAnswer() {
+        // 合法引用在前、畸形引用在后：失败类别必须是「形式非法」，而不是被当成普通文字忽略
+        KnowledgeAnswerUseCaseFixture fixture = new KnowledgeAnswerUseCaseFixture(
+                FakeRetrieval.withCitations(1), new FakeChatModel("正常结论 [K1]，伪造来源 [K-1]"));
+
+        Throwable thrown = catchThrowable(
+                () -> fixture.answer(new KnowledgeAnswerCommand(QUESTION, null, null)));
+
+        assertThat(thrown).isInstanceOf(AiProviderException.class);
+        assertThat(((AiProviderException) thrown).getCause())
+                .isInstanceOfSatisfying(GroundedAnswerException.class, cause -> assertThat(cause.failure())
+                        .isEqualTo(GroundedAnswerFailure.INVALID_CITATION_FORMAT));
+    }
+
+    @Test
     void aNullCommandIsTreatedAsAMissingQueryAndStillGoesThroughRetrieval() {
         FakeRetrieval retrieval = FakeRetrieval.empty();
         KnowledgeAnswerUseCaseFixture fixture = new KnowledgeAnswerUseCaseFixture(
@@ -236,6 +314,23 @@ class GroundedKnowledgeAnswerServiceTest {
     }
 
     // ---------- 辅助 ----------
+
+    /**
+     * 从用户消息里取出结构化数据，返回其中 {@code question} 字段的取值。
+     *
+     * @param userPrompt 用户消息全文
+     * @return 模型看到的问题
+     * @throws JsonProcessingException 数据区块里的 JSON 不合法
+     */
+    private static String promptQuestion(String userPrompt) throws JsonProcessingException {
+        int begin = userPrompt.indexOf(KnowledgeAnswerPromptBuilder.DATA_BEGIN);
+        int end = userPrompt.indexOf(KnowledgeAnswerPromptBuilder.DATA_END, begin + 1);
+        assertThat(begin).as("用户消息必须包含数据区块开始标记").isGreaterThanOrEqualTo(0);
+        assertThat(end).as("用户消息必须包含数据区块结束标记").isGreaterThan(begin);
+
+        String json = userPrompt.substring(begin + KnowledgeAnswerPromptBuilder.DATA_BEGIN.length(), end).strip();
+        return MAPPER.readTree(json).path("question").asText();
+    }
 
     /** 把两个协作者装到一起，避免每个测试重复三行构造代码。 */
     private static final class KnowledgeAnswerUseCaseFixture {

@@ -98,6 +98,47 @@ class KnowledgeAnswerResultTest {
                 .isInstanceOf(NullPointerException.class);
     }
 
+    // ---------- 证据快照（FD-0012-R1）----------
+
+    @Test
+    void keepsAuditingAgainstAnImmutableEvidenceSnapshot() {
+        // 证据来自一个外部可变列表：构造结果之后改动它，不得影响审计信息
+        List<KnowledgeCitationView> mutableEvidence = new ArrayList<>();
+        mutableEvidence.add(citation("K1"));
+
+        KnowledgeAnswerResult result = result(retrieval(mutableEvidence), List.of("K1"));
+        mutableEvidence.clear();
+        mutableEvidence.add(citation("K9"));
+
+        assertThat(result.retrieval().citations())
+                .as("证据是构造期的快照，不随外部列表变化")
+                .hasSize(1)
+                .first()
+                .extracting(KnowledgeCitationView::citationId)
+                .isEqualTo("K1");
+        assertThat(result.usedCitationIds())
+                .as("usedCitationIds 仍是快照证据的子集")
+                .containsExactly("K1");
+        assertThatThrownBy(() -> result.retrieval().citations().add(citation("K2")))
+                .as("返回的集合不可修改")
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> result.usedCitationIds().add("K2"))
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThat(result.retrievedCitationCount()).isEqualTo(1);
+    }
+
+    @Test
+    void theSubsetInvariantIsCheckedAgainstTheEvidenceSnapshotAtConstructionTime() {
+        // 子集校验依据的是构造那一刻的证据；之后把外部列表改成别的编号也不会让结果变「合法」
+        List<KnowledgeCitationView> mutableEvidence = new ArrayList<>();
+        mutableEvidence.add(citation("K1"));
+
+        assertThatThrownBy(() -> result(retrieval(mutableEvidence), List.of("K9")))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> result(retrieval(mutableEvidence), List.of("K2")))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
     // ---------- 命令 ----------
 
     @Test
@@ -131,9 +172,24 @@ class KnowledgeAnswerResultTest {
         List<KnowledgeCitationView> citations = new ArrayList<>();
         int rank = 1;
         for (String citationId : citationIds) {
-            citations.add(new KnowledgeCitationView(citationId, rank++, DOCUMENT_ID, 4L, "标题", rank,
-                    "0".repeat(64), "正文", 0.9));
+            citations.add(citation(citationId, rank++));
         }
         return new KnowledgeRetrievalView("dashscope", "text-embedding-v4", 1024, 5, 0.30, List.copyOf(citations));
+    }
+
+    /**
+     * @param citations 由调用方持有的证据列表（可能是可变 {@code ArrayList}）
+     * @return 证据视图
+     */
+    private static KnowledgeRetrievalView retrieval(List<KnowledgeCitationView> citations) {
+        return new KnowledgeRetrievalView("dashscope", "text-embedding-v4", 1024, 5, 0.30, citations);
+    }
+
+    private static KnowledgeCitationView citation(String citationId) {
+        return citation(citationId, 1);
+    }
+
+    private static KnowledgeCitationView citation(String citationId, int rank) {
+        return new KnowledgeCitationView(citationId, rank, DOCUMENT_ID, 4L, "标题", rank, "0".repeat(64), "正文", 0.9);
     }
 }

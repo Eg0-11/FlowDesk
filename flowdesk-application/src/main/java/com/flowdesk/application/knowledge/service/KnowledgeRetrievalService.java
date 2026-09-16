@@ -6,13 +6,13 @@ import com.flowdesk.application.knowledge.port.in.RetrieveKnowledgeUseCase;
 import com.flowdesk.application.knowledge.port.out.KnowledgeQueryEmbeddingPort;
 import com.flowdesk.application.knowledge.port.out.KnowledgeVectorMatch;
 import com.flowdesk.application.knowledge.port.out.KnowledgeVectorSearchPort;
+import com.flowdesk.application.knowledge.query.KnowledgeQueryNormalizer;
 import com.flowdesk.application.knowledge.query.RetrieveKnowledgeQuery;
 import com.flowdesk.application.knowledge.view.KnowledgeCitationView;
 import com.flowdesk.application.knowledge.view.KnowledgeRetrievalView;
 import com.flowdesk.domain.knowledge.EmbeddingDescriptor;
 import com.flowdesk.domain.knowledge.KnowledgeDomainException;
 import com.flowdesk.domain.knowledge.KnowledgeQueryEmbedding;
-import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -198,8 +198,10 @@ public final class KnowledgeRetrievalService implements RetrieveKnowledgeUseCase
      * 把服务端内部问题说成调用方输入错误、文档不存在或上游不可用。
      * 收口之后，检索链路上的失败只有两种对外形态：400（<b>调用方输入</b>，在调用本方法之前判定）
      * 与 500（<b>服务端</b>）。</p>
-     * <p>对外文案固定为「向量检索失败」：不含 query、向量、SQL、连接串、摘要原值，
-     * 也不含端口原始异常的消息。</p>
+     * <p>对外文案是<b>两条</b>固定文案之一（按失败形态区分，均不含 query、向量、SQL、连接串或摘要原值）：
+     * 端口抛出异常时为「向量检索端口调用失败」，端口返回契约之外的错误类别时为
+     * 「向量检索端口返回了非法错误类别」。这两条文案只进服务端日志；HTTP 响应仍是 500 的固定文案
+     * 「服务暂时不可用，请稍后重试」。</p>
      * <p>本方法只收紧<b>检索端口</b>的边界：查询向量端口（{@link #embedQuery(String)}）的
      * {@code EMBEDDING_PROVIDER_ERROR}（HTTP 502）不受影响。</p>
      *
@@ -232,6 +234,10 @@ public final class KnowledgeRetrievalService implements RetrieveKnowledgeUseCase
     /**
      * 规范化并校验 query：NFC → strip → 判空 → code point 上限 → 拒绝控制字符。
      *
+     * <p>NFC 与 {@code strip} 由 {@link KnowledgeQueryNormalizer} 提供 —— 那是检索与问答
+     * <b>共用</b>的唯一实现，因此送给查询向量端口的问题与写进模型提示词的问题逐字符相同；
+     * 本方法只补上「合法性」这一层（空值、长度、控制字符），它也只在这里判定。</p>
+     *
      * @param query 原始请求
      * @return 规范化后的 query
      */
@@ -239,7 +245,7 @@ public final class KnowledgeRetrievalService implements RetrieveKnowledgeUseCase
         if (query == null || query.query() == null) {
             throw invalidQuery("query 不能为空");
         }
-        String normalized = Normalizer.normalize(query.query(), Normalizer.Form.NFC).strip();
+        String normalized = KnowledgeQueryNormalizer.normalize(query.query());
         if (normalized.isEmpty()) {
             throw invalidQuery("query 不能为空");
         }
