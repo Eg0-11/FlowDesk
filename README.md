@@ -1,6 +1,6 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0014 —— 独立资产 MCP 服务的协议与只读查询工具（已完成）**
+> **当前阶段：FD-0014-R1 —— 资产 MCP 服务的返工（输入校验一致性、会话终止、能力声明）（已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
@@ -24,7 +24,9 @@
 > 可审计的知识检索重排（可选 qwen3-rerank、检索与问答共用同一份最终排序、重排分与向量分分离）
 > （FD-0013）、
 > 独立资产 MCP 服务（Streamable HTTP `/mcp`、唯一只读工具 `asset_get`、演示数据与真实数据边界、
-> 只监听回环 + 拒绝浏览器跨源）（FD-0014）。
+> 只监听回环 + 拒绝浏览器跨源）（FD-0014）、
+> 资产 MCP 服务返工（入参形状与公布的 schema 完全一致、允许 `DELETE` 终止会话并修掉测试 JVM
+> 退出超时、按实测只声明实现过的能力（`logging` 为 SDK 固定声明，如实记录））（FD-0014-R1）。
 > 尚未实现：全文检索与混合检索、任意切片读取接口、文档列表/下载/删除、
 > 孤立文件清理任务、`PARSING`/`INDEXING` 悬挂的恢复扫描、问答的流式输出与会话记忆、
 > 游标分页、PostgreSQL 全文检索与 pg_trgm、监控 MCP 服务的能力实现、Agent Graph、鉴权与前端。
@@ -739,6 +741,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0012-R2 | 引用意图识别收口：普通文本例外收紧为完整 ASCII 字母单词 | ✅ 已完成 |
 | FD-0013 | 可审计的知识检索重排（RAG 6/6）：DashScope qwen3-rerank、检索与问答共用同一份最终排序 | ✅ 已完成 |
 | FD-0014 | 独立资产 MCP 服务：Streamable HTTP `/mcp` + 只读工具 `asset_get` + 回环绑定与跨源限制 | ✅ 已完成 |
+| FD-0014-R1 | 返工：入参形状与 schema 一致（额外字段/非对象一律拒绝）、`disallow-delete` 改为允许会话终止、关闭未实现的 resources/prompts/completions 能力 | ✅ 已完成 |
 | 后续 | 问答流式输出与会话记忆（当前为一次性完整响应、无历史轮次） | 未开始 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm`（混合检索） | 未开始 |
 | 后续 | 孤立文件清理任务 | 未开始 |
@@ -759,6 +762,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | 引用意图收口证据（FD-0012-R2） | ✅ 已执行 | 修复前用独立探针（直接调用校验器）实测 `合法 [K1]，伪造 [Kx1]`、`[Ka-1]`、`[Known1]`、`[Kabc_1]`、`[ K999]`、`[ K1 ]`、`[\tK1]`、未闭合 `[Kx1` 八种输入**全部被接受**（`used=[K1]`）；修复后同一探针八种输入**全部** `INVALID_CITATION_FORMAT`，而 `[Known]`/`[KB]`/`[Kubernetes]` 仍作为普通文本、`[K999]` 仍为 `UNKNOWN_CITATION`、仅含 `[Kubernetes]` 的答案仍为 `ANSWER_WITHOUT_CITATION`；完整链路：`正常结论 [K1]，伪造来源 [Kx1]` → HTTP 502 + `AI_PROVIDER_ERROR` + `requestId` + 不回显答案 + 模型只调用一次，服务端失败类别为 `INVALID_CITATION_FORMAT`；HTTP 层另有 8 种 R2 形态的循环回归与「纯字母词不算引用」的正向用例 |
 | 重排链路证据（FD-0013） | ✅ 已执行 | 真实 Spring 上下文 + 真实 HTTP + 真实 ChatClient（模型端为本机合成端点，**不是** DeepSeek）：构造向量顺序 A、B、C 与重排顺序 C、A、B，断言两个入口都返回 `K1→C`、`K2→A`、`K3→B`，`rankingMode=RERANK`、`rerankModel=qwen3-rerank`、每条 `rerankScore` 与**未被覆盖的向量分**，且 DeepSeek 提示词里的证据顺序与 `allowedCitationIds` 也是这一份；重排端口只收到规范化 query 与三个候选正文；空命中与单候选时**重排与模型都不被调用**且模式为 `VECTOR_SIMILARITY`；关闭重排时端口调用为 0、响应里不出现 `rerankModel`/`rerankScore`；`RERANK_PROVIDER_ERROR` → 502 + 固定 `title`/`detail`/`instance` 且响应不含 query/正文/上游原文/`citations`，重排失败时不再调用模型；违约重排响应（重复下标）→ 500；适配器层用**本机合成 HTTP 端点**验证真实请求体（只有 `model`/`query`/`documents` 三字段、无 `top_n`/`input`/标识/向量）、`Authorization: Bearer <假 Key>`、按 `index` 绑定、缺字段透传为 `null`、非数字/缺 `results`/非 JSON → 500、429/500/502/503/401 → 502、读取超时 → 502 且**只发一次请求**、日志不含问题/正文/Key/地址；配置 fail-fast：关闭时不要求任何 Key/Endpoint、启用时缺 Endpoint/占位符 Endpoint/非 `qwen3-rerank` 模型/缺 Key/未启用向量化全部启动失败，完整配置可装配真实适配器 |
 | 资产 MCP 服务证据（FD-0014） | ✅ 已执行 | **真实 MCP 客户端 + 真实 Streamable HTTP 会话**（MCP Java SDK 0.17.0 的 `HttpClientSseClientTransport` 连到真实启动的进程/上下文，非 MockMvc 假协议）：`initialize` 成功、`tools/list` **恰好一个** `asset_get`（无任何写工具）、`tools/call` 命中返回 `isError=false` + `{assetId,assetType,status,source=DEMO}`、合法但不存在的编号返回 `isError=false` + `ASSET_NOT_FOUND`（**「未找到」不是工具失败**）、`AST-1`/`ast-900001`/` AST-900001`/`AST-9000011`/空/缺失/非字符串/未知参数在 MCP 层得到 `isError=true` + `INVALID_ASSET_ID`、默认模式下 `AST-900001` 得到 `isError=true` + `ASSET_SOURCE_UNAVAILABLE`；**逐条比对固定文案**与固定 input schema（`required=["assetId"]`、`additionalProperties=false`），并断言响应里不出现内部类名、堆栈、`at com.flowdesk`、路径与演示数据以外的内容；注入目录实现抛出含哨兵文本的异常后，错误内容只出现固定码与文案，且日志捕获里不出现哨兵文本/异常消息/堆栈；`Origin`（含 `null`、`http://127.0.0.1:8091`、`https://evil.example`、任意值）请求 `/mcp` 一律 403 + `ORIGIN_NOT_ALLOWED` 固定 problem 且**无** `Access-Control-Allow-Origin`、请求进不到端点，而同一进程上不带 `Origin` 的真实 SDK 客户端仍能完成 `initialize`/`tools/list`/`tools/call`，`/actuator/health` 不受过滤器影响；非回环 `server.address`（`0.0.0.0`/`192.168.1.10`/`203.0.113.7`/`2001:db8::1`/`::`/`example.com`/`my-host.local`/`localhost`/空白）在真实启动上下文中以固定 `IllegalStateException` **启动失败**，且有一个用例证明拒绝发生在 `ApplicationEnvironmentPreparedEvent` 阶段（**任何 Web 服务器被创建之前**），另有用例证明第二道闸门 Bean 同样拒绝；回环判定另有 31 条参数化用例覆盖 `127.0.0.1`/`127.0.0.0`/`127.255.255.255`/`::1` 通过，`127.5`/`127.example.com`/`0127.0.0.1`/`2130706433`/`::ffff:127.0.0.1` 被拒；测试全部使用固定虚构演示数据，**不访问任何外部服务** |
+| 资产 MCP 服务返工证据（FD-0014-R1） | ✅ 已执行 | **真实 MCP 客户端 + 真实 HTTP**：入参形状回归 —— `{"assetId":"AST-900001","extra":"sentinel-extra-argument"}` 经真实 SDK 客户端得到 `isError=true` + 固定 `INVALID_ASSET_ID`（且响应里没有多余字段的值、没有任何资产数据），字段名写成 `asset_id` 同样被拒；`arguments` 不是对象（原始 JSON-RPC 报文送字符串）在协议层被拒（实测 500、响应体为空，不回显取值）；畸形 JSON-RPC 报文被拒（400），响应不回显输入，且显式断言并记录了它含服务端堆栈这一框架边界；单元层逐条覆盖「额外字段 / 非对象（数组、字符串、数字、布尔、`null`、两段 JSON 拼接）/ `assetId` 非字符串 / 空与纯空白 / 超长」，并断言 schema 的 `pattern` 锚定且与 `AssetId` 常量一致、`maxLength` 等于长度上限（31 条目录契约 + 14 条工具契约）；**会话终止** —— 真实 HTTP：`initialize` 200 带 `Mcp-Session-Id`、通知 202、`DELETE /mcp` **200（不是 405）**、旧会话标识再请求 **404**；真实 SDK 客户端 `close()` 后服务端会话表回到基线（异步收敛用有界轮询断言，留下会话即失败）；无 `DELETE` 且无会话标识的删除请求被拒且不回显任何内容；**能力声明** —— 原始 `initialize` 报文的 `capabilities` 字段集合实测为 `["logging","tools"]`（`resources`/`prompts`/`completions` 已关闭；`logging` 是 MCP SDK 0.17.0 在 `McpAsyncServer` 构造器里无条件添加的，无开关，已如实写入 README 与 ADR），SDK 侧逐项断言 `tools` 非空、`resources`/`prompts`/`completions`/`experimental` 为空、`logging` 非空，容器层断言没有注册任何 resource/resource-template/prompt/completion 处理器；**关停** —— 模块测试与全仓测试的 JVM 退出都不再出现 `Surefire is going to kill self fork JVM`，`Commencing graceful shutdown` 与 `Graceful shutdown complete` 之间 9 ms（修复前是 30 秒后被强杀）；测试全部使用固定虚构演示数据，不访问任何外部服务 |
 | PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证**；pgvector 集成测试（Testcontainers，镜像固定为带扩展版本的 `pgvector/pgvector:0.8.6-pg16`）在无 Docker 时跳过（当前跳过 26 条：15 条索引写入 + 11 条相似度检索），报告标注 POSTGRESQL_PGVECTOR_IT=NOT_RUN |
 | 真实 DashScope Embedding | ⚠️ **DASHSCOPE_LIVE=NOT_RUN** | 无 DASHSCOPE_API_KEY，**未对真实向量服务发起过任何请求**；全部自动化测试都不访问真实上游 |
 | 真实 DeepSeek | ⚠️ **LIVE_SMOKE=NOT_RUN** | 无 `DEEPSEEK_API_KEY`，**未对真实模型发起过任何请求** |
@@ -2041,13 +2045,23 @@ Endpoint 示例在配置注释里写作 `https://<workspace-id>.<region>.maas.al
 
 ```json
 {"type":"object",
- "properties":{"assetId":{"type":"string","description":"资产标识，格式为 AST- 加 6 位数字，例如 AST-900001"}},
+ "properties":{"assetId":{"type":"string","description":"资产标识，格式为 AST- 加 6 位数字，例如 AST-900001",
+                          "pattern":"^AST-[0-9]{6}$","maxLength":10}},
  "required":["assetId"],
  "additionalProperties":false}
 ```
 
 - 唯一入参 `assetId`，**必填**；格式固定 `AST-[0-9]{6}`（大写前缀 + 恰好六位数字）；
 - 空、`null`、纯空白、超长（> 10 字符）、大小写不符、含空格或下划线一律拒绝；
+- **入参形状与上面的 schema 完全一致**（FD-0014-R1）：必须是「**恰好**一个 `assetId`
+  字符串字段的 JSON 对象」。多传任何字段、字段名写成 `asset_id`、把 `arguments` 写成数组或字符串、
+  两段 JSON 拼接 —— 一律拒绝，且失败内容仍是下面那张表里的固定形状；
+- schema 的 `pattern` 是**锚定**的：JSON Schema 的 `pattern` 是部分匹配语义，
+  不写成 `^...$` 就会比执行校验更宽松（`AST-900001X` 会被 schema 放过）。
+  这两个值直接来自 `AssetId` 常量，不会和代码各写一份；
+- 协议层还有一道更早的关卡：`params.arguments` 根本不是对象时，MCP SDK 在反序列化阶段就拒绝
+  （实测 HTTP 500、响应体为空），工具不会被调用；工具层的形状判断由单元测试直接覆盖，
+  因为**客户端可以不看 schema 直接发请求**，真正兜底的是执行校验而不是 schema；
 - **没有**任何写工具（新增/修改/删除在本阶段不可表达），底层端口也没有写方法。
 
 输出（MCP `CallToolResult` 的单个 text content，四种固定形状）：
@@ -2068,10 +2082,44 @@ Endpoint 示例在配置注释里写作 `https://<workspace-id>.<region>.maas.al
 文案来自固定枚举；不含路径、配置、凭据、异常消息、堆栈或类名。
 目录实现抛出的**任何**运行期异常都收敛为 `ASSET_SOURCE_UNAVAILABLE`；日志里也只出现
 稳定错误码与异常**类名**（不记录 assetId 原值、异常消息与堆栈）。
+（这一条只覆盖 `asset_get` 的输出与日志；MCP 端点本身的框架级错误响应另见 21.6。）
 
 > 实现细节（也是实际契约）：MCP 桥接层会把工具抛出异常的 `getMessage()` 原样放进错误内容，
 > 因此这里的消息**就是**上面那段固定 JSON（由 `AssetToolException` 承载），
 > 成功与失败的内容形状一致，调用方可以统一解析。
+
+### 21.1.1 能力声明：tools（外加 SDK 固定声明的 logging）
+
+`initialize` 响应的能力集是**实测值**，不是配置文件里的期望值：
+
+```json
+{"capabilities":{"logging":{},"tools":{"listChanged":true}}}
+```
+
+- `resources`、`prompts`、`completions` 本模块**没有实现**，因此显式关闭
+  （Spring AI 1.1.2 的默认值全是 `true`，不关就会声明出不存在的三个能力）；
+- **`logging` 关不掉**：MCP Java SDK 0.17.0 的 `McpAsyncServer` 构造器无条件执行
+  `serverCapabilities.mutate().logging().build()`，Spring AI 1.1.2 也没有对应开关。
+  所以这里有话直说：本服务声明的是 **tools + logging**，而不是「只有 tools」；
+  本服务不会主动向客户端推送日志通知，`logging` 是框架强加的声明；
+- 容器里也确实没有注册任何 resource / resource-template / prompt / completion 处理器
+  （测试直接查容器，而不是查配置文件）。
+
+### 21.1.2 会话生命周期：`DELETE /mcp` 是会话清理，不是资产写操作
+
+```yaml
+spring.ai.mcp.server.streamable-http.disallow-delete: false
+```
+
+- MCP 客户端用 `DELETE /mcp` 结束**自己**的会话，这只清理协议会话，不会碰任何资产数据；
+- 实测过的代价（FD-0014 曾经把这一项设成 `true`）：`DELETE` 返回 **405** 且会话不从会话表移除，
+  于是客户端 `close()` 之后会话与它的响应流都留在服务端；关停时 Tomcat 优雅关停
+  「等待活跃请求」等满 30 秒，测试 JVM 被 Surefire 强杀
+  （`Surefire is going to kill self fork JVM`）。改成允许 `DELETE` 之后，
+  真实 SDK 客户端 `close()` 会异步清理会话（实测 250 ms 内消失），
+  `Commencing graceful shutdown` 与 `Graceful shutdown complete` 之间只隔 9 ms；
+- 回归证据：真实 HTTP 的「会话可用（202）→ `DELETE` 200（不是 405）→ 旧会话标识 404」，
+  以及「SDK 客户端 `close()` 后服务端会话表回到基线」。
 
 ### 21.2 数据源：默认「不可用」，演示数据必须显式打开
 
@@ -2137,8 +2185,24 @@ MCP 客户端的连接信息：**URL = `http://127.0.0.1:8091/mcp`**，传输 = 
 1. **没有真实资产数据源**：默认模式返回 `ASSET_SOURCE_UNAVAILABLE`，未接入任何企业资产系统；
 2. **没有鉴权/授权**：任何能访问本机回环端口的进程都可以调用工具（这也是只监听回环的原因）；
 3. **只读、单工具**：没有写操作，也没有批量查询、列表、分页或模糊搜索；
-4. **只有 tools 能力**：不提供 MCP resources / prompts；
+4. **只有 tools 能力**（外加 SDK 强加的 `logging` 声明，见 21.1.1）：不提供 MCP
+   resources / prompts / completions，容器里也没有对应处理器；
 5. **不接入主 Agent**：MCP 工具不会注册到 DeepSeek ChatClient，RAG 问答不会自动调用它
    （模块之间不共享容器，没有任何跨模块注册）；
 6. **未验证项**：`MCP_LIVE=NOT_RUN`（未对接任何外部 MCP 服务或真实资产系统）；
    `POSTGRES_LIVE`、`DASHSCOPE_LIVE`、`LIVE_SMOKE` 与本模块无关但全仓仍为 `NOT_RUN`。
+
+### 21.6 已知的框架边界（如实记录，本阶段未修复）
+
+1. **调用未实现的方法会留下一条永不结束的响应流。** 实测：`tools/list`、`tools/call`
+   （含工具返回 `isError=true`）的 POST 应答在 200 ms 内就结束（EOF 立即到达）；而
+   `resources/list`、`prompts/list` 这类未实现的方法，SDK 0.17.0 只把
+   `-32601 Method not found` 写进 `text/event-stream` 却**不结束它**（3 秒后仍无 EOF，
+   会话被 `DELETE` 之后依然如此），服务端因此一直挂着一个活跃请求，关停时会等它。
+   本服务不声明这些能力，规范客户端不会调用；测试套件刻意不通过 HTTP 调用未实现的方法，
+   改成在容器层断言「没有注册这些处理器」。彻底消除需要改传输层的错误应答语义。
+2. **畸形 JSON-RPC 报文的 400 响应体会带服务端堆栈。** 传输层把 `McpError`
+   （一个 `RuntimeException`）直接作为响应体返回，Jackson 按 `Throwable` 序列化，
+   于是响应里既有固定文案 `Invalid message format`，也有服务端堆栈（SDK 与我们自己的类名、行号）。
+   `asset_get` 自身的响应不受影响（四种固定形状、无内部细节），
+   这条边界由协议测试显式钉住，SDK 升级后行为变化会立刻被测出来。

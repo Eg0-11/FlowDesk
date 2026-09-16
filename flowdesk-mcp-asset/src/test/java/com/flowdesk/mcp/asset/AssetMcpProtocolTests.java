@@ -61,6 +61,17 @@ class AssetMcpProtocolTests {
         assertThat(result.capabilities().tools())
                 .as("必须声明 tools 能力，否则客户端不会列出工具")
                 .isNotNull();
+
+        // FD-0014-R1：只声明真正实现的能力（原始报文级断言见 AssetMcpCapabilitiesTests）
+        assertThat(result.capabilities().resources())
+                .as("resources 未实现，不得声明")
+                .isNull();
+        assertThat(result.capabilities().prompts())
+                .as("prompts 未实现，不得声明")
+                .isNull();
+        assertThat(result.capabilities().completions())
+                .as("completions 未实现，不得声明")
+                .isNull();
     }
 
     @Test
@@ -181,5 +192,86 @@ class AssetMcpProtocolTests {
         assertThat(thrown)
                 .as("未注册的工具名必须被服务端拒绝（这同时证明本服务没有写工具）")
                 .isNotNull();
+    }
+
+    // ---------- FD-0014-R1：执行校验必须与公布的 input schema 一致 ----------
+
+    @Test
+    void anExtraArgumentIsRejectedInsteadOfBeingSilentlyIgnored() throws Exception {
+        this.client.initialize();
+
+        McpSchema.CallToolResult result = call(this.client, "asset_get",
+                Map.of("assetId", "AST-900001", "extra", "sentinel-extra-argument"));
+
+        assertThat(result.isError())
+                .as("schema 声明 additionalProperties=false：多传字段必须失败，不能被忽略后照常返回资产")
+                .isTrue();
+        assertThat(payload(result).path("error").asText()).isEqualTo("INVALID_ASSET_ID");
+        assertThat(text(result))
+                .as("固定内容：不回显多余字段的值，也不返回任何资产数据")
+                .doesNotContain("sentinel-extra-argument")
+                .doesNotContain("SERVER")
+                .doesNotContain("IN_SERVICE")
+                .doesNotContain("DEMO");
+    }
+
+    @Test
+    void aWrongNamedArgumentIsRejected() throws Exception {
+        this.client.initialize();
+
+        McpSchema.CallToolResult result = call(this.client, "asset_get", Map.of("asset_id", "AST-900001"));
+
+        assertThat(result.isError()).isTrue();
+        assertThat(payload(result).path("error").asText()).isEqualTo("INVALID_ASSET_ID");
+    }
+
+    @Test
+    void nonObjectArgumentsAreRejectedBeforeTheToolIsEverCalled() throws Exception {
+        AssetMcpRawClient raw = new AssetMcpRawClient(this.port);
+        String sessionId = raw.initialize().sessionId();
+
+        // arguments 不是 JSON 对象（这里是字符串）：SDK 在把入参反序列化成 Map 时就失败了，
+        // 因此工具根本不会被调用。实测状态码是 500（SDK 抛 IllegalArgumentException，未走
+        // 它自己的 400 分支），响应体为空 —— 既没有资产数据，也没有堆栈。
+        AssetMcpRawClient.RawResponse response = raw.post("""
+                {"jsonrpc":"2.0","id":2,"method":"tools/call",\
+                "params":{"name":"asset_get","arguments":"AST-900001"}}""", sessionId);
+
+        assertThat(response.status())
+                .as("非对象入参必须被拒绝（不是一次成功的工具调用）")
+                .isNotEqualTo(200);
+        assertThat(response.body())
+                .as("拒绝响应不得回显取值、不得返回资产数据、不得夹带堆栈")
+                .doesNotContain("SERVER")
+                .doesNotContain("IN_SERVICE")
+                .doesNotContain("DEMO")
+                .doesNotContain("AST-900001")
+                .doesNotContain("stackTrace")
+                .doesNotContain("at io.modelcontextprotocol")
+                .doesNotContain("at com.flowdesk");
+    }
+
+    @Test
+    void aMalformedJsonRpcEnvelopeIsRejectedWithoutEchoingTheInput() throws Exception {
+        AssetMcpRawClient raw = new AssetMcpRawClient(this.port);
+        String sessionId = raw.initialize().sessionId();
+
+        // 报文本身畸形，但里面带着一个合法 assetId：拒绝时绝不能把它回显出来
+        AssetMcpRawClient.RawResponse response = raw.post("{\"assetId\":\"AST-900001\",", sessionId);
+
+        assertThat(response.status()).as("畸形报文必须被拒绝").isEqualTo(400);
+        assertThat(response.body())
+                .as("拒绝体不得回显输入（Jackson 的源码位置是被 REDACTED 的）")
+                .doesNotContain("AST-900001");
+
+        // 已知的框架边界，已写入 ADR 0011 与 README 第二十一章，并在这里显式钉住：
+        // MCP SDK 0.17.0 直接把这个 McpError（一个 RuntimeException）当作 400 响应体返回，
+        // Jackson 于是按 Throwable 序列化，响应里会带服务端堆栈（含 SDK 与我们自己的类名）。
+        // 这是传输层错误响应的渲染方式，不是 asset_get 的工具输出；本阶段不修改它的语义，
+        // 但一旦 SDK 升级后行为变化，这两条断言会立刻提醒我们去更新文档。
+        assertThat(response.body())
+                .as("框架固定文案在，且这点是公开记录的边界")
+                .contains("Invalid message format")
+                .contains("stackTrace");
     }
 }

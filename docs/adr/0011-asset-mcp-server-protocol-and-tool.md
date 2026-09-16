@@ -171,3 +171,90 @@ Spring AI 的 MCP 桥接层（`McpToolUtils`）在工具抛出异常时，会把
 3. 需要浏览器调用时：改成显式 CORS 白名单 + 鉴权，并重新评估 CSRF 面；
 4. 工具数量增长时：把「恰好一个工具」的断言改成「白名单集合」，并保持只读默认；
 5. 需要写操作时：先补审计、幂等与权限模型（不能只加一个工具）。
+
+## 修订（FD-0014-R1）：执行校验、会话生命周期与能力声明
+
+本阶段是一次返工，修三件事，并如实记两条框架边界。
+
+### 1. 运行时输入校验必须等于公布的 schema
+
+原实现只用 `root.path("assetId")` 取值，于是**多传字段会被静默忽略**：客户端送
+`{"assetId":"AST-900001","asAdmin":true}` 照样拿到资产。schema 里写着
+`additionalProperties=false`，执行却不检查 ——「文档说不行、运行期可以」比不写 schema 更糟。
+
+现在 `asset_get` 只接受**恰好**一个 `assetId` 字符串字段的 JSON 对象：
+
+| 输入 | 结果 |
+| --- | --- |
+| 不是 JSON 对象（数组、字符串、数字、布尔、`null`） | `INVALID_ASSET_ID` |
+| 字段数不是 1，或那一个字段不叫 `assetId`（含任意额外字段、值为 `null` 的额外字段） | `INVALID_ASSET_ID` |
+| `assetId` 不是字符串（缺失、`null`、数字、对象、数组） | `INVALID_ASSET_ID` |
+| 非法 JSON、空串、纯空白、两段 JSON 拼接 | `INVALID_ASSET_ID` |
+| `assetId` 不匹配 `AST-[0-9]{6}` | `INVALID_ASSET_ID` |
+
+配套三点：
+
+- schema 补上 `pattern` 与 `maxLength`，并且 **pattern 显式锚定**（`^AST-[0-9]{6}$`）：
+  JSON Schema 的 `pattern` 是部分匹配语义，不锚定就会比执行校验更宽松；这两个值直接取自
+  `AssetId` 常量，避免文档与代码各写一份而漂移；
+- 解析器打开 `FAIL_ON_TRAILING_TOKENS`，两段 JSON 拼接不再被「只看第一段」放过；
+- 失败内容仍然只有固定枚举文案（`INVALID_ASSET_ID`），不回显输入、不说明是哪个字段错了。
+
+**两层输入的边界要说清**：MCP 协议层先把 `params.arguments` 反序列化成 Map，因此
+「`arguments` 根本不是对象」的请求在进入工具之前就被 SDK 拒绝（实测 500、响应体为空）；
+工具层「非对象」的判断由 `ToolCallback` 单元测试覆盖 —— 客户端可以不看 schema 直接发请求，
+真正兜底的是执行校验，而不是 schema。
+
+### 2. 允许 `DELETE` 结束会话：`disallow-delete` 不是「写操作开关」
+
+原配置写的是 `spring.ai.mcp.server.streamable-http.disallow-delete: true`，注释理由是
+「delete 请求在本阶段没有语义」。这是把**协议层的会话清理**当成了**资产写操作**：
+`DELETE /mcp` 结束的是调用方自己的会话，不会碰任何资产数据。
+
+代价是实测出来的，不是推测：
+
+1. Streamable HTTP 里 JSON-RPC **请求**的应答由 `text/event-stream` 承载，流随会话结束而结束；
+2. `disallow-delete=true` 时 SDK 传输层对 `DELETE` 直接返回 **405**，并且**不把会话从会话表移除**；
+3. 于是客户端 `close()` 之后，会话与它打开的流都留在服务端，成为一个永久的活跃请求；
+4. Tomcat 优雅关停（`Commencing graceful shutdown. Waiting for active requests to complete`）
+   一直等这个请求，测试 JVM 在 `System.exit(0)` 之后 30 秒仍未退出，最后被 Surefire 强杀：
+   `Surefire is going to kill self fork JVM`。
+
+改成 `disallow-delete: false` 之后：真实 SDK 客户端 `close()` 会异步发出 `DELETE /mcp`
+（实测：`close()` 返回瞬间会话还在，250 ms 内消失），服务端会话被移除、流被关闭，
+关停时 `Commencing` 与 `Graceful shutdown complete` 之间只隔 **9 ms**。
+
+证据放在 `AssetMcpSessionTests`：真实 HTTP 的「会话可用 → `DELETE` 200 → 旧标识 404」，
+以及「SDK 客户端 `close()` 后服务端会话表回到基线」。异步收敛用**有界轮询**（最多 5 秒、每 25 ms）
+等待，会话真的留下就会失败 —— 没有调大任何 JVM/测试超时，也没有强制退出。
+
+### 3. 只声明实现过的能力（`logging` 是例外，如实记录）
+
+Spring AI 1.1.2 里 `spring.ai.mcp.server.capabilities` 的 `resource` / `prompt` / `completion`
+默认值都是 `true`，而本模块只实现了 tools —— 原来的 `initialize` 响应因此声明了三个并不存在的能力。
+现在显式关掉这三项，只留 `tool: true`。
+
+**但 `logging` 关不掉**：MCP Java SDK 0.17.0 的 `McpAsyncServer` 构造器无条件执行
+`serverCapabilities.mutate().logging().build()`，Spring AI 1.1.2 也没有对应开关。
+所以真实 `initialize` 响应的能力集是 **`tools` + `logging`**，而不是「只有 tools」。
+本文件与 README 按实测写，不再声称「仅声明 tools」。`AssetMcpCapabilitiesTests`
+同时断言原始报文字段集合（`containsExactlyInAnyOrder("logging", "tools")`）、
+`ServerCapabilities` 的逐项取值，以及容器里没有注册任何
+resource / resource-template / prompt / completion 处理器。
+
+## 修订后仍然存在的框架边界（如实记录，未修复）
+
+1. **调用未实现的方法会留下一条永不结束的响应流。** 实测：`tools/list`、`tools/call`
+   （含工具返回 `isError=true`）的 POST 应答在 200 ms 内 EOF；而 `resources/list`、`prompts/list`
+   这类未实现的方法，SDK 只把 `-32601 Method not found` 写进流里却**不结束它**
+   （3 秒后仍无 EOF，会话被 `DELETE` 之后依然如此），服务端因此一直挂着一个活跃请求 ——
+   这是排查 30 秒强杀时发现的第二条链路。本服务不声明这些能力，规范客户端不会调用它们；
+   测试套件也刻意**不**通过 HTTP 调用未实现的方法（改在容器层断言没有注册处理器）。
+   彻底消除需要改传输层的错误应答语义，属于后续阶段。
+2. **畸形 JSON-RPC 报文的 400 响应体会带服务端堆栈。** 传输层把 `McpError`
+   （一个 `RuntimeException`）直接当作响应体返回，Jackson 按 `Throwable` 序列化，于是响应里
+   含固定文案 `Invalid message format`，同时含服务端堆栈（SDK 与我们自己的类名、行号）。
+   `asset_get` 自身的响应不受影响（四种固定形状、无内部细节）。该边界由
+   `AssetMcpProtocolTests.aMalformedJsonRpcEnvelopeIsRejectedWithoutEchoingTheInput`
+   显式钉住（断言 400、不回显输入、且确实含 `stackTrace` 字段），以免 SDK 升级后行为变化而无人察觉。
+   修复它同样属于传输层改造，本阶段不做。

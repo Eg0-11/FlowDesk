@@ -1,6 +1,7 @@
 package com.flowdesk.mcp.asset.tool;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.flowdesk.mcp.asset.directory.AssetDirectory;
@@ -32,7 +33,9 @@ import org.springframework.ai.tool.definition.ToolDefinition;
  *   <tr><td>合法但不存在</td><td>{@code false}</td>
  *       <td>{@code {"assetId":"AST-999999","found":false,"error":"ASSET_NOT_FOUND",...}}</td></tr>
  *   <tr><td>输入非法</td><td>{@code true}</td>
- *       <td>{@code {"error":"INVALID_ASSET_ID","message":"assetId 必须形如 AST-000001（AST- 加 6 位数字）"}}</td></tr>
+ *       <td>{@code {"error":"INVALID_ASSET_ID","message":"assetId 必须形如 AST-000001（AST- 加 6 位数字）"}}<br>
+ *       入参必须<b>恰好</b>是「只含一个 {@code assetId} 字符串字段的 JSON 对象」：
+ *       额外字段、非对象、缺失或非字符串一律按非法处理（见 {@link #rawAssetId(String)}）</td></tr>
  *   <tr><td>数据源不可用 / 内部异常</td><td>{@code true}</td>
  *       <td>{@code {"error":"ASSET_SOURCE_UNAVAILABLE","message":"资产数据源当前不可用"}}</td></tr>
  * </table>
@@ -66,19 +69,32 @@ public final class AssetGetTool implements ToolCallback {
             数据源不可用时返回 ASSET_SOURCE_UNAVAILABLE。""";
 
     /**
-     * 输入 schema：只允许 {@code assetId} 一个字符串字段，且必填。
+     * 输入 schema：<b>恰好</b>一个 {@code assetId} 字符串字段，且必填（FD-0014 / FD-0014-R1）。
      *
-     * <p>手写而不是由方法签名推导，是为了把「必填」「不接受额外字段」这两条写死。</p>
+     * <p>手写而不是由方法签名推导，是为了把三条写死：{@code required}、{@code additionalProperties=false}
+     * 与 {@code pattern}/{@code maxLength}。schema 是<b>公布</b>给客户端的契约，
+     * 因此它必须与 {@link #call(String)} 里的运行时校验一致：本工具<b>只</b>接受
+     * 「只有一个 assetId 字段的 JSON 对象」，任何额外字段、非对象、缺失或非字符串的 assetId
+     * 都在执行校验里被拒绝，而不是只写在 schema 里。</p>
      */
     public static final String INPUT_SCHEMA = "{\"type\":\"object\",\"properties\":{\"assetId\":{"
-            + "\"type\":\"string\",\"description\":\"资产标识，格式为 AST- 加 6 位数字，例如 AST-900001\"}},"
+            + "\"type\":\"string\",\"description\":\"资产标识，格式为 AST- 加 6 位数字，例如 AST-900001\","
+            + "\"pattern\":\"" + AssetId.SCHEMA_PATTERN + "\",\"maxLength\":" + AssetId.MAX_LENGTH + "}},"
             + "\"required\":[\"assetId\"],\"additionalProperties\":false}";
 
     private static final Logger log = LoggerFactory.getLogger(AssetGetTool.class);
 
     private static final String OPERATION = "asset.get";
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    /**
+     * 入参解析器（FD-0014-R1）。
+     *
+     * <p>打开 {@code FAIL_ON_TRAILING_TOKENS}：{@code {"assetId":"AST-900001"}} 后面再跟一段
+     * JSON 不属于「只含一个 assetId 字段的 JSON 对象」，必须按非法处理，
+     * 而不是默默只看第一段。默认关闭该特性会让这种输入被当成合法。</p>
+     */
+    private static final ObjectMapper MAPPER =
+            new ObjectMapper().enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
 
     private final AssetDirectory directory;
 
@@ -136,13 +152,24 @@ public final class AssetGetTool implements ToolCallback {
     }
 
     /**
-     * 从工具入参 JSON 里取 {@code assetId}。
+     * 从工具入参 JSON 里取 {@code assetId}，并<b>按公布的 schema 校验入参形状</b>。
      *
-     * <p>不是字符串（含缺失、{@code null}、数字等）一律返回 {@code null}，
-     * 由 {@link AssetId#isValid(String)} 统一判为非法。</p>
+     * <p>只接受「<b>恰好</b>一个 {@code assetId} 字段的 JSON 对象」：</p>
+     * <ul>
+     *   <li>不是 JSON 对象（数组、字符串、数字、布尔、{@code null}）→ 非法；</li>
+     *   <li>字段数不是 1，或那一个字段不叫 {@code assetId}（含<b>任何额外字段</b>）→ 非法；</li>
+     *   <li>{@code assetId} 不是字符串（缺失、{@code null}、数字、对象…）→ 非法；</li>
+     *   <li>不是合法 JSON → 非法。</li>
+     * </ul>
      *
-     * @param toolInput 工具入参 JSON（可能为 {@code null} 或不是合法 JSON）
-     * @return 原始 assetId；取不到时为 {@code null}
+     * <p>与 schema 的一致性由两处共同保证：{@code additionalProperties=false} / {@code required}
+     * 描述的是这里的形状判定，{@code pattern} / {@code maxLength} 描述的是 {@link AssetId#isValid(String)}。
+     * <b>只改 schema 不改执行校验是不允许的</b> —— 客户端可以不看 schema 直接发请求，
+     * 因此执行校验才是真正的边界。非法输入一律返回固定的 {@code INVALID_ASSET_ID} 内容，
+     * 不回显输入、不说明是哪一个字段错了。</p>
+     *
+     * @param toolInput 工具入参 JSON（可能为 {@code null}、不是 JSON 或不满足 schema）
+     * @return 合法的 assetId；任何不满足上述形状的输入都返回 {@code null}
      */
     private static String rawAssetId(String toolInput) {
         if (toolInput == null || toolInput.isBlank()) {
@@ -150,7 +177,14 @@ public final class AssetGetTool implements ToolCallback {
         }
         try {
             JsonNode root = MAPPER.readTree(toolInput);
-            JsonNode value = root == null ? null : root.path(ARGUMENT_ASSET_ID);
+            if (root == null || !root.isObject()) {
+                return null;
+            }
+            if (root.size() != 1 || !root.has(ARGUMENT_ASSET_ID)) {
+                // 额外字段（或字段名不对）同样拒绝：schema 里 additionalProperties=false
+                return null;
+            }
+            JsonNode value = root.get(ARGUMENT_ASSET_ID);
             return value != null && value.isTextual() ? value.asText() : null;
         }
         catch (JsonProcessingException ex) {

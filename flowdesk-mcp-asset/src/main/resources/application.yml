@@ -11,11 +11,23 @@ spring:
         type: SYNC
         protocol: STREAMABLE
         instructions: FlowDesk 资产目录只读查询服务：目前只提供 asset_get（按标识查询一条资产记录）。
+        # 能力面必须与实现一致（FD-0014-R1）：本服务只有 tools，没有 resources / prompts /
+        # completions。Spring AI 1.1.2 里这三项的默认值都是 true，不显式关闭就会让
+        # initialize 响应声明出并不存在的能力。
+        capabilities:
+          tool: true
+          resource: false
+          prompt: false
+          completion: false
         streamable-http:
           # MCP 端点路径（唯一公开的 MCP 入口）
           mcp-endpoint: /mcp
-          # 不提供服务端主动断开：delete 请求在本阶段没有语义
-          disallow-delete: true
+          # 允许客户端用 DELETE 结束自己的 MCP 会话（FD-0014-R1）：这是协议层的会话清理，
+          # 不是资产写操作，本服务仍然只有只读工具。
+          # 设为 true 时 DELETE 会得到 405 且会话不从会话表移除，客户端 close() 之后
+          # 会话与它打开的流仍然活着，上下文关闭时 Tomcat 优雅关停会一直等活跃请求，
+          # 测试 JVM 因此无法在 30 秒内退出并被 Surefire 强杀。
+          disallow-delete: false
 
 server:
   # 只监听本机回环地址。这不是「默认值而已」：server.address 必须是字面量回环地址

@@ -7,6 +7,7 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.flowdesk.mcp.asset.directory.AssetDirectory;
+import com.flowdesk.mcp.asset.directory.AssetId;
 import com.flowdesk.mcp.asset.directory.AssetRecord;
 import com.flowdesk.mcp.asset.directory.AssetSource;
 import com.flowdesk.mcp.asset.directory.DemoAssetDirectory;
@@ -42,6 +43,39 @@ class AssetGetToolTest {
         assertThat(schema.path("required")).hasSize(1);
         assertThat(schema.path("required").get(0).asText()).isEqualTo("assetId");
         assertThat(schema.path("additionalProperties").asBoolean()).isFalse();
+    }
+
+    @Test
+    void thePublishedSchemaCarriesTheSameLimitsAsTheRuntimeValidation() throws Exception {
+        JsonNode schema = MAPPER.readTree(new AssetGetTool(new DemoAssetDirectory())
+                .getToolDefinition().inputSchema());
+        JsonNode assetId = schema.path("properties").path("assetId");
+
+        assertThat(assetId.path("maxLength").asInt())
+                .as("schema 的 maxLength 必须就是 AssetId 的长度上限")
+                .isEqualTo(AssetId.MAX_LENGTH);
+
+        String pattern = assetId.path("pattern").asText();
+        assertThat(pattern)
+                .as("JSON Schema 的 pattern 是部分匹配：必须锚定，否则比执行校验更宽松")
+                .isEqualTo(AssetId.SCHEMA_PATTERN)
+                .startsWith("^")
+                .endsWith("$");
+
+        java.util.regex.Pattern compiled = java.util.regex.Pattern.compile(pattern);
+        assertThat(compiled.matcher("AST-900001").matches())
+                .as("schema 允许的形态必须真的通过 AssetId 校验")
+                .isTrue();
+        assertThat(AssetId.isValid("AST-900001")).isTrue();
+        for (String legalLookingButRejected : new String[] { "AST-1", "ast-900001", "AST-900001 ", " AST-900001",
+                "AST-9000011", "XAST-900001", "AST-900001X" }) {
+            assertThat(compiled.matcher(legalLookingButRejected).matches())
+                    .as("schema 必须拒绝 [%s]，与执行校验一致", legalLookingButRejected)
+                    .isFalse();
+            assertThat(AssetId.isValid(legalLookingButRejected))
+                    .as("执行校验也必须拒绝 [%s]", legalLookingButRejected)
+                    .isFalse();
+        }
     }
 
     // ---------- 命中 ----------
@@ -95,6 +129,78 @@ class AssetGetToolTest {
         assertThatThrownBy(() -> this.demo.call(null))
                 .isInstanceOf(AssetToolException.class)
                 .hasMessageContaining("INVALID_ASSET_ID");
+    }
+
+    // ---------- FD-0014-R1：执行校验必须与公布的 schema 一致 ----------
+
+    @Test
+    void anObjectWithExtraFieldsIsRejectedInsteadOfBeingSilentlyIgnored() throws Exception {
+        for (String toolInput : new String[] {
+                "{\"assetId\":\"AST-900001\",\"extra\":\"sentinel-extra\"}",
+                "{\"assetId\":\"AST-900001\",\"note\":null}",
+                "{\"assetId\":\"AST-900001\",\"assetId2\":\"AST-900002\"}",
+                "{\"assetId\":\"AST-900001\",\"asAdmin\":true}",
+                "{\"extra\":\"sentinel-extra\",\"assetId\":\"AST-900001\"}",
+                "{\"asset_id\":\"AST-900001\"}",
+                "{\"assetid\":\"AST-900001\"}",
+                "{\"assetId\":\"AST-900001\",\"source\":\"REAL\"}" }) {
+
+            Throwable thrown = catchThrowable(() -> this.demo.call(toolInput));
+
+            assertThat(thrown)
+                    .as("toolInput=%s：schema 声明 additionalProperties=false，执行校验必须拒绝", toolInput)
+                    .isInstanceOf(AssetToolException.class);
+            assertThat(((AssetToolException) thrown).error())
+                    .as("toolInput=%s", toolInput)
+                    .isEqualTo(AssetToolError.INVALID_ASSET_ID);
+            assertThat(thrown.getMessage())
+                    .as("toolInput=%s：固定内容，不回显输入、不回显多余字段的值", toolInput)
+                    .doesNotContain("sentinel-extra")
+                    .doesNotContain("AST-900001")
+                    .doesNotContain("asAdmin")
+                    .doesNotContain("REAL");
+        }
+    }
+
+    @Test
+    void aNonObjectToolInputIsRejected() throws Exception {
+        for (String toolInput : new String[] {
+                "[\"AST-900001\"]",
+                "[\"assetId\",\"AST-900001\"]",
+                "\"AST-900001\"",
+                "900001",
+                "123456",
+                "true",
+                "false",
+                "null",
+                "{\"assetId\":\"AST-900001\"}{\"assetId\":\"AST-900002\"}",
+                "{\"assetId\":123456}",
+                "{\"assetId\":[\"AST-900001\"]}",
+                "{\"assetId\":{\"value\":\"AST-900001\"}}",
+                "{\"assetId\":null}" }) {
+
+            Throwable thrown = catchThrowable(() -> this.demo.call(toolInput));
+
+            assertThat(thrown)
+                    .as("toolInput=%s：入参必须是「只含一个 assetId 字符串字段的 JSON 对象」", toolInput)
+                    .isInstanceOf(AssetToolException.class);
+            assertThat(((AssetToolException) thrown).error())
+                    .as("toolInput=%s", toolInput)
+                    .isEqualTo(AssetToolError.INVALID_ASSET_ID);
+        }
+    }
+
+    @Test
+    void theStrictShapeIsAlsoEnforcedForAWorkingDirectory() throws Exception {
+        ToolCallback unavailable = new AssetGetTool(new UnavailableAssetDirectory());
+
+        // 形状不合法时必须是 INVALID_ASSET_ID（输入问题先于数据源问题），
+        // 而不是被数据源的 ASSET_SOURCE_UNAVAILABLE 掩盖。
+        Throwable thrown = catchThrowable(
+                () -> unavailable.call("{\"assetId\":\"AST-900001\",\"extra\":\"x\"}"));
+
+        assertThat(thrown).isInstanceOf(AssetToolException.class);
+        assertThat(((AssetToolException) thrown).error()).isEqualTo(AssetToolError.INVALID_ASSET_ID);
     }
 
     // ---------- 数据源不可用 / 内部异常 ----------

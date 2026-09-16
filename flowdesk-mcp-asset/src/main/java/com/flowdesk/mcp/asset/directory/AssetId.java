@@ -22,6 +22,16 @@ public final class AssetId {
     /** 合法资产标识的形式。 */
     public static final Pattern PATTERN = Pattern.compile("AST-[0-9]{6}");
 
+    /**
+     * 对外公布的 JSON Schema {@code pattern}（FD-0014-R1）。
+     *
+     * <p>{@link #PATTERN} 是未锚定的正则，而 {@link #isValid(String)} 用的是整串匹配
+     * （{@code Matcher.matches()}）。JSON Schema 的 {@code pattern} 是「部分匹配」语义，
+     * 因此公布时必须显式加上 {@code ^} / {@code $} —— 否则 schema 会比执行校验更宽松，
+     * 出现「文档说可以、运行期拒绝」的不一致。</p>
+     */
+    public static final String SCHEMA_PATTERN = "^" + "AST-[0-9]{6}" + "$";
+
     /** 合法长度：{@code AST-} + 六位数字。 */
     public static final int MAX_LENGTH = 10;
 
