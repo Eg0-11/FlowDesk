@@ -2,7 +2,28 @@ spring:
   application:
     name: flowdesk-mcp-asset
 
+  ai:
+    mcp:
+      server:
+        # 独立资产 MCP 服务（FD-0014）：只提供只读查询，不注册任何写工具。
+        name: flowdesk-mcp-asset
+        # 同步服务器 + Streamable HTTP：工具以 Spring AI ToolCallback Bean 注册（同步调用模型）。
+        type: SYNC
+        protocol: STREAMABLE
+        instructions: FlowDesk 资产目录只读查询服务：目前只提供 asset_get（按标识查询一条资产记录）。
+        streamable-http:
+          # MCP 端点路径（唯一公开的 MCP 入口）
+          mcp-endpoint: /mcp
+          # 不提供服务端主动断开：delete 请求在本阶段没有语义
+          disallow-delete: true
+
 server:
+  # 只监听本机回环地址。这不是「默认值而已」：server.address 必须是字面量回环地址
+  # （127.0.0.0/8 的完整四段十进制写法，或 IPv6 回环 ::1），否则应用启动失败。
+  # 主闸门 AssetMcpBindingGuard（经 META-INF/spring.factories 注册）在环境准备阶段就拒绝，
+  # 那时还没有创建 Web 服务器；AssetMcpConfiguration 的装配期校验是第二道闸门。
+  # 判定只做字面匹配、不做 DNS 解析，因此 0.0.0.0 / 外网地址 / 主机名（含 localhost）都被拒绝。
+  address: 127.0.0.1
   port: 8091
 
 management:
@@ -10,3 +31,11 @@ management:
     web:
       exposure:
         include: health,info
+
+flowdesk:
+  asset:
+    directory:
+      # unavailable（默认）：本阶段没有真实资产数据源，asset_get 返回稳定的
+      #   ASSET_SOURCE_UNAVAILABLE，绝不用虚构数据冒充真实资产。
+      # demo：内置少量固定虚构资产（结果里 source=DEMO），仅供演示与自动化测试。
+      mode: unavailable

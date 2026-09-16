@@ -1,6 +1,6 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0013 —— 可审计的知识检索重排（RAG 6/6，已完成）**
+> **当前阶段：FD-0014 —— 独立资产 MCP 服务的协议与只读查询工具（已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
@@ -22,10 +22,12 @@
 > 引用意图识别收口（普通文本例外只留给完整的纯 ASCII 字母单词，`[Kx1]`/`[Ka-1]`/`[Known1]` 等
 > 一律按畸形引用失败）（FD-0012-R2）、
 > 可审计的知识检索重排（可选 qwen3-rerank、检索与问答共用同一份最终排序、重排分与向量分分离）
-> （FD-0013）。
+> （FD-0013）、
+> 独立资产 MCP 服务（Streamable HTTP `/mcp`、唯一只读工具 `asset_get`、演示数据与真实数据边界、
+> 只监听回环 + 拒绝浏览器跨源）（FD-0014）。
 > 尚未实现：全文检索与混合检索、任意切片读取接口、文档列表/下载/删除、
 > 孤立文件清理任务、`PARSING`/`INDEXING` 悬挂的恢复扫描、问答的流式输出与会话记忆、
-> 游标分页、PostgreSQL 全文检索与 pg_trgm、MCP 能力、Agent Graph、鉴权与前端。
+> 游标分页、PostgreSQL 全文检索与 pg_trgm、监控 MCP 服务的能力实现、Agent Graph、鉴权与前端。
 
 ## 一、项目简介
 
@@ -56,7 +58,7 @@ Tool 调用、MCP 资产/监控服务以及基于 Agent Graph 的自动化编排
 | `flowdesk-agent` | AI 编排：实现 application 的 AI 用例，用 ChatClient 编排提示词与本地工具 | 已实现普通聊天、工具冒烟，以及知识库问答编排（提示词构造 + 引用校验 + 无证据降级） |
 | `flowdesk-infrastructure` | 持久化与模型适配器 | 已提供 JDBC 工单存储（`…ticket.persistence.jdbc`）、DeepSeek 传输适配，以及知识文档的 JDBC 存储、本地文件系统内容读写、Tika 解析适配器、确定性切片器、DashScope 文档/查询 Embedding 适配器、pgvector 向量写入与相似度检索适配器、DashScope 文本重排适配器（`…knowledge.*`） |
 | `flowdesk-bootstrap` | FlowDesk 主服务启动模块（Web + Validation + Actuator + AI 接口 + 工单 REST 接口 + 知识文档 REST 接口 + 知识检索接口 + 知识问答接口） | 可启动，端口 8080 |
-| `flowdesk-mcp-asset` | 独立资产 MCP 服务（Web + Actuator） | 可启动，端口 8091 |
+| `flowdesk-mcp-asset` | 独立资产 MCP 服务（Web + Actuator + MCP Streamable HTTP `/mcp`） | 可启动，端口 8091；已实现 `asset_get` 只读查询工具（演示/不可用两种数据源模式） |
 | `flowdesk-mcp-monitoring` | 独立监控 MCP 服务（Web + Actuator） | 可启动，端口 8092 |
 
 ## 三、模块依赖关系
@@ -90,7 +92,7 @@ flowdesk-mcp-monitoring     ← 只依赖 flowdesk-shared
 | JDK | 17（Release 固定 17，Enforcer 校验 `[17,18)`） |
 | Maven | 3.9+（Enforcer 校验 `[3.9,)`） |
 | Spring Boot | 3.5.8（父 POM + BOM） |
-| Spring AI | 1.1.2（BOM 管理；实际使用 `spring-ai-client-chat` 与 `spring-ai-starter-model-openai`） |
+| Spring AI | 1.1.2（BOM 管理；实际使用 `spring-ai-client-chat`、`spring-ai-starter-model-openai` 与 `spring-ai-starter-mcp-server-webmvc`（FD-0014，随附 MCP Java SDK 0.17.0，版本由 BOM 管理，未手工指定版本）） |
 | Spring AI Alibaba | 1.1.2.2（BOM 管理；实际使用 `spring-ai-alibaba-starter-dashscope`，只在 `dashscope-embedding` profile 下提供 `EmbeddingModel`；Agent Framework 留待后续阶段） |
 | Spring AI Alibaba Extensions | 1.1.2.2（**仅导入 BOM**） |
 | DeepSeek 传输 | OpenAI 兼容 Chat Completions（`spring-ai-starter-model-openai`，见 [ADR 0001](docs/adr/0001-deepseek-openai-compatible-transport.md)） |
@@ -122,7 +124,7 @@ mvnw.cmd clean package
 | 服务 | 模块 | 端口 | 健康检查 |
 | --- | --- | --- | --- |
 | FlowDesk 主服务 | `flowdesk-bootstrap` | 8080 | `http://localhost:8080/actuator/health` |
-| 资产 MCP 服务 | `flowdesk-mcp-asset` | 8091 | `http://localhost:8091/actuator/health` |
+| 资产 MCP 服务 | `flowdesk-mcp-asset` | 8091（**只监听 `127.0.0.1`**，MCP 端点为 `/mcp`） | `http://127.0.0.1:8091/actuator/health` |
 | 监控 MCP 服务 | `flowdesk-mcp-monitoring` | 8092 | `http://localhost:8092/actuator/health` |
 
 启动方式（示例）：
@@ -736,11 +738,12 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0012-R1 | 规范化问题贯通检索与生成、引用形态绕过收口、证据结构化 JSON、证据不可变快照 | ✅ 已完成 |
 | FD-0012-R2 | 引用意图识别收口：普通文本例外收紧为完整 ASCII 字母单词 | ✅ 已完成 |
 | FD-0013 | 可审计的知识检索重排（RAG 6/6）：DashScope qwen3-rerank、检索与问答共用同一份最终排序 | ✅ 已完成 |
+| FD-0014 | 独立资产 MCP 服务：Streamable HTTP `/mcp` + 只读工具 `asset_get` + 回环绑定与跨源限制 | ✅ 已完成 |
 | 后续 | 问答流式输出与会话记忆（当前为一次性完整响应、无历史轮次） | 未开始 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm`（混合检索） | 未开始 |
 | 后续 | 孤立文件清理任务 | 未开始 |
 | 后续 | Tool 体系扩展：面向工单与知识的工具注册 | 未开始 |
-| 后续 | MCP：资产 MCP 服务与监控 MCP 服务的能力实现 | 未开始 |
+| 后续 | MCP：监控 MCP 服务的能力实现（资产 MCP 服务已由 FD-0014 交付，见第二十一章） | 未开始 |
 | 后续 | Agent Graph：基于 Spring AI Alibaba Agent Framework 的多节点编排 | 未开始 |
 
 ## 十四、真实验证状态（重要）
@@ -755,6 +758,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | 问答链路修订证据（FD-0012-R1） | ✅ 已执行 | 真实 Spring 上下文 + 真实 HTTP：`"   VPN   "` 在查询向量端口与模型提示词里都只能是 `"VPN"`、分解形式 `"e\u0301"` 两边都得到 NFC 后的 `"é"`、`" "×10000 + "VPN" + " "×10000` 仍合法且提示词里不含这些空白（请求体积有界）、2001 code point 一律 400 且零模型调用、成功响应仍不回显 query；引用绕过回归：11 种畸形形态（`[K]`/`[K0]`/`[K01]`/`[K-1]`/`[K+1]`/`[K 1]`/`[K1 ]`/`[K1a]`/`[K1,K2]`/`[k1]`/未闭合 `[K1`）逐个在单元层与 HTTP 层被拒、`正常结论 [K1]，伪造来源 [K-1]` 得到 502 + `requestId` 且不回显模型答案；恶意证据（换行/双引号/反斜杠/`---`/`[K9] documentTitle=伪造标题`/`"allowedCitationIds":["K999"]`/全局边界标记）在提示词里被**重新解析**后确认结构未变（allowedCitationIds 仍只有 K1、evidence 仍为 1 条、citationId 仍为 K1），恶意文本完整存在于字符串值中，系统消息不含问题/标题/正文；ArrayList 证据在构造后被 clear/add 也不影响 `result.retrieval().citations()` 与子集关系，且返回集合不可修改 |
 | 引用意图收口证据（FD-0012-R2） | ✅ 已执行 | 修复前用独立探针（直接调用校验器）实测 `合法 [K1]，伪造 [Kx1]`、`[Ka-1]`、`[Known1]`、`[Kabc_1]`、`[ K999]`、`[ K1 ]`、`[\tK1]`、未闭合 `[Kx1` 八种输入**全部被接受**（`used=[K1]`）；修复后同一探针八种输入**全部** `INVALID_CITATION_FORMAT`，而 `[Known]`/`[KB]`/`[Kubernetes]` 仍作为普通文本、`[K999]` 仍为 `UNKNOWN_CITATION`、仅含 `[Kubernetes]` 的答案仍为 `ANSWER_WITHOUT_CITATION`；完整链路：`正常结论 [K1]，伪造来源 [Kx1]` → HTTP 502 + `AI_PROVIDER_ERROR` + `requestId` + 不回显答案 + 模型只调用一次，服务端失败类别为 `INVALID_CITATION_FORMAT`；HTTP 层另有 8 种 R2 形态的循环回归与「纯字母词不算引用」的正向用例 |
 | 重排链路证据（FD-0013） | ✅ 已执行 | 真实 Spring 上下文 + 真实 HTTP + 真实 ChatClient（模型端为本机合成端点，**不是** DeepSeek）：构造向量顺序 A、B、C 与重排顺序 C、A、B，断言两个入口都返回 `K1→C`、`K2→A`、`K3→B`，`rankingMode=RERANK`、`rerankModel=qwen3-rerank`、每条 `rerankScore` 与**未被覆盖的向量分**，且 DeepSeek 提示词里的证据顺序与 `allowedCitationIds` 也是这一份；重排端口只收到规范化 query 与三个候选正文；空命中与单候选时**重排与模型都不被调用**且模式为 `VECTOR_SIMILARITY`；关闭重排时端口调用为 0、响应里不出现 `rerankModel`/`rerankScore`；`RERANK_PROVIDER_ERROR` → 502 + 固定 `title`/`detail`/`instance` 且响应不含 query/正文/上游原文/`citations`，重排失败时不再调用模型；违约重排响应（重复下标）→ 500；适配器层用**本机合成 HTTP 端点**验证真实请求体（只有 `model`/`query`/`documents` 三字段、无 `top_n`/`input`/标识/向量）、`Authorization: Bearer <假 Key>`、按 `index` 绑定、缺字段透传为 `null`、非数字/缺 `results`/非 JSON → 500、429/500/502/503/401 → 502、读取超时 → 502 且**只发一次请求**、日志不含问题/正文/Key/地址；配置 fail-fast：关闭时不要求任何 Key/Endpoint、启用时缺 Endpoint/占位符 Endpoint/非 `qwen3-rerank` 模型/缺 Key/未启用向量化全部启动失败，完整配置可装配真实适配器 |
+| 资产 MCP 服务证据（FD-0014） | ✅ 已执行 | **真实 MCP 客户端 + 真实 Streamable HTTP 会话**（MCP Java SDK 0.17.0 的 `HttpClientSseClientTransport` 连到真实启动的进程/上下文，非 MockMvc 假协议）：`initialize` 成功、`tools/list` **恰好一个** `asset_get`（无任何写工具）、`tools/call` 命中返回 `isError=false` + `{assetId,assetType,status,source=DEMO}`、合法但不存在的编号返回 `isError=false` + `ASSET_NOT_FOUND`（**「未找到」不是工具失败**）、`AST-1`/`ast-900001`/` AST-900001`/`AST-9000011`/空/缺失/非字符串/未知参数在 MCP 层得到 `isError=true` + `INVALID_ASSET_ID`、默认模式下 `AST-900001` 得到 `isError=true` + `ASSET_SOURCE_UNAVAILABLE`；**逐条比对固定文案**与固定 input schema（`required=["assetId"]`、`additionalProperties=false`），并断言响应里不出现内部类名、堆栈、`at com.flowdesk`、路径与演示数据以外的内容；注入目录实现抛出含哨兵文本的异常后，错误内容只出现固定码与文案，且日志捕获里不出现哨兵文本/异常消息/堆栈；`Origin`（含 `null`、`http://127.0.0.1:8091`、`https://evil.example`、任意值）请求 `/mcp` 一律 403 + `ORIGIN_NOT_ALLOWED` 固定 problem 且**无** `Access-Control-Allow-Origin`、请求进不到端点，而同一进程上不带 `Origin` 的真实 SDK 客户端仍能完成 `initialize`/`tools/list`/`tools/call`，`/actuator/health` 不受过滤器影响；非回环 `server.address`（`0.0.0.0`/`192.168.1.10`/`203.0.113.7`/`2001:db8::1`/`::`/`example.com`/`my-host.local`/`localhost`/空白）在真实启动上下文中以固定 `IllegalStateException` **启动失败**，且有一个用例证明拒绝发生在 `ApplicationEnvironmentPreparedEvent` 阶段（**任何 Web 服务器被创建之前**），另有用例证明第二道闸门 Bean 同样拒绝；回环判定另有 31 条参数化用例覆盖 `127.0.0.1`/`127.0.0.0`/`127.255.255.255`/`::1` 通过，`127.5`/`127.example.com`/`0127.0.0.1`/`2130706433`/`::ffff:127.0.0.1` 被拒；测试全部使用固定虚构演示数据，**不访问任何外部服务** |
 | PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证**；pgvector 集成测试（Testcontainers，镜像固定为带扩展版本的 `pgvector/pgvector:0.8.6-pg16`）在无 Docker 时跳过（当前跳过 26 条：15 条索引写入 + 11 条相似度检索），报告标注 POSTGRESQL_PGVECTOR_IT=NOT_RUN |
 | 真实 DashScope Embedding | ⚠️ **DASHSCOPE_LIVE=NOT_RUN** | 无 DASHSCOPE_API_KEY，**未对真实向量服务发起过任何请求**；全部自动化测试都不访问真实上游 |
 | 真实 DeepSeek | ⚠️ **LIVE_SMOKE=NOT_RUN** | 无 `DEEPSEEK_API_KEY`，**未对真实模型发起过任何请求** |
@@ -2010,3 +2014,131 @@ Endpoint 示例在配置注释里写作 `https://<workspace-id>.<region>.maas.al
 5. **失败即失败**：没有「上游挂了就用向量排序」的降级路径，调用方会明确拿到 502/500；
 6. **真实上游未验证**：`DASHSCOPE_LIVE=NOT_RUN`、`RERANK_LIVE=NOT_RUN`（本机无 Key），
    适配器测试全部使用本机合成 HTTP 端点（不访问真实付费接口）。
+
+## 二十一、独立资产 MCP 服务（FD-0014）
+
+设计取舍见 [`docs/adr/0011-asset-mcp-server-protocol-and-tool.md`](docs/adr/0011-asset-mcp-server-protocol-and-tool.md)。
+
+本阶段把 `flowdesk-mcp-asset` 从「只有健康检查的 Web 骨架」变成**真正可被 MCP 客户端连接**的
+独立服务：`initialize` → `tools/list` → `tools/call`，只暴露**一个只读工具** `asset_get`。
+
+> **边界先行**：本阶段只做**协议、工具契约与安全边界**。**没有**接入真实企业资产系统，
+> 也**没有**接入主 Agent —— MCP 工具不会注册到 DeepSeek ChatClient，RAG 问答也不会自动调用它。
+
+| 项 | 值 |
+| --- | --- |
+| 模块 | `flowdesk-mcp-asset`（只依赖 `flowdesk-shared`） |
+| Starter | `spring-ai-starter-mcp-server-webmvc`（Spring AI 1.1.2，版本由既有 BOM 管理） |
+| 传输 | **Streamable HTTP**（`spring.ai.mcp.server.protocol=STREAMABLE`，`type=SYNC`） |
+| 端点 | `POST /mcp`（`spring.ai.mcp.server.streamable-http.mcp-endpoint=/mcp`） |
+| 端口 / 监听 | `8091`，且**只监听 `127.0.0.1`**（见 21.4） |
+| 工具 | 恰好一个：`asset_get`（只读） |
+| 健康检查 | `GET /actuator/health`（行为不变） |
+
+### 21.1 工具契约（`asset_get`）
+
+输入（`tools/list` 里的 input schema）：
+
+```json
+{"type":"object",
+ "properties":{"assetId":{"type":"string","description":"资产标识，格式为 AST- 加 6 位数字，例如 AST-900001"}},
+ "required":["assetId"],
+ "additionalProperties":false}
+```
+
+- 唯一入参 `assetId`，**必填**；格式固定 `AST-[0-9]{6}`（大写前缀 + 恰好六位数字）；
+- 空、`null`、纯空白、超长（> 10 字符）、大小写不符、含空格或下划线一律拒绝；
+- **没有**任何写工具（新增/修改/删除在本阶段不可表达），底层端口也没有写方法。
+
+输出（MCP `CallToolResult` 的单个 text content，四种固定形状）：
+
+| 情形 | `isError` | 内容 |
+| --- | --- | --- |
+| 命中 | `false` | `{"assetId":"AST-900001","assetType":"SERVER","status":"IN_SERVICE","source":"DEMO"}` |
+| 合法但不存在 | `false` | `{"assetId":"AST-999999","found":false,"error":"ASSET_NOT_FOUND","message":"未找到该资产","source":"DEMO"}` |
+| 输入非法 | `true` | `{"error":"INVALID_ASSET_ID","message":"assetId 必须形如 AST-000001（AST- 加 6 位数字）"}` |
+| 数据源不可用 | `true` | `{"error":"ASSET_SOURCE_UNAVAILABLE","message":"资产数据源当前不可用"}` |
+
+**「未找到」不是「工具执行失败」**：`isError` 表达的是「这次**调用**有没有失败」，
+不是「查询结果好不好」。资产不存在是查询正常给出的答案（与检索接口「无命中返回 200 空列表」
+同一条原则），标成错误会让调用方以为工具坏了而重试或降级。
+真正的执行失败（输入非法、数据源不可用、内部异常）才置 `isError=true`。
+
+**错误内容为什么不泄漏**：错误码只有 `INVALID_ASSET_ID` 与 `ASSET_SOURCE_UNAVAILABLE` 两个，
+文案来自固定枚举；不含路径、配置、凭据、异常消息、堆栈或类名。
+目录实现抛出的**任何**运行期异常都收敛为 `ASSET_SOURCE_UNAVAILABLE`；日志里也只出现
+稳定错误码与异常**类名**（不记录 assetId 原值、异常消息与堆栈）。
+
+> 实现细节（也是实际契约）：MCP 桥接层会把工具抛出异常的 `getMessage()` 原样放进错误内容，
+> 因此这里的消息**就是**上面那段固定 JSON（由 `AssetToolException` 承载），
+> 成功与失败的内容形状一致，调用方可以统一解析。
+
+### 21.2 数据源：默认「不可用」，演示数据必须显式打开
+
+```yaml
+flowdesk:
+  asset:
+    directory:
+      mode: unavailable   # 默认；也可以显式设为 demo
+```
+
+| 模式 | 行为 |
+| --- | --- |
+| `unavailable`（**默认**） | 没有真实数据源：每次查询都以稳定的 `ASSET_SOURCE_UNAVAILABLE` 失败（`isError=true`）。**不会**用虚构数据冒充真实资产 |
+| `demo` | 内置三条固定虚构资产（`AST-900001`~`AST-900003`），所有结果都带 `source=DEMO` |
+
+- 「没有数据」与「资产不存在」被严格区分：前者是执行失败，后者是正常答案；
+- 命中与「未找到」都带 `source`（问的是哪个目录），因为「演示目录说没有」与
+  「真实资产系统说没有」是两件不同的事；数据源不可用时**不产生任何 `source` 声明**；
+- 演示数据是**虚构**的（`AST-9xxxxx` 是明显的保留段）。本文档不使用「已接入企业资产系统」
+  这类表述，演示路径的测试也**不是**真实资产集成测试。
+
+### 21.3 启动与调用
+
+```powershell
+# 1) 打包并启动（默认模式：没有数据源）
+.\mvnw.cmd clean package
+java -jar flowdesk-mcp-asset/target/flowdesk-mcp-asset-0.1.0-SNAPSHOT.jar
+
+# 2) 演示模式（可选）：进程级参数显式打开
+java -jar flowdesk-mcp-asset/target/flowdesk-mcp-asset-0.1.0-SNAPSHOT.jar `
+     --flowdesk.asset.directory.mode=demo
+
+# 3) 健康检查
+curl.exe http://127.0.0.1:8091/actuator/health
+```
+
+MCP 客户端的连接信息：**URL = `http://127.0.0.1:8091/mcp`**，传输 = Streamable HTTP，
+不需要任何鉴权头（本阶段没有鉴权，因此严格限制在本机回环）。请求示例（JSON-RPC，节选）：
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call",
+ "params":{"name":"asset_get","arguments":{"assetId":"AST-900001"}}}
+```
+
+### 21.4 安全边界
+
+**只监听本机回环**：`server.address` 必须是**无歧义的**回环字面量 ——
+完整的四段十进制 IPv4 回环（`127.0.0.0/8`，如 `127.0.0.1`）或 IPv6 回环 `::1` 的完整写法。
+以下一律**启动失败**：`0.0.0.0`、`::`、具体外网地址、主机名（含 `localhost`）、
+以及 `127.5`、`127.example.com`、`0127.0.0.1` 这类含糊写法（判定只做字面匹配、**不**做 DNS 解析）。
+
+拒绝发生在 **Web 服务器创建之前**（`ApplicationEnvironmentPreparedEvent` 监听器），
+因此**不会绑定任何端口**；装配期校验 Bean 作为第二道闸门兜住「绕过监听器直接刷新上下文」的路径。
+这说明「不能只靠 `application.yml` 默认值」：默认值只是默认，配置覆盖必须被拦下。
+
+**浏览器跨源一律 403**：`/mcp` 请求只要带 `Origin` 头就返回
+`403` + 固定 problem（`urn:flowdesk:problem:origin-not-allowed` / `ORIGIN_NOT_ALLOWED`），
+请求不会进入 MCP 端点。**不配置宽松 CORS**，也不把端点暴露给外部网络；
+不带 `Origin` 的正常 MCP SDK 客户端不受影响。健康检查等其它端点不受该过滤器影响。
+
+### 21.5 已知边界
+
+1. **没有真实资产数据源**：默认模式返回 `ASSET_SOURCE_UNAVAILABLE`，未接入任何企业资产系统；
+2. **没有鉴权/授权**：任何能访问本机回环端口的进程都可以调用工具（这也是只监听回环的原因）；
+3. **只读、单工具**：没有写操作，也没有批量查询、列表、分页或模糊搜索；
+4. **只有 tools 能力**：不提供 MCP resources / prompts；
+5. **不接入主 Agent**：MCP 工具不会注册到 DeepSeek ChatClient，RAG 问答不会自动调用它
+   （模块之间不共享容器，没有任何跨模块注册）；
+6. **未验证项**：`MCP_LIVE=NOT_RUN`（未对接任何外部 MCP 服务或真实资产系统）；
+   `POSTGRES_LIVE`、`DASHSCOPE_LIVE`、`LIVE_SMOKE` 与本模块无关但全仓仍为 `NOT_RUN`。
