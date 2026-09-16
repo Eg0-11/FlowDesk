@@ -305,7 +305,7 @@ class KnowledgeAnswerWebTests {
         assertThat(this.searchPort.calls()).isZero();
     }
 
-    // ---------- 引用绕过回归（FD-0012-R1）----------
+    // ---------- 引用绕过回归（FD-0012-R1 / R2）----------
 
     @Test
     void aMalformedCitationNextToAValidOneStillFailsTheWholeAnswer() throws Exception {
@@ -334,11 +334,38 @@ class KnowledgeAnswerWebTests {
     }
 
     @Test
+    void aCitationShapedWordWithADigitNextToAValidOneStillFailsTheWholeAnswer() throws Exception {
+        // FD-0012-R2 的验收缺口：早期实现只看 K 后的第一个字符，[Kx1] 被当成普通文本而整次作答成功
+        this.searchPort.willReturn(List.of(match(0, 0.9, "标题", "正文")));
+        endpoint.willAnswer("正常结论 [K1]，伪造来源 [Kx1]");
+
+        MvcResult result = this.mockMvc.perform(post(ANSWER_PATH)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"query\":\"" + QUESTION + "\"}"))
+                .andExpect(status().isBadGateway())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.code").value("AI_PROVIDER_ERROR"))
+                .andExpect(jsonPath("$.type").value("urn:flowdesk:problem:ai-provider-error"))
+                .andExpect(jsonPath("$.requestId").isNotEmpty())
+                .andReturn();
+
+        assertThat(body(result))
+                .as("失败响应不得回显模型原始答案")
+                .doesNotContain("正常结论")
+                .doesNotContain("伪造来源")
+                .doesNotContain("[Kx1]")
+                .doesNotContain("[K1]")
+                .doesNotContain("Exception");
+        assertThat(endpoint.requests()).as("校验失败不重试，模型只被调用一次").hasSize(1);
+    }
+
+    @Test
     void everyMalformedCitationShapeIsRejectedOverHttp() throws Exception {
         this.searchPort.willReturn(List.of(match(0, 0.9, "标题", "正文")));
 
         for (String malformed : List.of("[K]", "[K0]", "[K01]", "[K-1]", "[K+1]", "[K 1]", "[K1 ]",
-                "[K1a]", "[K1,K2]", "[k1]", "[K1")) {
+                "[K1a]", "[K1,K2]", "[k1]", "[K1",
+                "[Kx1]", "[Ka-1]", "[Known1]", "[Kabc_1]", "[ K999]", "[ K1 ]", "[\tK1]", "[Kx1")) {
 
             endpoint.willAnswer("合法 [K1]，伪造 SENTINEL-BYPASS " + malformed);
 
@@ -354,6 +381,21 @@ class KnowledgeAnswerWebTests {
                     .doesNotContain("SENTINEL-BYPASS")
                     .doesNotContain("[K1]");
         }
+    }
+
+    @Test
+    void asciiLetterWordsAreStillPlainTextOverHttp() throws Exception {
+        // [Known]/[KB]/[Kubernetes] 是完整的纯 ASCII 字母单词：不得因为它们而判失败
+        this.searchPort.willReturn(List.of(match(0, 0.9, "标题", "正文")));
+        endpoint.willAnswer("依据 [Known] 与 [Kubernetes] 的说法，结论是 [K1]。");
+
+        this.mockMvc.perform(post(ANSWER_PATH)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"query\":\"" + QUESTION + "\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.grounded").value(true))
+                .andExpect(jsonPath("$.usedCitationIds.length()").value(1))
+                .andExpect(jsonPath("$.usedCitationIds[0]").value("K1"));
     }
 
     // ---------- 结构化证据：恶意内容无法变成结构（FD-0012-R1）----------

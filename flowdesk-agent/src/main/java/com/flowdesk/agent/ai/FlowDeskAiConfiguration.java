@@ -43,7 +43,8 @@ public class FlowDeskAiConfiguration {
     /**
      * 基于检索证据的知识库问答实现（RAG 5/6）。
      *
-     * <p>依赖两件事：检索用例（输入的规范化与校验唯一入口，也是「无证据不调用模型」的判断依据）
+     * <p>依赖两件事：检索用例（输入的<b>合法性</b>校验唯一入口，也是「无证据不调用模型」的判断依据；
+     * NFC + strip 则由检索与问答共用的 {@code KnowledgeQueryNormalizer} 完成）
      * 与命名明确的 {@code deepSeekChatClient}。本 Bean 只在 {@code flowdesk.ai.enabled=true}
      * 时存在，因此默认 profile 下不会有任何问答能力，也不会有出网可能。</p>
      *

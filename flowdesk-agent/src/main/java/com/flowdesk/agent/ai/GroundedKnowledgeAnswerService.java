@@ -32,8 +32,12 @@ import org.springframework.ai.chat.client.ChatClient;
  *   <li><b>调用 DeepSeek 一次</b>：只发送 system + user 两条消息，<b>不</b>注册工具、
  *       <b>不</b>启用会话记忆、<b>不</b>在本类内重试生成结果；</li>
  *   <li><b>校验引用</b>：{@link GroundedCitationValidator}（非空、至少一个规范引用、
- *       引用必须在本次证据内；<b>任何</b>畸形引用 —— 含 {@code [K-1]}、{@code [K1a]}、
- *       {@code [K 2]}、{@code [k9]}、未闭合的 {@code [K1} —— 都使整次作答失败），失败即 502；</li>
+ *       引用必须在本次证据内）。按 <b>ASCII 方括号引用协议</b>判定：只有
+ *       {@code [K[1-9][0-9]*]} 是规范引用；K/k 前缀的<b>非纯字母记号</b>一律按畸形引用处理
+ *       （{@code [K-1]}、{@code [K1a]}、{@code [K 2]}、{@code [k9]}、{@code [Kx1]}、{@code [Ka-1]}、
+ *       {@code [Known1]}、{@code [ K999]}、未闭合的 {@code [K1} 等），整次作答失败；
+ *       只有完整的纯 ASCII 字母单词（{@code [Known]}、{@code [KB]}、{@code [Kubernetes]}）
+ *       才是普通文本。失败即 502；</li>
  *   <li><b>返回</b>：答案 + 实际引用编号 + 完整检索证据（证据是不可变快照，
  *       见 {@link KnowledgeRetrievalView}）。</li>
  * </ol>
@@ -41,11 +45,13 @@ import org.springframework.ai.chat.client.ChatClient;
  * <h2>为什么答案必须后校验</h2>
  * <p>提示词只能「要求」模型给出规范引用，不能保证它照做 —— 结构化隔离与系统指令只是
  * <b>降低</b>注入风险，不能防止模型违背规则。真正决定响应能否返回成功的，是对模型输出的
- * <b>独立校验</b>：空答案、没有引用、任何形式的畸形引用、以及本次没有给出的编号，
+ * <b>独立校验</b>：空答案、没有引用、协议内的畸形引用、以及本次没有给出的编号，
  * 全部判为失败（HTTP 502）。这样「答案看起来合理」不再等于「答案有据可查」。</p>
  *
  * <p>反过来说清楚边界：引用校验证明的是<b>编号来源</b>（每个引用都能回到本次检索到的具体切片），
- * 它<b>不</b>证明答案在事实上正确 —— 模型仍可能「引用了正确编号却推理错误」。</p>
+ * 它<b>不</b>证明答案在事实上正确 —— 模型仍可能「引用了正确编号却推理错误」。
+ * 校验器也只处理 ASCII 方括号协议，不解析 Markdown、不解码 HTML 实体、不做 Unicode 同形字符
+ * 归一（详见 {@link GroundedCitationValidator} 的「已知边界」）。</p>
  *
  * <h2>不做的事</h2>
  * <p>不生成流式输出、不做 Rerank、不拼接多轮会话记忆、不注册任何工具；
@@ -69,7 +75,8 @@ public class GroundedKnowledgeAnswerService implements KnowledgeAnswerUseCase {
     private final ChatClient deepSeekChatClient;
 
     /**
-     * @param retrieveKnowledgeUseCase 检索用例（输入的规范化与校验唯一入口）
+     * @param retrieveKnowledgeUseCase 检索用例（输入的<b>合法性</b>校验唯一入口；NFC + strip
+     *                                 由检索与问答共用的 {@link KnowledgeQueryNormalizer} 完成）
      * @param deepSeekChatClient       命名明确的 DeepSeek ChatClient（不注册工具、无会话记忆）
      */
     public GroundedKnowledgeAnswerService(RetrieveKnowledgeUseCase retrieveKnowledgeUseCase,

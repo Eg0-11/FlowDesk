@@ -18,10 +18,13 @@ import org.junit.jupiter.params.provider.ValueSource;
  * 因此这里的重点是三件事：</p>
  * <ol>
  *   <li>合法引用按首次出现顺序去重返回；</li>
- *   <li><b>所有</b>畸形引用形态都被拒绝 —— 包括与合法引用混在同一句话里的情况
- *       （FD-0012-R1：早期实现只匹配 {@code \[K(\d*)\]}，漏检了 {@code [K-1]}、{@code [K1a]}、
- *       {@code [K 2]}、{@code [k9]} 这类写法）；</li>
- *   <li>形式合法但本次没给出的编号仍然归类为未知引用。</li>
+ *   <li><b>所有</b>畸形引用形态都被拒绝 —— 包括与合法引用混在同一句话里的情况。
+ *       FD-0012-R1 关掉了「形态不匹配就被当普通文字忽略」的绕过；
+ *       FD-0012-R2 进一步关掉了「K 后第一个字符是字母就当作普通文本」的绕过
+ *       （{@code [Kx1]}、{@code [Ka-1]}、{@code [Known1]}、{@code [Kabc_1]}、
+ *       {@code [ K999]}、{@code [ K1 ]}、制表符前缀、未闭合 {@code [Kx1}）；</li>
+ *   <li>只有<b>完整的纯 ASCII 字母单词</b>（{@code [Known]}、{@code [KB]}、{@code [Kubernetes]}）
+ *       才是普通文本；形式合法但本次没给出的编号仍然归类为未知引用。</li>
  * </ol>
  */
 class GroundedCitationValidatorTest {
@@ -55,11 +58,32 @@ class GroundedCitationValidatorTest {
 
     @Test
     void treatsABracketedWordStartingWithKAsProseRatherThanACitation() {
-        // [Known] 里 K 后面是 ASCII 字母：不构成引用意图，按普通英文方括号词处理
+        // [Known] 整体由 ASCII 字母组成：不构成引用意图，按普通英文方括号词处理
         List<String> used = GroundedCitationValidator.requireValidCitations(
                 "[Known] 只是正文里的一个方括号词，真正的引用在这里 [K1]。", ALLOWED);
 
         assertThat(used).containsExactly("K1");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "[Known]", "[KB]", "[Kubernetes]", "[known]" })
+    void treatsOnlyCompleteAsciiLetterWordsAsPlainText(String word) {
+        assertThat(GroundedCitationValidator.requireValidCitations(
+                word + " 是普通词，真正的引用是 [K1]。", ALLOWED))
+                .as("word=%s", word)
+                .containsExactly("K1");
+    }
+
+    @Test
+    void aProseWordAloneIsStillAnAnswerWithoutAnyCitation() {
+        for (String answer : List.of("[Kubernetes] 是普通词。", "[KB] 也只是普通词。")) {
+            Throwable thrown = catchThrowable(
+                    () -> GroundedCitationValidator.requireValidCitations(answer, ALLOWED));
+
+            assertThat(thrown).as("answer=[%s]", answer).isInstanceOf(GroundedAnswerException.class);
+            assertThat(((GroundedAnswerException) thrown).failure())
+                    .isEqualTo(GroundedAnswerFailure.ANSWER_WITHOUT_CITATION);
+        }
     }
 
     @Test
@@ -76,7 +100,7 @@ class GroundedCitationValidatorTest {
                 .containsExactly("K1");
     }
 
-    // ---------- 畸形引用：逐个形态（FD-0012-R1）----------
+    // ---------- 畸形引用：逐个形态（FD-0012-R1 / R2）----------
 
     @ParameterizedTest
     @ValueSource(strings = {
@@ -90,7 +114,17 @@ class GroundedCitationValidatorTest {
             "[K1a]",        // 编号后有多余字符
             "[K1,K2]",      // 一次写两个编号
             "[k1]",         // 小写 k
-            "[K1"           // 未闭合
+            "[K1",          // 未闭合
+            // FD-0012-R2：K 后面第一个字符是字母时的绕过
+            "[Kx1]",        // 字母 x 后跟数字
+            "[Ka-1]",       // 字母 a 后跟 -1
+            "[Known1]",     // 纯字母单词后面多了数字
+            "[Kabc_1]",     // 字母后跟下划线数字
+            "[ K999]",      // 前导空白：strip 只用于判断意图，不用于修正
+            "[ K1 ]",       // 两侧空白
+            "[Kx1",         // 未闭合 + 字母绕过
+            "[\tK1]",       // 制表符后再写 K1
+            "[\nK1]"        // 换行后再写 K1
     })
     void rejectsEveryMalformedCitationShape(String malformed) {
         Throwable thrown = catchThrowable(
@@ -111,10 +145,19 @@ class GroundedCitationValidatorTest {
             "[K0]",
             "[K]",
             "[K1,K2]",
-            "[K1"
+            "[K1",
+            // FD-0012-R2：K 后第一个字符是字母的绕过，以及与合法 [K1] 混排
+            "[Kx1]",
+            "[Ka-1]",
+            "[Known1]",
+            "[Kabc_1]",
+            "[ K999]",
+            "[ K1 ]",
+            "[\tK1]",
+            "[Kx1"
     })
     void aMalformedCitationNextToAValidOneStillFailsTheWholeAnswer(String malformed) {
-        // 这正是 FD-0012 的验收缺口：合法引用与畸形引用混在一起时，整次答案仍然必须失败
+        // FD-0012 / FD-0012-R2 的验收缺口：合法引用与畸形引用混在一起时，整次答案仍然必须失败
         String answer = "合法 [K1]，伪造 " + malformed;
 
         Throwable thrown = catchThrowable(
@@ -124,6 +167,19 @@ class GroundedCitationValidatorTest {
         assertThat(((GroundedAnswerException) thrown).failure())
                 .as("畸形引用不得被当成普通文字忽略")
                 .isEqualTo(GroundedAnswerFailure.INVALID_CITATION_FORMAT);
+    }
+
+    @Test
+    void aProseWordContainingADigitIsNotProseButAMalformedCitation() {
+        // FD-0012-R2 的反例：早期实现只看 K 后的第一个字符，[Kx1] / [Known1] 被当成普通文本
+        assertThat(catchThrowable(() -> GroundedCitationValidator.requireValidCitations(
+                "正常结论 [K1]，伪造来源 [Kx1]", ALLOWED)))
+                .isInstanceOfSatisfying(GroundedAnswerException.class, thrown -> assertThat(thrown.failure())
+                        .isEqualTo(GroundedAnswerFailure.INVALID_CITATION_FORMAT));
+        assertThat(catchThrowable(() -> GroundedCitationValidator.requireValidCitations(
+                "正常结论 [K1]，伪造来源 [Ka-1]", ALLOWED)))
+                .isInstanceOfSatisfying(GroundedAnswerException.class, thrown -> assertThat(thrown.failure())
+                        .isEqualTo(GroundedAnswerFailure.INVALID_CITATION_FORMAT));
     }
 
     @Test

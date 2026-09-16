@@ -147,7 +147,8 @@ class KnowledgeAnswerResultTest {
 
         RetrieveKnowledgeQuery query = command.toRetrievalQuery();
 
-        assertThat(query.query()).as("不做 strip / NFC：规范化只有检索用例那一处实现")
+        assertThat(query.query())
+                .as("命令只透传原始值（不 strip / 不 NFC）：规范化由检索与问答共用的 KnowledgeQueryNormalizer 实现")
                 .isEqualTo("  VPN 无法连接  ");
         assertThat(query.topK()).isEqualTo(7);
         assertThat(query.minScore()).isEqualTo(0.5);

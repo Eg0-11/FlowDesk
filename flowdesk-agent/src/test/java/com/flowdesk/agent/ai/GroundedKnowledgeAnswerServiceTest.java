@@ -70,7 +70,7 @@ class GroundedKnowledgeAnswerServiceTest {
 
         assertThat(model.calls()).as("一轮问答只调用一次模型，不做内部重试").isEqualTo(1);
         assertThat(retrieval.queries())
-                .as("原始问题原样交给检索用例，合法性校验只有那一处实现")
+                .as("原始问题原样交给检索用例：合法性校验只有那一处实现，规范化由共用的 KnowledgeQueryNormalizer 负责")
                 .containsExactly(QUESTION);
     }
 
@@ -267,7 +267,16 @@ class GroundedKnowledgeAnswerServiceTest {
                 "合法 [K1]，伪造 [K1a]。",
                 "合法 [K1]，伪造 [K 2]。",
                 "合法 [K1]，伪造 [k9]。",
-                "合法 [K1]，伪造 [K1。")) {
+                "合法 [K1]，伪造 [K1。",
+                // FD-0012-R2：K 后第一个字符是字母的绕过
+                "正常结论 [K1]，伪造来源 [Kx1]",
+                "合法 [K1]，伪造 [Ka-1]。",
+                "合法 [K1]，伪造 [Known1]。",
+                "合法 [K1]，伪造 [Kabc_1]。",
+                "合法 [K1]，伪造 [ K999]。",
+                "合法 [K1]，伪造 [ K1 ]。",
+                "合法 [K1]，伪造 [\tK1]。",
+                "合法 [K1]，伪造 [Kx1。")) {
 
             KnowledgeAnswerUseCaseFixture fixture = new KnowledgeAnswerUseCaseFixture(
                     FakeRetrieval.withCitations(1), new FakeChatModel(answer));
@@ -288,16 +297,29 @@ class GroundedKnowledgeAnswerServiceTest {
     @Test
     void reportsTheInvalidCitationFormatFailureCategoryForAMixedAnswer() {
         // 合法引用在前、畸形引用在后：失败类别必须是「形式非法」，而不是被当成普通文字忽略
-        KnowledgeAnswerUseCaseFixture fixture = new KnowledgeAnswerUseCaseFixture(
-                FakeRetrieval.withCitations(1), new FakeChatModel("正常结论 [K1]，伪造来源 [K-1]"));
+        for (String answer : List.of(
+                "正常结论 [K1]，伪造来源 [K-1]",
+                "正常结论 [K1]，伪造来源 [Kx1]",
+                "正常结论 [K1]，伪造来源 [Ka-1]",
+                "正常结论 [K1]，伪造来源 [Known1]")) {
 
-        Throwable thrown = catchThrowable(
-                () -> fixture.answer(new KnowledgeAnswerCommand(QUESTION, null, null)));
+            KnowledgeAnswerUseCaseFixture fixture = new KnowledgeAnswerUseCaseFixture(
+                    FakeRetrieval.withCitations(1), new FakeChatModel(answer));
 
-        assertThat(thrown).isInstanceOf(AiProviderException.class);
-        assertThat(((AiProviderException) thrown).getCause())
-                .isInstanceOfSatisfying(GroundedAnswerException.class, cause -> assertThat(cause.failure())
-                        .isEqualTo(GroundedAnswerFailure.INVALID_CITATION_FORMAT));
+            Throwable thrown = catchThrowable(
+                    () -> fixture.answer(new KnowledgeAnswerCommand(QUESTION, null, null)));
+
+            assertThat(thrown).as("answer=[%s]", answer).isInstanceOf(AiProviderException.class);
+            AiProviderException providerError = (AiProviderException) thrown;
+            assertThat(providerError.requestId()).as("answer=[%s]", answer).isNotBlank();
+            assertThat(providerError)
+                    .as("answer=[%s]", answer)
+                    .hasMessage("上游 AI 服务调用失败");
+            assertThat(providerError.getCause())
+                    .isInstanceOfSatisfying(GroundedAnswerException.class, cause -> assertThat(cause.failure())
+                            .as("answer=[%s]", answer)
+                            .isEqualTo(GroundedAnswerFailure.INVALID_CITATION_FORMAT));
+        }
     }
 
     @Test
