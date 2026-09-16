@@ -312,7 +312,16 @@ class DashScopeKnowledgeRerankAdapterTest {
                 "http://rerank.example.com/compatible-api/v1/reranks",
                 "http://10.0.0.1:8080/reranks",
                 "http://192.168.1.10/reranks",
-                "http://[2001:db8::1]/reranks" }) {
+                "http://[2001:db8::1]/reranks",
+                // FD-0013-R2：前缀像回环、实际不是完整 IPv4 字面量的写法
+                "http://127.example.com/reranks",
+                "http://127.0.0.1.attacker.example/reranks",
+                "http://127.999.999.999/reranks",
+                "http://127.5/reranks",
+                "http://0127.0.0.1/reranks",
+                "http://2130706433/reranks",
+                "http://127..0.1/reranks",
+                "http://[::ffff:127.0.0.1]/reranks" }) {
 
             Throwable thrown = catchThrowable(() -> new DashScopeKnowledgeRerankAdapter(
                     URI.create(endpoint), KnowledgeRerankProperties.SUPPORTED_MODEL, API_KEY,
@@ -334,13 +343,17 @@ class DashScopeKnowledgeRerankAdapterTest {
                 "https://rerank.example.com/compatible-api/v1/reranks",
                 "https://127.0.0.1/reranks",
                 "http://127.0.0.1:8080/reranks",
+                "http://127.5.5.5/reranks",
+                "http://127.255.255.255/reranks",
                 "http://localhost:8080/reranks",
-                "http://[::1]:8080/reranks" }) {
+                "http://LOCALHOST:8080/reranks",
+                "http://[::1]:8080/reranks",
+                "http://[0:0:0:0:0:0:0:1]:8080/reranks" }) {
 
             assertThatCode(() -> new DashScopeKnowledgeRerankAdapter(URI.create(endpoint),
                     KnowledgeRerankProperties.SUPPORTED_MODEL, API_KEY, Duration.ofSeconds(2),
                     Duration.ofSeconds(2)))
-                    .as("endpoint=%s（HTTPS 或本机回环）必须被接受", endpoint)
+                    .as("endpoint=%s（HTTPS 或本机回环字面量）必须被接受", endpoint)
                     .doesNotThrowAnyException();
         }
     }

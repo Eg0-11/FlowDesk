@@ -88,6 +88,25 @@ class KnowledgeRerankConfigFailFastTests {
     }
 
     @Test
+    void aHostThatOnlyStartsWithTheLoopbackPrefixFailsFast() {
+        // FD-0013-R2：127.example.com 这类「前缀像回环」的写法不是回环，必须在启动期被拒绝
+        for (String hostile : new String[] {
+                "http://127.example.com/compatible-api/v1/reranks",
+                "http://127.0.0.1.attacker.example/compatible-api/v1/reranks",
+                "http://127.999.999.999/compatible-api/v1/reranks",
+                "http://127.5/compatible-api/v1/reranks" }) {
+
+            assertThatThrownBy(() -> builder().run(dashscopeArguments(
+                    "--flowdesk.knowledge.rerank.enabled=true",
+                    "--flowdesk.knowledge.rerank.endpoint=" + hostile,
+                    "--spring.ai.dashscope.api-key=test-fake-key-not-a-real-secret")))
+                    .as("endpoint=%s", hostile)
+                    .isInstanceOf(RuntimeException.class)
+                    .hasMessageNotContaining(hostile);
+        }
+    }
+
+    @Test
     void aLoopbackHttpEndpointStillStarts() {
         // 本地合成端点必须仍然可用：明文 HTTP 只对本机回环放行
         try (ConfigurableApplicationContext context = builder().run(dashscopeArguments(

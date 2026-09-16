@@ -115,21 +115,66 @@ class KnowledgeRerankPropertiesTest {
     }
 
     @Test
+    void aHostThatOnlyStartsWithTheLoopbackPrefixIsNotLoopback() {
+        // FD-0013-R2 的反例：早期实现用 startsWith("127.") 判断回环，
+        // 于是这些「前缀是回环、实际由别处解析」的写法都被当成本机端点
+        for (String hostile : new String[] {
+                "http://127.example.com/reranks",
+                "http://127.0.0.1.attacker.example/reranks",
+                "http://127.999.999.999/reranks",
+                "http://127.5/reranks" }) {
+
+            KnowledgeRerankProperties properties = enabled();
+            properties.setEndpoint(hostile);
+
+            assertThatThrownBy(properties::validate)
+                    .as("endpoint=[%s] 必须在启动期被拒绝", hostile)
+                    .isInstanceOf(IllegalStateException.class);
+            assertThatThrownBy(properties::validate)
+                    .as("错误信息不得回显 Endpoint 原值")
+                    .hasMessageNotContaining(hostile);
+        }
+    }
+
+    @Test
+    void hostNamesAndMalformedIpv4AcceptTheHttpsMessage() {
+        // 主机名能被 java.net.URI 解析出来的那些写法，走的是「必须 HTTPS」这条判断
+        for (String remote : new String[] {
+                "http://rerank.example.com/reranks",
+                "http://127.example.com/reranks",
+                "http://127.0.0.1.attacker.example/reranks",
+                "http://0127.0.0.1/reranks",
+                "http://2130706433/reranks" }) {
+
+            KnowledgeRerankProperties properties = enabled();
+            properties.setEndpoint(remote);
+
+            assertThatThrownBy(properties::validate)
+                    .as("endpoint=[%s]", remote)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("HTTPS")
+                    .hasMessageNotContaining(remote);
+        }
+    }
+
+    @Test
     void httpsAndLoopbackHttpEndpointsAreAccepted() {
         for (String allowed : new String[] {
                 "https://rerank.example.com/compatible-api/v1/reranks",
                 "https://127.0.0.1/reranks",
                 "http://127.0.0.1:8080/reranks",
                 "http://127.5.5.5/reranks",
+                "http://127.255.255.255/reranks",
                 "http://localhost:8080/reranks",
                 "http://LOCALHOST/reranks",
-                "http://[::1]:8080/reranks" }) {
+                "http://[::1]:8080/reranks",
+                "http://[0:0:0:0:0:0:0:1]:8080/reranks" }) {
 
             KnowledgeRerankProperties properties = enabled();
             properties.setEndpoint(allowed);
 
             assertThatCode(properties::validate)
-                    .as("endpoint=[%s]（HTTPS 或本机回环）必须被接受", allowed)
+                    .as("endpoint=[%s]（HTTPS 或本机回环字面量）必须被接受", allowed)
                     .doesNotThrowAnyException();
         }
     }
