@@ -242,19 +242,81 @@ Spring AI 1.1.2 里 `spring.ai.mcp.server.capabilities` 的 `resource` / `prompt
 `ServerCapabilities` 的逐项取值，以及容器里没有注册任何
 resource / resource-template / prompt / completion 处理器。
 
-## 修订后仍然存在的框架边界（如实记录，未修复）
+## 修订（FD-0014-R1）后记录的两条边界（**已由 FD-0014-R2 修复**）
+
+下面两条在 FD-0014-R1 时只做了记录，R2 已在**我们自己的传输入口**上收口（见本文最后一节）：
 
 1. **调用未实现的方法会留下一条永不结束的响应流。** 实测：`tools/list`、`tools/call`
    （含工具返回 `isError=true`）的 POST 应答在 200 ms 内 EOF；而 `resources/list`、`prompts/list`
    这类未实现的方法，SDK 只把 `-32601 Method not found` 写进流里却**不结束它**
    （3 秒后仍无 EOF，会话被 `DELETE` 之后依然如此），服务端因此一直挂着一个活跃请求 ——
-   这是排查 30 秒强杀时发现的第二条链路。本服务不声明这些能力，规范客户端不会调用它们；
-   测试套件也刻意**不**通过 HTTP 调用未实现的方法（改在容器层断言没有注册处理器）。
-   彻底消除需要改传输层的错误应答语义，属于后续阶段。
+   这是排查 30 秒强杀时发现的第二条链路。
 2. **畸形 JSON-RPC 报文的 400 响应体会带服务端堆栈。** 传输层把 `McpError`
    （一个 `RuntimeException`）直接当作响应体返回，Jackson 按 `Throwable` 序列化，于是响应里
-   含固定文案 `Invalid message format`，同时含服务端堆栈（SDK 与我们自己的类名、行号）。
-   `asset_get` 自身的响应不受影响（四种固定形状、无内部细节）。该边界由
-   `AssetMcpProtocolTests.aMalformedJsonRpcEnvelopeIsRejectedWithoutEchoingTheInput`
-   显式钉住（断言 400、不回显输入、且确实含 `stackTrace` 字段），以免 SDK 升级后行为变化而无人察觉。
-   修复它同样属于传输层改造，本阶段不做。
+   含服务端堆栈（SDK 与我们自己的类名、行号），部分路径甚至转发原始异常消息。
+
+## 修订（FD-0014-R2）：收口传输层错误与悬挂响应流
+
+### 最小复现（基线 `e994418`，真实 HTTP + 真实流读取）
+
+用原始 HTTP 客户端逐个发请求，并在 1.2 秒窗口内观察响应流是否 EOF：
+
+| 请求 | 状态 | 响应流 | 泄漏 |
+| --- | --- | --- | --- |
+| `ping` / `tools/list` / `tools/call`（合法）/ `logging/setLevel` | 200 SSE | **EOF 立即到达** | 无 |
+| `resources/list` / `prompts/list` / `completion/complete` / `foo/bar` | 200 SSE | **永不结束**（会话 DELETE 之后依旧） | 无 |
+| 非对象 `arguments`（字符串、数组） | **500**，体为空，`Content-Type: text/event-stream` | EOF | 无 |
+| 畸形 JSON / 顶层数组 / 缺 `method` / 缺会话标识 | 400 JSON | EOF | **`stackTrace` + 类名 + 文件名 + 行号** |
+| 未知通知 | 202 | EOF | 无 |
+
+后果是实测的：四条「永不结束」的流让服务端一直持有活跃请求，Tomcat 优雅关停等满 30 秒，
+测试 JVM 在 `System.exit(0)` 之后被 Surefire 强杀（`Surefire is going to kill self fork JVM`）。
+
+### 决策
+
+1. **入口闸门 `McpRequestGateFilter`**（只作用于 `POST /mcp`，顺序在 Origin 过滤器之后）：
+   在请求进入 SDK 传输实现之前解析报文，用固定 JSON-RPC 错误回答三类请求，其余**原样放行**
+   （请求体经包装器完整重放，传输层读到的原文一字不差）。规则：
+
+   | 请求 | 回答 | 状态码 |
+   | --- | --- | --- |
+   | 不是合法 JSON（含两段拼接） | `-32700 Parse error` | 400 |
+   | 合法 JSON 但不是 JSON-RPC 请求对象（数组、裸值、缺 `jsonrpc`/`method`） | `-32600 Invalid request` | 400 |
+   | 带 `id` 且方法不在实现清单（`initialize`、`ping`、`tools/list`、`tools/call`、`logging/setLevel`） | `-32601 Method not found[: 方法名]` | **200，普通 JSON** |
+   | `tools/call` 的 `params`/`name`/`arguments` 形状不合法 | `-32602 Invalid params…` | **200，普通 JSON** |
+   | 请求体超过 1 MiB | `-32600 Request body too large` | 413 |
+   | 通知（没有 `id` 成员，含 `notifications/initialized`） | **原样放行** —— 握手语义不能被闸门吞掉 | 传输层决定 |
+   | 其余（含合法工具调用、非对象之外的参数） | **原样放行** | 传输层决定 |
+
+   方法名只在形状受限（`[A-Za-z0-9_./-]{1,64}`）时才回显，避免把任意客户端字符串写回响应。
+
+2. **`McpErrorJsonSerializer`**（Jackson 定制器，兜底）：SDK 仍会在若干路径上把 `McpError`
+   （`RuntimeException`）直接作为响应体返回（缺会话标识、Accept 头不合法、SDK 内部异常等）。
+   该序列化器把这类响应体固定成 `{"code":…,"message":…}`：错误码沿用 SDK 的 JSON-RPC 码
+   （没有就给 `-32600`），**文案只取固定枚举，从不转发 SDK 或异常自己的消息**。
+   细节留在服务端日志。
+
+**错误响应没有被丢弃，也没有被统一成一种**：闸门给出的是标准 JSON-RPC 错误码
+（-32700/-32600/-32601/-32602），工具层错误仍是 `isError=true` + 固定内容 + 200 的 SSE，
+框架错误仍是它原本的状态码（400/404/413）—— 只是不再夹带任何内部信息，且不再有永不结束的流。
+
+### 为什么不在依赖里修（备选方案与影响）
+
+| 方案 | 结论 |
+| --- | --- |
+| 升级 Spring AI / MCP SDK | **不做**：任务明确禁止升级依赖；且新版本是否修好流结束与 Throwable 序列化未经核实，升级会同时改动协议行为 |
+| 用同名类覆盖 SDK 的 `WebMvcStreamableServerTransportProvider` | **不做**：需要劫持包名，依赖升级时会静默失效，属于比缺陷本身更危险的做法 |
+| 自己实现 `McpStreamableServerTransportProvider` | **不做**：等于重写传输层（会话、SSE、断线续传），风险远超收益 |
+| 在入口闸门 + 序列化器收口（**采用**） | 只碰我们自己的代码，依赖保持不变；三类已知缺陷有测试钉住；SDK 内部缺陷仍会在升级时被重新评估 |
+
+### 影响与残留边界
+
+- 新增的每请求开销是「读一次 ≤1 MiB 的请求体 + 一次 JSON 解析」，只作用于 `POST /mcp`；
+- `GET /mcp`（服务端事件流）与 `DELETE /mcp` 不经闸门，行为与 FD-0014-R1 一致：
+  GET 的流按协议在会话结束时结束，会话清理依赖客户端 `DELETE`（R1 已允许）；
+- **SDK 内部的缺陷仍然存在**（未结束的流、Throwable 序列化、`ex.getMessage()` 直传）。
+  我们只是让它们**到不了客户端**；一旦升级 MCP SDK，应当先重跑
+  `AssetMcpTransportErrorTests`，确认这些补偿是否可以撤掉，而不是无条件保留；
+- 未实现方法的「客户端侧」防线还有一层：规范客户端在服务端未声明该能力时**根本不会发请求**
+  （实测 SDK 客户端抛 `IllegalStateException: Server does not provide the resources capability`）。
+  闸门面向的是不走客户端库、或故意构造请求的调用方。

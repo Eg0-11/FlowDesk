@@ -1,24 +1,25 @@
 package com.flowdesk.mcp.asset;
 
+import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * 直接发原始 JSON-RPC / HTTP 报文的测试客户端（FD-0014-R1）。
+ * 直接发原始 JSON-RPC / HTTP 报文的测试客户端（FD-0014-R1 / FD-0014-R2）。
  *
- * <p>SDK 客户端（{@link AssetMcpTestClient}）隐藏了会话标识与 HTTP 方法，
- * 而 FD-0014-R1 要验收的正是这两件事：</p>
- * <ul>
- *   <li>{@code initialize} 响应里的 {@code capabilities} 到底声明了什么（原始 JSON）；</li>
- *   <li>客户端能否用 {@code DELETE} 结束自己的 MCP 会话，以及会话结束后是不是真的查不到了。</li>
- * </ul>
+ * <p>SDK 客户端（{@link AssetMcpTestClient}）隐藏了会话标识、HTTP 方法、状态码与原始报文，
+ * 而这里要验收的恰恰是这些：会话标识、{@code DELETE}、以及「错误响应到底长什么样」。</p>
  *
- * <p>这里只用 JDK 的 {@link HttpClient}，不引入任何测试专用框架，
- * 断言的是服务端真实的 HTTP 状态码、响应头与 JSON 报文。</p>
+ * <p>{@link #postBounded} 是本类存在的另一个理由：MCP 的请求应答可能是
+ * {@code text/event-stream}，而「流有没有结束」不能靠请求超时判断（超时只管到响应头），
+ * 必须真的去读并观察 EOF。因此它用一个有界的读取窗口来判断，
+ * 读不到 EOF 就如实报告 —— 这正是 FD-0014-R2 要钉住的行为。</p>
  */
 final class AssetMcpRawClient {
 
@@ -72,15 +73,57 @@ final class AssetMcpRawClient {
      * @throws Exception 请求失败
      */
     RawResponse post(String body, String sessionId) throws Exception {
-        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(this.endpoint))
-                .timeout(REQUEST_TIMEOUT)
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json, text/event-stream")
-                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8));
-        if (sessionId != null) {
-            builder.header(SESSION_HEADER, sessionId);
+        return send(request(body, sessionId).build());
+    }
+
+    /**
+     * 发一个 POST，并在有界窗口内观察响应流是否结束。
+     *
+     * @param body      JSON-RPC 报文
+     * @param sessionId 会话标识；{@code null} 表示不带该头
+     * @param window    观察 EOF 的时间窗口
+     * @return 响应（含 EOF 判断）
+     * @throws Exception 请求失败
+     */
+    BoundedResponse postBounded(String body, String sessionId, Duration window) throws Exception {
+        HttpResponse<InputStream> response =
+                this.httpClient.send(request(body, sessionId).build(), HttpResponse.BodyHandlers.ofInputStream());
+
+        InputStream stream = response.body();
+        StringBuilder received = new StringBuilder();
+        AtomicReference<String> failure = new AtomicReference<>();
+        AtomicBoolean ended = new AtomicBoolean(false);
+
+        Thread reader = new Thread(() -> {
+            try (stream) {
+                byte[] buffer = new byte[4096];
+                int read;
+                while ((read = stream.read(buffer)) != -1) {
+                    synchronized (received) {
+                        received.append(new String(buffer, 0, read, StandardCharsets.UTF_8));
+                    }
+                }
+                ended.set(true);
+            }
+            catch (Exception ex) {
+                failure.set(ex.getClass().getName());
+            }
+        });
+        reader.setDaemon(true);
+        reader.start();
+
+        long deadline = System.nanoTime() + window.toNanos();
+        while (System.nanoTime() < deadline && !ended.get()) {
+            Thread.sleep(10);
         }
-        return send(builder.build());
+
+        String text;
+        synchronized (received) {
+            text = received.toString();
+        }
+        return new BoundedResponse(response.statusCode(),
+                response.headers().firstValue("Content-Type").orElse(null),
+                text, ended.get(), failure.get());
     }
 
     /**
@@ -105,6 +148,18 @@ final class AssetMcpRawClient {
         return post(INITIALIZE_BODY);
     }
 
+    private HttpRequest.Builder request(String body, String sessionId) {
+        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(this.endpoint))
+                .timeout(REQUEST_TIMEOUT)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8));
+        if (sessionId != null) {
+            builder.header(SESSION_HEADER, sessionId);
+        }
+        return builder;
+    }
+
     private RawResponse send(HttpRequest request) throws Exception {
         HttpResponse<String> response = this.httpClient.send(request, HttpResponse.BodyHandlers.ofString());
         return new RawResponse(response.statusCode(), response.body(),
@@ -119,5 +174,17 @@ final class AssetMcpRawClient {
      * @param sessionId 响应头里的会话标识；没有则为 {@code null}
      */
     record RawResponse(int status, String body, String sessionId) {
+    }
+
+    /**
+     * 带 EOF 判断的原始响应。
+     *
+     * @param status      HTTP 状态码
+     * @param contentType 响应内容类型
+     * @param body        在观察窗口内读到的内容
+     * @param ended       响应流是否在窗口内结束（EOF）
+     * @param readFailure 读取失败时的异常类名；没有则为 {@code null}
+     */
+    record BoundedResponse(int status, String contentType, String body, boolean ended, String readFailure) {
     }
 }

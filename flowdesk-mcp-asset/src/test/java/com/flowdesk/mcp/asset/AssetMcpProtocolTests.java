@@ -7,6 +7,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.modelcontextprotocol.client.McpSyncClient;
 import io.modelcontextprotocol.spec.McpSchema;
 import java.util.List;
@@ -31,6 +32,8 @@ import org.springframework.boot.test.web.server.LocalServerPort;
         "flowdesk.asset.directory.mode=demo"
 })
 class AssetMcpProtocolTests {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     @LocalServerPort
     private int port;
@@ -230,25 +233,29 @@ class AssetMcpProtocolTests {
         AssetMcpRawClient raw = new AssetMcpRawClient(this.port);
         String sessionId = raw.initialize().sessionId();
 
-        // arguments 不是 JSON 对象（这里是字符串）：SDK 在把入参反序列化成 Map 时就失败了，
-        // 因此工具根本不会被调用。实测状态码是 500（SDK 抛 IllegalArgumentException，未走
-        // 它自己的 400 分支），响应体为空 —— 既没有资产数据，也没有堆栈。
+        // arguments 不是 JSON 对象（这里是字符串）：闸门在用 200 + -32602 明确拒绝，
+        // 工具与资产目录都不会被调用（详细断言见 AssetMcpTransportErrorTests）
         AssetMcpRawClient.RawResponse response = raw.post("""
                 {"jsonrpc":"2.0","id":2,"method":"tools/call",\
                 "params":{"name":"asset_get","arguments":"AST-900001"}}""", sessionId);
 
         assertThat(response.status())
-                .as("非对象入参必须被拒绝（不是一次成功的工具调用）")
-                .isNotEqualTo(200);
+                .as("协议级输入错误用 200 + JSON-RPC 错误表达，不再是 500 空响应")
+                .isEqualTo(200);
         assertThat(response.body())
-                .as("拒绝响应不得回显取值、不得返回资产数据、不得夹带堆栈")
+                .as("拒绝响应不得回显取值、不得返回资产数据、不得夹带内部信息")
                 .doesNotContain("SERVER")
                 .doesNotContain("IN_SERVICE")
                 .doesNotContain("DEMO")
                 .doesNotContain("AST-900001")
                 .doesNotContain("stackTrace")
-                .doesNotContain("at io.modelcontextprotocol")
-                .doesNotContain("at com.flowdesk");
+                .doesNotContain("io.modelcontextprotocol")
+                .doesNotContain("com.flowdesk")
+                .contains("-32602");
+
+        assertThat(MAPPER.readTree(response.body()).path("error").path("message").asText())
+                .as("错误必须可解析且稳定")
+                .isEqualTo("Invalid params: arguments must be a JSON object");
     }
 
     @Test
@@ -261,17 +268,28 @@ class AssetMcpProtocolTests {
 
         assertThat(response.status()).as("畸形报文必须被拒绝").isEqualTo(400);
         assertThat(response.body())
-                .as("拒绝体不得回显输入（Jackson 的源码位置是被 REDACTED 的）")
+                .as("拒绝体不得回显输入")
                 .doesNotContain("AST-900001");
 
-        // 已知的框架边界，已写入 ADR 0011 与 README 第二十一章，并在这里显式钉住：
-        // MCP SDK 0.17.0 直接把这个 McpError（一个 RuntimeException）当作 400 响应体返回，
-        // Jackson 于是按 Throwable 序列化，响应里会带服务端堆栈（含 SDK 与我们自己的类名）。
-        // 这是传输层错误响应的渲染方式，不是 asset_get 的工具输出；本阶段不修改它的语义，
-        // 但一旦 SDK 升级后行为变化，这两条断言会立刻提醒我们去更新文档。
+        // FD-0014-R2：错误响应必须是固定、可解析、不含任何内部信息的 JSON-RPC 错误。
+        // 这里做的是**负向泄漏断言**：SDK 曾经把 McpError（RuntimeException）直接当响应体，
+        // Jackson 按 Throwable 序列化，于是带出 stackTrace、类名、文件名与行号。
         assertThat(response.body())
-                .as("框架固定文案在，且这点是公开记录的边界")
-                .contains("Invalid message format")
-                .contains("stackTrace");
+                .as("不得出现堆栈、异常类名、内部路径或原始异常消息")
+                .doesNotContain("stackTrace")
+                .doesNotContain("cause")
+                .doesNotContain("lineNumber")
+                .doesNotContain("nativeMethod")
+                .doesNotContain("Exception")
+                .doesNotContain("java.")
+                .doesNotContain("io.modelcontextprotocol")
+                .doesNotContain("org.springframework")
+                .doesNotContain("com.flowdesk")
+                .doesNotContain(".java")
+                .doesNotContain("Invalid message format");
+
+        assertThat(MAPPER.readTree(response.body()).path("error").path("code").asInt())
+                .as("固定错误码：解析失败")
+                .isEqualTo(-32700);
     }
 }

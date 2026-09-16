@@ -4,7 +4,10 @@ import com.flowdesk.mcp.asset.directory.AssetDirectory;
 import com.flowdesk.mcp.asset.directory.DemoAssetDirectory;
 import com.flowdesk.mcp.asset.directory.UnavailableAssetDirectory;
 import com.flowdesk.mcp.asset.tool.AssetGetTool;
+import com.flowdesk.mcp.asset.transport.McpErrorJsonSerializer;
+import com.flowdesk.mcp.asset.transport.McpRequestGateFilter;
 import org.springframework.ai.tool.ToolCallback;
+import org.springframework.boot.autoconfigure.jackson.Jackson2ObjectMapperBuilderCustomizer;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
@@ -102,5 +105,41 @@ public class AssetMcpConfiguration {
         registration.setName("mcpOriginRejectionFilter");
         registration.setOrder(0);
         return registration;
+    }
+
+    /**
+     * 给 MCP 端点挂上传输层入口闸门（FD-0014-R2）。
+     *
+     * <p>顺序在 Origin 过滤器之后：带 {@code Origin} 的浏览器请求先被 403 挡掉，
+     * 闸门只处理「已经到了 MCP 端点门口」的请求。</p>
+     *
+     * @param mcpEndpoint MCP 端点路径
+     * @return 过滤器注册
+     */
+    @Bean
+    public FilterRegistrationBean<McpRequestGateFilter> mcpRequestGateFilter(
+            @org.springframework.beans.factory.annotation.Value("${spring.ai.mcp.server.streamable-http.mcp-endpoint:/mcp}")
+            String mcpEndpoint) {
+
+        FilterRegistrationBean<McpRequestGateFilter> registration =
+                new FilterRegistrationBean<>(new McpRequestGateFilter());
+        registration.addUrlPatterns(mcpEndpoint);
+        registration.setName("mcpRequestGateFilter");
+        registration.setOrder(1);
+        return registration;
+    }
+
+    /**
+     * 兜底：让 MCP SDK 的 {@link io.modelcontextprotocol.spec.McpError} 不再按 {@code Throwable} 序列化。
+     *
+     * <p>SDK 0.17.0 在多条错误路径上把 {@code McpError}（继承 {@code RuntimeException}）直接
+     * 当作响应体返回，Jackson 会把堆栈、类名与行号一并写出去。闸门能提前拦下的请求已经不走到这里，
+     * 这一条覆盖剩下的路径（缺会话标识、Accept 头不合法、SDK 内部异常等）。</p>
+     *
+     * @return 定制器
+     */
+    @Bean
+    public Jackson2ObjectMapperBuilderCustomizer mcpErrorSerializationCustomizer() {
+        return builder -> builder.modulesToInstall(McpErrorJsonSerializer.module());
     }
 }
