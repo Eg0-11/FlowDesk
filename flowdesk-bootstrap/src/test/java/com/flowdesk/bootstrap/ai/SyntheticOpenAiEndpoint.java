@@ -28,7 +28,10 @@ final class SyntheticOpenAiEndpoint {
         TOOL_CALL_THEN_ANSWER,
 
         /** 无论是否携带工具都直接返回文本 —— 模拟“模型跳过工具”。 */
-        ANSWER_ONLY
+        ANSWER_ONLY,
+
+        /** 无论请求内容如何，都返回测试指定的固定文本（RAG 5/6 问答链路使用）。 */
+        STATIC_ANSWER
     }
 
     static final String PLAIN_ANSWER = "FlowDesk 是一个把企业工单流转与知识运营打通并引入大模型能力的平台。";
@@ -41,10 +44,15 @@ final class SyntheticOpenAiEndpoint {
 
     private final List<CapturedRequest> requests = Collections.synchronizedList(new ArrayList<>());
 
-    private final Behaviour behaviour;
+    // 行为与静态答案可变更：端点实例在整份测试类之间共享（端口必须在上下文创建前确定），
+    // 而不同用例需要模型给出不同回答（合法引用 / 非法引用 / 空答案）。
+    private volatile Behaviour behaviour;
 
-    private SyntheticOpenAiEndpoint(Behaviour behaviour) throws IOException {
+    private volatile String staticAnswer;
+
+    private SyntheticOpenAiEndpoint(Behaviour behaviour, String staticAnswer) throws IOException {
         this.behaviour = behaviour;
+        this.staticAnswer = staticAnswer;
         this.server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         this.server.createContext("/chat/completions", this::handle);
         this.server.start();
@@ -54,7 +62,34 @@ final class SyntheticOpenAiEndpoint {
      * 启动一个端点实例。
      */
     static SyntheticOpenAiEndpoint start(Behaviour behaviour) throws IOException {
-        return new SyntheticOpenAiEndpoint(behaviour);
+        return new SyntheticOpenAiEndpoint(behaviour, null);
+    }
+
+    /**
+     * 启动一个「总是返回指定文本」的端点实例（RAG 5/6 问答链路测试）。
+     *
+     * <p>文本中的引号、换行等字符会被正确转义，因此可以直接用来构造
+     * 「合法引用」「非法引用」「空答案」等模型输出场景。</p>
+     *
+     * @param answer 模型回答原文
+     * @return 端点实例
+     * @throws IOException 端口绑定失败
+     */
+    static SyntheticOpenAiEndpoint startWithAnswer(String answer) throws IOException {
+        return new SyntheticOpenAiEndpoint(Behaviour.STATIC_ANSWER, answer);
+    }
+
+    /**
+     * 让端点从下一次请求起改为「总是返回指定文本」（RAG 5/6 问答链路测试）。
+     *
+     * <p>端点实例在整份测试类之间共享（它必须在 Spring 上下文创建之前就占用端口），
+     * 因此需要按用例切换模型回答：合法引用、非法引用、空答案等。</p>
+     *
+     * @param answer 模型回答原文
+     */
+    void willAnswer(String answer) {
+        this.staticAnswer = answer;
+        this.behaviour = Behaviour.STATIC_ANSWER;
     }
 
     /**
@@ -94,6 +129,9 @@ final class SyntheticOpenAiEndpoint {
     }
 
     private String renderResponse(String body) {
+        if (this.behaviour == Behaviour.STATIC_ANSWER) {
+            return envelope("chatcmpl-stub-static", this.staticAnswer, "stop", null);
+        }
         if (this.behaviour == Behaviour.ANSWER_ONLY) {
             return envelope("chatcmpl-stub-plain", PLAIN_ANSWER, "stop", null);
         }
@@ -110,6 +148,7 @@ final class SyntheticOpenAiEndpoint {
     }
 
     private static String envelope(String id, String content, String finishReason, String extraMessageFields) {
+        // content 统一走 JSON 转义：回答里出现引号、换行或反斜杠时，报文仍然是合法 JSON
         return """
                 {
                   "id": "%s",
@@ -118,12 +157,26 @@ final class SyntheticOpenAiEndpoint {
                   "model": "deepseek-flash",
                   "choices": [{
                     "index": 0,
-                    "message": {"role": "assistant", "content": "%s"%s},
+                    "message": {"role": "assistant", "content": %s%s},
                     "finish_reason": "%s"
                   }],
                   "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}
                 }
-                """.formatted(id, content, extraMessageFields == null ? "" : ", " + extraMessageFields, finishReason);
+                """.formatted(id, jsonString(content), extraMessageFields == null ? "" : ", " + extraMessageFields,
+                finishReason);
+    }
+
+    /**
+     * @param value 任意文本
+     * @return 已加引号并转义的 JSON 字符串字面量
+     */
+    private static String jsonString(String value) {
+        try {
+            return MAPPER.writeValueAsString(value == null ? "" : value);
+        }
+        catch (com.fasterxml.jackson.core.JsonProcessingException ex) {
+            throw new IllegalStateException("无法序列化模型回答", ex);
+        }
     }
 
     /**

@@ -1,5 +1,6 @@
 package com.flowdesk.agent.ai;
 
+import com.flowdesk.application.knowledge.port.in.RetrieveKnowledgeUseCase;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -37,5 +38,26 @@ public class FlowDeskAiConfiguration {
             @Qualifier("deepSeekChatClient") ChatClient deepSeekChatClient,
             SupportPolicyTools supportPolicyTools) {
         return new ChatClientAiService(deepSeekChatClient, supportPolicyTools);
+    }
+
+    /**
+     * 基于检索证据的知识库问答实现（RAG 5/6）。
+     *
+     * <p>依赖两件事：检索用例（输入的规范化与校验唯一入口，也是「无证据不调用模型」的判断依据）
+     * 与命名明确的 {@code deepSeekChatClient}。本 Bean 只在 {@code flowdesk.ai.enabled=true}
+     * 时存在，因此默认 profile 下不会有任何问答能力，也不会有出网可能。</p>
+     *
+     * <p>注意：<b>Chat 走 DeepSeek，Embedding 走 DashScope</b>，两者职责不混用 ——
+     * 本实现不接触任何 Embedding 适配器，查询向量由检索用例在 knowledge 链路内完成。</p>
+     *
+     * @param retrieveKnowledgeUseCase 检索用例（含输入校验与 503 开关判断）
+     * @param deepSeekChatClient       DeepSeek 对话客户端
+     * @return 知识库问答用例实现
+     */
+    @Bean
+    public GroundedKnowledgeAnswerService groundedKnowledgeAnswerService(
+            RetrieveKnowledgeUseCase retrieveKnowledgeUseCase,
+            @Qualifier("deepSeekChatClient") ChatClient deepSeekChatClient) {
+        return new GroundedKnowledgeAnswerService(retrieveKnowledgeUseCase, deepSeekChatClient);
     }
 }

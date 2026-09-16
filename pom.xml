@@ -18,7 +18,7 @@
   <packaging>pom</packaging>
 
   <name>flowdesk</name>
-  <description>FlowDesk 企业智能工单与知识运营平台（当前阶段：已完成知识切片 Embedding 与 PostgreSQL pgvector 原子存储，RAG 3/6）</description>
+  <description>FlowDesk 企业智能工单与知识运营平台（当前阶段：已完成基于检索证据的 DeepSeek 可审计回答 —— 无证据不调用模型、答案引用必须来自本次检索，RAG 5/6）</description>
 
   <modules>
     <module>flowdesk-shared</module>
