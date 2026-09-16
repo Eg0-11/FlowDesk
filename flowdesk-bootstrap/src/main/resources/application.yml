@@ -128,6 +128,9 @@ flowdesk:
       #
       # 语义边界：只重排本次 topK 候选，不扩大初召回池，因此不可能找回向量检索未召回的切片；
       # 重排失败**不会**静默退回向量排序（那是另一条 502 或 500）。
+      #
+      # 传输要求（FD-0013-R1）：Endpoint 必须是 https —— Bearer Key 会随请求头发送，
+      # 明文 HTTP 只允许本机回环地址（127.0.0.1 / localhost / ::1），供自动化测试的本地合成端点使用。
       enabled: false
       model: qwen3-rerank
       # 示例（请替换 <workspace-id> 与地域；仓库中不保存任何真实业务空间 ID）：

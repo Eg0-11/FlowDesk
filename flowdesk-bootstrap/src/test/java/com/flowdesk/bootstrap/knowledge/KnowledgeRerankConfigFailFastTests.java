@@ -77,6 +77,31 @@ class KnowledgeRerankConfigFailFastTests {
     }
 
     @Test
+    void aPlainHttpEndpointOutsideLoopbackFailsFast() {
+        // FD-0013-R1：Bearer Key 不得随明文 HTTP 离开本机
+        assertThatThrownBy(() -> builder().run(dashscopeArguments(
+                "--flowdesk.knowledge.rerank.enabled=true",
+                "--flowdesk.knowledge.rerank.endpoint=http://rerank.example.com/compatible-api/v1/reranks",
+                "--spring.ai.dashscope.api-key=test-fake-key-not-a-real-secret")))
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("HTTPS");
+    }
+
+    @Test
+    void aLoopbackHttpEndpointStillStarts() {
+        // 本地合成端点必须仍然可用：明文 HTTP 只对本机回环放行
+        try (ConfigurableApplicationContext context = builder().run(dashscopeArguments(
+                "--flowdesk.knowledge.rerank.enabled=true",
+                "--flowdesk.knowledge.rerank.endpoint=http://127.0.0.1:8080/compatible-api/v1/reranks",
+                "--spring.ai.dashscope.api-key=test-fake-key-not-a-real-secret"))) {
+
+            assertThat(context.getBean(
+                    com.flowdesk.application.knowledge.port.out.KnowledgeRerankPort.class))
+                    .isInstanceOf(DashScopeKnowledgeRerankAdapter.class);
+        }
+    }
+
+    @Test
     void anUnsupportedRerankModelFailsFast() {
         assertThatThrownBy(() -> builder().run(dashscopeArguments(
                 "--flowdesk.knowledge.rerank.enabled=true",

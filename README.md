@@ -1910,7 +1910,16 @@ curl.exe -s -X POST http://localhost:8080/api/v1/knowledge/search `
   重排只需要「问题 + 候选正文」；
 - **不发送** `top_n`（要给全部候选打分）、`instruct`、`return_documents`；
 - 结果按 **`index`** 绑定回候选，**不**按响应到达顺序猜位置；
-- 只接受顶层 `results`；嵌套 `output.results`（另一种协议）会被判为「无法解释的响应」而不是被兼容。
+- **`index` 必须是整数类型且能无损装进 Java `int`**（FD-0013-R1）：`0.9`、`1.8`、`1e0` 这类小数与指数形式，
+  字符串、布尔值，以及 `4294967296`、`-4294967296` 这类超出 `int` 范围的值**一律拒绝**；
+  绝不用 `intValue()` 截断或溢出 —— 那会把 `0.9` 变成 `0`、把 `2³²` 变成 `0`，
+  让「这条分数属于第 0 个候选」这种看起来合法、实际错位的绑定悄悄成立。字段缺失或为 `null` 时
+  仍按既有应用层契约拒绝（重排结果必须完整覆盖候选）；
+- 只接受顶层 `results`；嵌套 `output.results`（另一种协议）会被判为「无法解释的响应」而不是被兼容；
+- **Endpoint 必须是 HTTPS**（FD-0013-R1）：API Key 通过 `Authorization: Bearer` 发送，
+  明文 HTTP 会让它在链路上直接暴露；明文 HTTP **只允许本机回环地址**
+  （`127.0.0.1`、`localhost`、`::1`），供自动化测试使用本地合成端点。
+  这条边界由配置校验与适配器构造器**共同**执行，因此绕过 Spring 直接 `new` 出适配器也挡得住。
 
 ### 20.4 排序与分数语义
 
@@ -1930,6 +1939,7 @@ curl.exe -s -X POST http://localhost:8080/api/v1/knowledge/search `
 | 重排上游返回 429 / 5xx / 401 / 403 | 502 | `RERANK_PROVIDER_ERROR` | **不降级** |
 | 重排响应不是合法 JSON / 缺少顶层 `results` / 元素不是对象 / 类型不对 | 500 | `INTERNAL_SERVER_ERROR` | **不降级** |
 | `index` 缺失、负数、越界、重复、条数不全 | 500 | `INTERNAL_SERVER_ERROR` | **不降级** |
+| `index` 是小数、指数形式、字符串、布尔值，或超出 `int` 范围（FD-0013-R1） | 500 | `INTERNAL_SERVER_ERROR` | **不降级** |
 | `relevance_score` 为 `NaN`/`±Infinity`/超出 `0..1` | 500 | `INTERNAL_SERVER_ERROR` | **不降级** |
 | 重排端口抛出契约之外的错误码或运行期异常 | 500 | `INTERNAL_SERVER_ERROR` | **不降级** |
 | 命中 0 条 / 只有 1 条 | 200 | —（`rankingMode=VECTOR_SIMILARITY`） | 不调用重排 |
@@ -1956,6 +1966,7 @@ flowdesk:
 | 默认（H2，重排关闭） | 正常启动；**不需要 Endpoint、不需要 Key**；重排端口是「拒绝一切」的占位实现 |
 | `enabled=true` 但没有 `flowdesk.knowledge.embedding.enabled=true` | **启动失败**：重排只对向量检索的候选生效，该配置永远不生效 |
 | `enabled=true` 但 Endpoint 为空 / 非法 / 仍含 `{WorkspaceId}` 占位符 | **启动失败**（Endpoint 包含业务空间 ID，因此仓库里不提供默认值） |
+| `enabled=true` 但 Endpoint 是**非回环的明文 HTTP** | **启动失败**：Bearer Key 不得随明文离开本机（明文仅限 `127.0.0.1`/`localhost`/`::1`，供本地合成端点测试） |
 | `enabled=true` 但模型名不是逐字 `qwen3-rerank` | **启动失败**（只实现了这一种协议） |
 | `enabled=true` 但 DashScope Key 缺失/空/纯空白 | **启动失败**，信息只提配置名与环境变量名 |
 | `enabled=true` + 合法 Endpoint + Key | 装配 DashScope 适配器（装配本身不发任何请求） |
@@ -1964,6 +1975,13 @@ Key 复用向量化的凭证原则：`spring.ai.dashscope.rerank.api-key`（模�
 `spring.ai.dashscope.api-key`（通用，兜底，`dashscope-embedding` profile 绑定 `${DASHSCOPE_API_KEY:}`）；
 刻意不读 `AI_DASHSCOPE_API_KEY`。仓库中**不保存**任何真实 Key 或业务空间 ID；
 Endpoint 示例在配置注释里写作 `https://<workspace-id>.<region>.maas.aliyuncs.com/compatible-api/v1/reranks`。
+
+**Endpoint 的传输要求**：必须是 HTTPS。明文 HTTP 会让 `Authorization: Bearer <Key>` 在链路上直接暴露，
+因此只对本机回环地址（`127.0.0.0/8`、`localhost`、`::1`）放行 —— 那是自动化测试使用本地合成端点的唯一途径。
+判定只做字面匹配、**不**做 DNS 解析（校验阶段不得联网），
+并且在**配置校验与适配器构造器**两处执行，所以直接 `new DashScopeKnowledgeRerankAdapter(...)`
+同样绕不过去。失败信息只说明规则，不回显 Endpoint、Key 或任何请求内容。
+
 本阶段**不做**内部重试：一次检索只调用一次重排，失败即失败。
 
 ### 20.7 已知边界

@@ -51,9 +51,18 @@ import org.slf4j.LoggerFactory;
  *   <tr><td>响应不是合法 JSON、缺少 {@code results} 数组、元素不是对象、
  *       或 {@code index}/{@code relevance_score} 存在但不是数字</td>
  *       <td>{@code KNOWLEDGE_RETRIEVAL_FAILURE}</td><td>500</td></tr>
+ *   <tr><td>{@code index} 是小数、指数形式、字符串、布尔值，或超出 {@code int} 范围
+ *       （FD-0013-R1：不能用 {@code intValue()} 截断/溢出）</td>
+ *       <td>{@code KNOWLEDGE_RETRIEVAL_FAILURE}</td><td>500</td></tr>
  * </table>
  * <p>「字段缺失」（而不是类型不对）不在适配器里判定：适配器把缺失表示为 {@code null}，
  * 由应用层的重排结果契约统一拒绝 —— 契约只有一处实现，不因换适配器而漂移。</p>
+ *
+ * <h2>传输安全（FD-0013-R1）</h2>
+ * <p>API Key 通过 {@code Authorization: Bearer} 发送，因此 Endpoint 必须是 HTTPS；
+ * 明文 HTTP 只允许<b>本机回环地址</b>（{@code 127.0.0.1} / {@code localhost} / {@code ::1}），
+ * 供自动化测试使用本地合成端点。这条边界在构造器里就检查（见 {@link RerankEndpointPolicy}），
+ * 因此「直接 new 出适配器」也绕不过去。</p>
  *
  * <h2>不重试、不降级</h2>
  * <p>一次检索只发起一次请求；失败即失败，绝不返回「原向量排序」之类的降级结果
@@ -92,16 +101,20 @@ public final class DashScopeKnowledgeRerankAdapter implements KnowledgeRerankPor
     private final Duration readTimeout;
 
     /**
-     * @param endpoint       重排接口地址（不含业务空间占位符）
+     * @param endpoint       重排接口地址（不含业务空间占位符；必须是 HTTPS 或本机回环 HTTP）
      * @param model          重排模型标识（本版本要求逐字为 {@code qwen3-rerank}）
      * @param apiKey         DashScope API Key（只放进 Authorization 头，不写日志）
      * @param connectTimeout 连接超时
      * @param readTimeout    读取（响应）超时
+     * @throws IllegalStateException Endpoint 使用明文 HTTP 且不是本机回环地址
      */
     public DashScopeKnowledgeRerankAdapter(URI endpoint, String model, String apiKey,
             Duration connectTimeout, Duration readTimeout) {
 
         this.endpoint = Objects.requireNonNull(endpoint, "endpoint 不能为 null");
+        // FD-0013-R1：适配器自己也守这条边界 —— 直接构造（绕过 Spring 配置校验）同样不能把
+        // Bearer Key 发往明文 HTTP；判断逻辑与配置校验共用同一个策略类
+        RerankEndpointPolicy.requireSecureEndpoint(this.endpoint);
         this.model = Objects.requireNonNull(model, "model 不能为 null");
         this.apiKey = Objects.requireNonNull(apiKey, "apiKey 不能为 null");
         this.readTimeout = Objects.requireNonNull(readTimeout, "readTimeout 不能为 null");
@@ -219,6 +232,21 @@ public final class DashScopeKnowledgeRerankAdapter implements KnowledgeRerankPor
     }
 
     /**
+     * 读取单条结果的原始下标（FD-0013-R1 收紧）。
+     *
+     * <p>下标必须<b>是整数类型</b>且<b>能无损装进 Java {@code int}</b>：
+     * {@code 0.9}、{@code 1.8}、{@code 1e0}（解析为浮点节点）、
+     * {@code 4294967296}、{@code -4294967296}（超出 int 范围）、
+     * 以及字符串、布尔值一律拒绝。</p>
+     *
+     * <p>为什么不能用 {@code intValue()} 了事：它会把 {@code 0.9} 变成 {@code 0}、
+     * 把 {@code 4294967296} 溢出成 {@code 0} —— 于是「分数属于第 0 个候选」这种
+     * 看起来合法、实际错位的绑定就悄悄成立了。这里宁可整次失败，也不接受无法无损表达的
+     * 下标。</p>
+     *
+     * <p>字段缺失或为 {@code null} 时返回 {@code null}：那不是「默认 0」，
+     * 而是「上游没有给出归属」，由应用层的重排结果契约统一拒绝（契约只有一处实现）。</p>
+     *
      * @param node 单条结果
      * @return 原始下标；字段缺失时为 {@code null}
      */
@@ -227,7 +255,7 @@ public final class DashScopeKnowledgeRerankAdapter implements KnowledgeRerankPor
         if (index.isMissingNode() || index.isNull()) {
             return null;
         }
-        if (!index.isNumber()) {
+        if (!index.isIntegralNumber() || !index.canConvertToInt()) {
             throw invalidResponse(null);
         }
         return index.intValue();

@@ -22,11 +22,17 @@ import org.springframework.util.StringUtils;
  *
  * <h2>为什么 Endpoint 没有默认值</h2>
  * <p>DashScope 的文本重排接口地址形如
- * {@code https://{WorkspaceId}.<region>.maas.aliyuncs.com/...</b>}，其中 {@code {WorkspaceId}}
+ * {@code https://{WorkspaceId}.<region>.maas.aliyuncs.com/...}，其中 {@code {WorkspaceId}}
  * 是<b>每个账号自己的业务空间 ID</b>。把它硬编码进代码或默认配置，要么写死别人的空间、
  * 要么在日志与仓库里留下一个账号标识；因此这里<b>不提供默认 Endpoint</b>：
  * 开启重排必须显式写出地址，启动期校验会拒绝空值、非法 URL 与仍含 {@code &#123;...&#125;}
  * 占位符的地址。</p>
+ *
+ * <h2>为什么必须 HTTPS（FD-0013-R1）</h2>
+ * <p>API Key 通过 {@code Authorization: Bearer} 请求头发送，明文 HTTP 会让它在链路上直接暴露
+ * （本机回环地址除外，那仅供自动化测试用本地合成端点验证真实报文）。
+ * 这条边界由 {@link RerankEndpointPolicy} 实现，<b>配置校验与适配器构造器都会执行</b> ——
+ * 只在装配层拦一次挡不住「直接 new 出适配器」的路径。</p>
  *
  * <h2>为什么模型名必须逐字等于 {@value #SUPPORTED_MODEL}</h2>
  * <p>本版本只实现 <b>qwen3-rerank 的扁平协议</b>（请求体里 {@code model}/{@code query}/{@code documents}
@@ -127,6 +133,8 @@ public class KnowledgeRerankProperties {
         if (uri.getQuery() != null || uri.getFragment() != null) {
             throw new IllegalStateException("flowdesk.knowledge.rerank.endpoint 不得包含查询串或片段");
         }
+        // FD-0013-R1：Bearer Key 不得走明文 HTTP（本机回环除外，供本地合成端点测试）
+        RerankEndpointPolicy.requireSecureEndpoint(uri);
     }
 
     /**

@@ -93,6 +93,48 @@ class KnowledgeRerankPropertiesTest {
     }
 
     @Test
+    void aPlainHttpEndpointOutsideLoopbackIsRejected() {
+        // FD-0013-R1：Bearer Key 不得随明文 HTTP 离开本机
+        for (String remote : new String[] {
+                "http://rerank.example.com/compatible-api/v1/reranks",
+                "http://10.0.0.1:8080/reranks",
+                "http://192.168.1.10/reranks",
+                "http://rerank.example.com." }) {
+
+            KnowledgeRerankProperties properties = enabled();
+            properties.setEndpoint(remote);
+
+            assertThatThrownBy(properties::validate)
+                    .as("endpoint=[%s]", remote)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("HTTPS");
+            assertThatThrownBy(properties::validate)
+                    .as("错误信息不得回显 Endpoint 原值")
+                    .hasMessageNotContaining(remote);
+        }
+    }
+
+    @Test
+    void httpsAndLoopbackHttpEndpointsAreAccepted() {
+        for (String allowed : new String[] {
+                "https://rerank.example.com/compatible-api/v1/reranks",
+                "https://127.0.0.1/reranks",
+                "http://127.0.0.1:8080/reranks",
+                "http://127.5.5.5/reranks",
+                "http://localhost:8080/reranks",
+                "http://LOCALHOST/reranks",
+                "http://[::1]:8080/reranks" }) {
+
+            KnowledgeRerankProperties properties = enabled();
+            properties.setEndpoint(allowed);
+
+            assertThatCode(properties::validate)
+                    .as("endpoint=[%s]（HTTPS 或本机回环）必须被接受", allowed)
+                    .doesNotThrowAnyException();
+        }
+    }
+
+    @Test
     void theModelMustBeExactlyTheSupportedValueWhenEnabled() {
         for (String model : new String[] { "gte-rerank-v2", "Qwen3-Rerank", " qwen3-rerank", "" }) {
             KnowledgeRerankProperties properties = enabled();

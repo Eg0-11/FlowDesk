@@ -333,6 +333,13 @@ class KnowledgeRerankWebTests {
                 .andReturn();
 
         assertThat(body(result)).doesNotContain("citations").doesNotContain("Exception");
+        // FD-0013-R1：重排违约时整次失败，既不返回引用，也不继续调用 DeepSeek
+        this.mockMvc.perform(post(ANSWER_PATH)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"query\":\"" + QUESTION + "\"}"))
+                .andExpect(status().isInternalServerError())
+                .andExpect(jsonPath("$.code").value("INTERNAL_SERVER_ERROR"));
+        assertThat(endpoint.requests()).as("重排违约时不得调用模型").isEmpty();
     }
 
     // ---------- 辅助 ----------

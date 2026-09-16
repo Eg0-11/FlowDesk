@@ -1,6 +1,7 @@
 package com.flowdesk.infrastructure.knowledge.rerank;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowable;
 
@@ -13,6 +14,7 @@ import com.flowdesk.application.knowledge.KnowledgeApplicationErrorCode;
 import com.flowdesk.application.knowledge.KnowledgeApplicationException;
 import com.flowdesk.application.knowledge.port.out.KnowledgeRerankResult;
 import java.io.IOException;
+import java.net.URI;
 import java.time.Duration;
 import java.util.List;
 import org.junit.jupiter.api.AfterAll;
@@ -138,6 +140,80 @@ class DashScopeKnowledgeRerankAdapterTest {
         assertInvalidResponse();
     }
 
+    // ---------- 下标必须是整数（FD-0013-R1）----------
+
+    @Test
+    void aFractionalOrExponentialIndexIsRejectedInsteadOfBeingTruncated() {
+        // 0.9 / 1.8 / 1e0 都是浮点节点：intValue() 会把它们悄悄截断成 0 或 1，
+        // 于是「分数属于第 N 个候选」变成一个看起来合法、实际错位的绑定
+        for (String index : new String[] { "0.9", "1.8", "1e0", "2.0", "-0.5" }) {
+            endpoint.willReturn(200, "{\"results\":[{\"index\":" + index + ",\"relevance_score\":0.9}]}");
+
+            Throwable thrown = catchThrowable(() -> adapter(Duration.ofSeconds(2)).rerank(QUESTION, DOCUMENTS));
+
+            assertThat(thrown).as("index=%s", index).isInstanceOf(KnowledgeApplicationException.class);
+            assertThat(((KnowledgeApplicationException) thrown).errorCode())
+                    .as("index=%s 不得被截断", index)
+                    .isEqualTo(KnowledgeApplicationErrorCode.KNOWLEDGE_RETRIEVAL_FAILURE);
+        }
+    }
+
+    @Test
+    void anIndexOutsideTheIntRangeIsRejectedInsteadOfOverflowing() {
+        // 2^32 与 int 边界之外的值：intValue() 会回绕成 0 或负数，同样是错位绑定
+        for (String index : new String[] { "4294967296", "-4294967296", "2147483648", "-2147483649",
+                "99999999999999999999999" }) {
+            endpoint.willReturn(200, "{\"results\":[{\"index\":" + index + ",\"relevance_score\":0.9}]}");
+
+            Throwable thrown = catchThrowable(() -> adapter(Duration.ofSeconds(2)).rerank(QUESTION, DOCUMENTS));
+
+            assertThat(thrown).as("index=%s", index).isInstanceOf(KnowledgeApplicationException.class);
+            assertThat(((KnowledgeApplicationException) thrown).errorCode())
+                    .as("index=%s 不得溢出", index)
+                    .isEqualTo(KnowledgeApplicationErrorCode.KNOWLEDGE_RETRIEVAL_FAILURE);
+        }
+    }
+
+    @Test
+    void aBooleanOrStructuredIndexIsRejected() {
+        for (String index : new String[] { "true", "false", "[0]", "{\"value\":0}" }) {
+            endpoint.willReturn(200, "{\"results\":[{\"index\":" + index + ",\"relevance_score\":0.9}]}");
+
+            Throwable thrown = catchThrowable(() -> adapter(Duration.ofSeconds(2)).rerank(QUESTION, DOCUMENTS));
+
+            assertThat(thrown).as("index=%s", index).isInstanceOf(KnowledgeApplicationException.class);
+            assertThat(((KnowledgeApplicationException) thrown).errorCode())
+                    .isEqualTo(KnowledgeApplicationErrorCode.KNOWLEDGE_RETRIEVAL_FAILURE);
+        }
+    }
+
+    @Test
+    void theWholeRequestFailsAtTheFirstBadIndexWithoutSendingAnythingElse() {
+        // 第一条合法、第二条是小数：整次请求失败，且只发了一次请求（不重试、不降级）
+        endpoint.willReturn(200, "{\"results\":[{\"index\":0,\"relevance_score\":0.9},"
+                + "{\"index\":1.5,\"relevance_score\":0.1}]}");
+
+        Throwable thrown = catchThrowable(() -> adapter(Duration.ofSeconds(2)).rerank(QUESTION, DOCUMENTS));
+
+        assertThat(thrown).isInstanceOf(KnowledgeApplicationException.class);
+        assertThat(((KnowledgeApplicationException) thrown).errorCode())
+                .isEqualTo(KnowledgeApplicationErrorCode.KNOWLEDGE_RETRIEVAL_FAILURE);
+        assertThat(endpoint.calls()).isEqualTo(1);
+    }
+
+    @Test
+    void integerIndicesInAnyOrderAreStillBoundByTheirOriginalPosition() throws Exception {
+        // 合法乱序（int 范围内）必须照旧归位：这条能力不能被上面的收紧破坏
+        endpoint.willReturn(200, "{\"results\":[{\"index\":1,\"relevance_score\":0.9},"
+                + "{\"index\":0,\"relevance_score\":0.2}]}");
+
+        List<KnowledgeRerankResult> results = adapter(Duration.ofSeconds(2)).rerank(QUESTION, DOCUMENTS);
+
+        assertThat(results).containsExactly(
+                new KnowledgeRerankResult(1, 0.9),
+                new KnowledgeRerankResult(0, 0.2));
+    }
+
     @Test
     void aResponseWithoutATopLevelResultsArrayIsAnInvalidResponse() {
         // 嵌套 output.results 属于 gte-rerank-v2 的协议：不猜测、不兼容，直接判为无法解释
@@ -226,6 +302,47 @@ class DashScopeKnowledgeRerankAdapterTest {
                 || message.contains("SENTINEL-BODY")
                 || message.contains(API_KEY)
                 || message.contains("127.0.0.1"));
+    }
+
+    // ---------- 传输安全：Bearer Key 不得走明文 HTTP（FD-0013-R1）----------
+
+    @Test
+    void theConstructorRejectsAPlainHttpEndpointOutsideLoopback() {
+        for (String endpoint : new String[] {
+                "http://rerank.example.com/compatible-api/v1/reranks",
+                "http://10.0.0.1:8080/reranks",
+                "http://192.168.1.10/reranks",
+                "http://[2001:db8::1]/reranks" }) {
+
+            Throwable thrown = catchThrowable(() -> new DashScopeKnowledgeRerankAdapter(
+                    URI.create(endpoint), KnowledgeRerankProperties.SUPPORTED_MODEL, API_KEY,
+                    Duration.ofSeconds(2), Duration.ofSeconds(2)));
+
+            assertThat(thrown).as("endpoint=%s", endpoint)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("HTTPS");
+            assertThat(thrown.getMessage())
+                    .as("错误信息不得回显 Endpoint 或 Key")
+                    .doesNotContain(endpoint)
+                    .doesNotContain(API_KEY);
+        }
+    }
+
+    @Test
+    void theConstructorAcceptsHttpsAndLoopbackHttpEndpoints() {
+        for (String endpoint : new String[] {
+                "https://rerank.example.com/compatible-api/v1/reranks",
+                "https://127.0.0.1/reranks",
+                "http://127.0.0.1:8080/reranks",
+                "http://localhost:8080/reranks",
+                "http://[::1]:8080/reranks" }) {
+
+            assertThatCode(() -> new DashScopeKnowledgeRerankAdapter(URI.create(endpoint),
+                    KnowledgeRerankProperties.SUPPORTED_MODEL, API_KEY, Duration.ofSeconds(2),
+                    Duration.ofSeconds(2)))
+                    .as("endpoint=%s（HTTPS 或本机回环）必须被接受", endpoint)
+                    .doesNotThrowAnyException();
+        }
     }
 
     // ---------- 入参防护 ----------
