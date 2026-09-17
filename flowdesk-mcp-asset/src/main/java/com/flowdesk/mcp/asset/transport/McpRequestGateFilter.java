@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.modelcontextprotocol.spec.HttpHeaders;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ReadListener;
 import jakarta.servlet.ServletException;
@@ -47,17 +48,30 @@ import org.springframework.web.filter.OncePerRequestFilter;
  *   <li><b>只拦 POST</b>：GET（服务端事件流）与 DELETE（会话清理）原样放行；</li>
  *   <li>请求体不是合法 JSON → {@code 400} + {@code -32700 Parse error}；</li>
  *   <li>合法 JSON 但不是 JSON-RPC 请求对象（数组、裸字符串、缺 {@code jsonrpc}/{@code method}）
- *       → {@code 400} + {@code -32600 Invalid request}；</li>
+ *       → {@code 400} + {@code -32600 Invalid request}；
+ *       第 2、3 条<b>不要求会话</b>：传输层自己也是在会话校验<b>之前</b>解析报文的
+ *       （实测：畸形报文 + 无会话标识得到的是解析失败，而不是「缺少会话」）；</li>
+ *   <li>{@code initialize} → 原样放行：握手不要求会话，协议版本在会话里协商；</li>
+ *   <li><b>会话校验（FD-0014-R3）</b>：其余请求必须带上<b>活跃</b>的 {@code Mcp-Session-Id}。
+ *       没有该头、值为空、伪造、或会话已被 {@code DELETE} 结束 —— 一律<b>原样放行</b>，
+ *       让传输层按它自己的语义回答 {@code 400} / {@code 404}（这些响应同样已脱敏）。
+ *       「会话标识非空」不算有效：必须真的在传输层的会话表里；</li>
+ *   <li>通知（没有 {@code id}）原样放行 —— 包括 {@code notifications/initialized}，
+ *       握手语义不能被闸门吞掉；实测未知通知由传输层回 202，流本来就是有界的；</li>
+ *   <li><b>协议版本校验（FD-0014-R3）</b>：会话有效之后，请求头
+ *       {@code MCP-Protocol-Version} 必须是传输层公布的受支持版本之一（缺省视为受支持，
+ *       与传输层的行为一致）。不受支持 → {@code 400} + 固定 {@code Unsupported protocol version}。
+ *       传输层自己不校验这个头（实测：带一个不存在的版本仍然照常处理），但规范要求 400；
+ *       而且只有在这里拒绝，未实现的方法才不会退化成一条永不结束的流；</li>
  *   <li>带 {@code id} 的请求且方法不在实现清单
  *       （{@code initialize}、{@code ping}、{@code tools/list}、{@code tools/call}、{@code logging/setLevel}）
  *       → {@code 200} + {@code -32601 Method not found}，**普通 JSON 响应**，因此流立即结束；</li>
  *   <li>{@code tools/call} 的 {@code params} 必须是对象、{@code name} 必须是字符串、
  *       {@code arguments} 必须**缺省或为对象** → 否则 {@code 200} + {@code -32602 Invalid params}，
  *       工具与资产目录都不会被调用；</li>
- *   <li>通知（没有 {@code id}）一律放行 —— 包括 {@code notifications/initialized}，
- *       握手语义不能被闸门吞掉；实测未知通知由传输层回 202，流本来就是有界的；</li>
  *   <li>请求体超过 {@value #MAX_BODY_BYTES} 字节 → {@code 413} + 固定错误：本服务的入参只有一个
- *       短标识，不存在合法的大请求体，而读不完的报文无法判定，只能拒绝。</li>
+ *       短标识，不存在合法的大请求体，而读不完的报文无法判定，只能拒绝
+ *       （与容器自身的体积上限同类，因此不依赖会话）。</li>
  * </ol>
  *
  * <p><b>为什么不在 SDK 里修</b>：这三处都在 MCP Java SDK 0.17.0 的传输实现内部
@@ -77,6 +91,15 @@ public final class McpRequestGateFilter extends OncePerRequestFilter {
 
     private static final ObjectMapper MAPPER =
             new ObjectMapper().enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
+
+    private final McpTransportState transportState;
+
+    /**
+     * @param transportState 传输层状态查询（会话活跃性与受支持协议版本）
+     */
+    public McpRequestGateFilter(McpTransportState transportState) {
+        this.transportState = transportState;
+    }
 
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
@@ -119,10 +142,36 @@ public final class McpRequestGateFilter extends OncePerRequestFilter {
 
         String method = textOf(root.get("method"));
 
-        // JSON-RPC 用「有没有 id 成员」区分请求与通知（id:null 仍算请求）
-        if (!root.has("id")) {
-            // 通知：没有任何响应语义，原样交给传输层（它回 202，流是有界的）
+        // 握手不要求会话（那是建立会话的请求），也不在这里校验协议版本：
+        // 客户端在 initialize 里请求一个版本，服务端在会话里协商，响应里给出最终版本
+        if ("initialize".equals(method)) {
             chain.doFilter(replay(request, body), response);
+            return;
+        }
+
+        // FD-0014-R3：提前回答的前提是「传输层本来也会接受这个请求」。
+        // 非 initialize 的请求必须先证明会话真的活跃 —— 缺失、伪造、已删除（含空串）一律放行，
+        // 让传输层按它自己的语义给出 400 / 404（这些响应同样已被脱敏）。
+        if (this.transportState.sessionState(request.getHeader(HttpHeaders.MCP_SESSION_ID))
+                != McpTransportState.SessionState.LIVE) {
+
+            chain.doFilter(replay(request, body), response);
+            return;
+        }
+
+        // 通知没有任何响应语义：原样交给传输层（它回 202，流是有界的）
+        if (!root.has("id")) {
+            chain.doFilter(replay(request, body), response);
+            return;
+        }
+
+        // 会话有效之后才校验协议版本：传输层自己不校验这个头（实测会把不支持的版本照常处理），
+        // 而规范要求对不受支持的版本回 400；也正因为要在这里拒绝，
+        // 「未实现的方法」才不会退化成一条永不结束的流
+        if (!this.transportState.supportsProtocolVersion(request.getHeader(HttpHeaders.PROTOCOL_VERSION))) {
+            writeBody(response, HttpServletResponse.SC_BAD_REQUEST,
+                    McpProtocolError.body(idOf(root), McpProtocolError.INVALID_REQUEST,
+                            McpProtocolError.UNSUPPORTED_PROTOCOL_VERSION_MESSAGE));
             return;
         }
 

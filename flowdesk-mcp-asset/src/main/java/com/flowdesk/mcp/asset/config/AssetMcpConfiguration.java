@@ -6,6 +6,7 @@ import com.flowdesk.mcp.asset.directory.UnavailableAssetDirectory;
 import com.flowdesk.mcp.asset.tool.AssetGetTool;
 import com.flowdesk.mcp.asset.transport.McpErrorJsonSerializer;
 import com.flowdesk.mcp.asset.transport.McpRequestGateFilter;
+import com.flowdesk.mcp.asset.transport.McpTransportState;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.boot.autoconfigure.jackson.Jackson2ObjectMapperBuilderCustomizer;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -108,21 +109,27 @@ public class AssetMcpConfiguration {
     }
 
     /**
-     * 给 MCP 端点挂上传输层入口闸门（FD-0014-R2）。
+     * 给 MCP 端点挂上传输层入口闸门（FD-0014-R2 / FD-0014-R3）。
      *
      * <p>顺序在 Origin 过滤器之后：带 {@code Origin} 的浏览器请求先被 403 挡掉，
      * 闸门只处理「已经到了 MCP 端点门口」的请求。</p>
      *
+     * <p>闸门需要传输层状态：非 {@code initialize} 的请求只有在会话<b>活跃</b>、
+     * 协议版本受支持时，闸门才允许提前回答；否则一律放行，由传输层按自己的语义回答
+     * （缺少会话标识 → 400，伪造或已删除 → 404）。</p>
+     *
      * @param mcpEndpoint MCP 端点路径
+     * @param transport   MCP 传输实现（Spring AI 自动装配的 Streamable HTTP provider）
      * @return 过滤器注册
      */
     @Bean
     public FilterRegistrationBean<McpRequestGateFilter> mcpRequestGateFilter(
             @org.springframework.beans.factory.annotation.Value("${spring.ai.mcp.server.streamable-http.mcp-endpoint:/mcp}")
-            String mcpEndpoint) {
+            String mcpEndpoint,
+            io.modelcontextprotocol.spec.McpStreamableServerTransportProvider transport) {
 
         FilterRegistrationBean<McpRequestGateFilter> registration =
-                new FilterRegistrationBean<>(new McpRequestGateFilter());
+                new FilterRegistrationBean<>(new McpRequestGateFilter(new McpTransportState(transport)));
         registration.addUrlPatterns(mcpEndpoint);
         registration.setName("mcpRequestGateFilter");
         registration.setOrder(1);

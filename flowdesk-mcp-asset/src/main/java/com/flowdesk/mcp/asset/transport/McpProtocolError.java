@@ -55,6 +55,9 @@ public final class McpProtocolError {
     /** 固定文案：{@code tools/call} 的 {@code arguments} 不是 JSON 对象。 */
     public static final String ARGUMENTS_NOT_OBJECT_MESSAGE = "Invalid params: arguments must be a JSON object";
 
+    /** 固定文案：{@code MCP-Protocol-Version} 不受支持（FD-0014-R3）。 */
+    public static final String UNSUPPORTED_PROTOCOL_VERSION_MESSAGE = "Unsupported protocol version";
+
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private McpProtocolError() {

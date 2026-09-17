@@ -29,6 +29,9 @@ final class AssetMcpRawClient {
     /** 会话标识响应头 / 请求头（MCP Streamable HTTP）。 */
     static final String SESSION_HEADER = "Mcp-Session-Id";
 
+    /** 协议版本请求头（MCP Streamable HTTP，FD-0014-R3）。 */
+    static final String PROTOCOL_VERSION_HEADER = "MCP-Protocol-Version";
+
     /** {@code initialize} 请求体（协议版本与 SDK 客户端一致）。 */
     static final String INITIALIZE_BODY = """
             {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18",\
@@ -86,8 +89,24 @@ final class AssetMcpRawClient {
      * @throws Exception 请求失败
      */
     BoundedResponse postBounded(String body, String sessionId, Duration window) throws Exception {
-        HttpResponse<InputStream> response =
-                this.httpClient.send(request(body, sessionId).build(), HttpResponse.BodyHandlers.ofInputStream());
+        return postBounded(body, sessionId, null, window);
+    }
+
+    /**
+     * 发一个 POST（可带协议版本头），并在有界窗口内观察响应流是否结束。
+     *
+     * @param body            JSON-RPC 报文
+     * @param sessionId       会话标识；{@code null} 表示不带该头
+     * @param protocolVersion {@code MCP-Protocol-Version} 头；{@code null} 表示不带该头
+     * @param window          观察 EOF 的时间窗口
+     * @return 响应（含 EOF 判断）
+     * @throws Exception 请求失败
+     */
+    BoundedResponse postBounded(String body, String sessionId, String protocolVersion, Duration window)
+            throws Exception {
+
+        HttpResponse<InputStream> response = this.httpClient.send(
+                request(body, sessionId, protocolVersion).build(), HttpResponse.BodyHandlers.ofInputStream());
 
         InputStream stream = response.body();
         StringBuilder received = new StringBuilder();
@@ -149,6 +168,10 @@ final class AssetMcpRawClient {
     }
 
     private HttpRequest.Builder request(String body, String sessionId) {
+        return request(body, sessionId, null);
+    }
+
+    private HttpRequest.Builder request(String body, String sessionId, String protocolVersion) {
         HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(this.endpoint))
                 .timeout(REQUEST_TIMEOUT)
                 .header("Content-Type", "application/json")
@@ -156,6 +179,9 @@ final class AssetMcpRawClient {
                 .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8));
         if (sessionId != null) {
             builder.header(SESSION_HEADER, sessionId);
+        }
+        if (protocolVersion != null) {
+            builder.header(PROTOCOL_VERSION_HEADER, protocolVersion);
         }
         return builder;
     }
