@@ -19,6 +19,8 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.List;
 import java.util.Set;
 import org.springframework.web.filter.OncePerRequestFilter;
 
@@ -159,19 +161,20 @@ public final class McpRequestGateFilter extends OncePerRequestFilter {
             return;
         }
 
-        // 通知没有任何响应语义：原样交给传输层（它回 202，流是有界的）
-        if (!root.has("id")) {
-            chain.doFilter(replay(request, body), response);
-            return;
-        }
-
-        // 会话有效之后才校验协议版本：传输层自己不校验这个头（实测会把不支持的版本照常处理），
-        // 而规范要求对不受支持的版本回 400；也正因为要在这里拒绝，
-        // 「未实现的方法」才不会退化成一条永不结束的流
-        if (!this.transportState.supportsProtocolVersion(request.getHeader(HttpHeaders.PROTOCOL_VERSION))) {
+        // FD-0014-R3/R4：会话有效之后、**请求/通知分流之前**校验协议版本。
+        // 传输层自己不校验这个头（实测会把不支持的版本照常处理），而规范要求对不受支持的版本回 400；
+        // 放在分流之前意味着合法请求与通知遵守同一条规则（通知也回 400，错误体 id 为 null）。
+        // 缺失版本头继续兼容（返回 null → 视为受支持）；存在但为空白的值按无效版本处理。
+        if (!this.transportState.supportsProtocolVersion(protocolVersionOf(request))) {
             writeBody(response, HttpServletResponse.SC_BAD_REQUEST,
                     McpProtocolError.body(idOf(root), McpProtocolError.INVALID_REQUEST,
                             McpProtocolError.UNSUPPORTED_PROTOCOL_VERSION_MESSAGE));
+            return;
+        }
+
+        // 通知没有任何响应语义：原样交给传输层（它回 202，流是有界的）
+        if (!root.has("id")) {
+            chain.doFilter(replay(request, body), response);
             return;
         }
 
@@ -216,6 +219,21 @@ public final class McpRequestGateFilter extends OncePerRequestFilter {
             return McpProtocolError.ARGUMENTS_NOT_OBJECT_MESSAGE;
         }
         return null;
+    }
+
+    /**
+     * 取协议版本头，并区分「缺失」与「存在但为空」。
+     *
+     * <p>Servlet API 的 {@code getHeader} 对这两种情况都返回 {@code null} 或空串，无法区分，
+     * 因此这里读头的所有取值：一个都没有 → 缺失（{@code null}，兼容现有客户端）；
+     * 有取值 → 取第一个（可能是空串或纯空白，按无效版本处理）。</p>
+     *
+     * @param request 请求
+     * @return 版本头的值；缺失时为 {@code null}
+     */
+    private static String protocolVersionOf(HttpServletRequest request) {
+        List<String> values = Collections.list(request.getHeaders(HttpHeaders.PROTOCOL_VERSION));
+        return values.isEmpty() ? null : values.get(0);
     }
 
     /**

@@ -1,6 +1,6 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0014-R3 —— 请求闸门不得绕过传输层的会话与协议版本校验（已完成）**
+> **当前阶段：FD-0014-R4 —— 通知与请求遵守同一条协议版本规则（已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
@@ -30,7 +30,9 @@
 > MCP 传输层收口（畸形报文不再回传堆栈、非对象 `arguments` 由 500 空响应改为明确的
 > `-32602`、未实现方法由闸门直接回答 `-32601` 且响应流有界）（FD-0014-R2）、
 > 闸门校验收口（提前回答前先确认会话**活跃**并与传输层一致、补上 `MCP-Protocol-Version`
-> 校验；缺失/伪造/已删除的会话标识改由传输层回答 400/404）（FD-0014-R3）。
+> 校验；缺失/伪造/已删除的会话标识改由传输层回答 400/404）（FD-0014-R3）、
+> 通知同样遵守版本规则（版本校验移到请求/通知分流之前；空白版本头按无效版本处理，
+> 通知错误体为 `id:null` + 固定文案）（FD-0014-R4）。
 > 尚未实现：全文检索与混合检索、任意切片读取接口、文档列表/下载/删除、
 > 孤立文件清理任务、`PARSING`/`INDEXING` 悬挂的恢复扫描、问答的流式输出与会话记忆、
 > 游标分页、PostgreSQL 全文检索与 pg_trgm、监控 MCP 服务的能力实现、Agent Graph、鉴权与前端。
@@ -748,6 +750,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0014-R1 | 返工：入参形状与 schema 一致（额外字段/非对象一律拒绝）、`disallow-delete` 改为允许会话终止、关闭未实现的 resources/prompts/completions 能力 | ✅ 已完成 |
 | FD-0014-R2 | 传输层收口：畸形报文回固定协议错误（无堆栈/类名/路径/原始异常消息）、非对象 `arguments` 回明确的 `-32602`、未实现方法回 `-32601` 且响应流有界 | ✅ 已完成 |
 | FD-0014-R3 | 闸门校验收口：提前回答前必须会话**活跃**（缺失/伪造/已删除一律交传输层回 400/404）、补 `MCP-Protocol-Version` 校验 | ✅ 已完成 |
+| FD-0014-R4 | 通知同样遵守版本规则：版本校验移到请求/通知分流之前（通知也回 400、`id:null`）、空白版本头按无效版本处理 | ✅ 已完成 |
 | 后续 | 问答流式输出与会话记忆（当前为一次性完整响应、无历史轮次） | 未开始 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm`（混合检索） | 未开始 |
 | 后续 | 孤立文件清理任务 | 未开始 |
@@ -771,6 +774,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | 资产 MCP 服务返工证据（FD-0014-R1） | ✅ 已执行 | **真实 MCP 客户端 + 真实 HTTP**：入参形状回归 —— `{"assetId":"AST-900001","extra":"sentinel-extra-argument"}` 经真实 SDK 客户端得到 `isError=true` + 固定 `INVALID_ASSET_ID`（且响应里没有多余字段的值、没有任何资产数据），字段名写成 `asset_id` 同样被拒；`arguments` 不是对象（原始 JSON-RPC 报文送字符串）在协议层被拒（实测 500、响应体为空，不回显取值）；畸形 JSON-RPC 报文被拒（400），响应不回显输入，且显式断言并记录了它含服务端堆栈这一框架边界；单元层逐条覆盖「额外字段 / 非对象（数组、字符串、数字、布尔、`null`、两段 JSON 拼接）/ `assetId` 非字符串 / 空与纯空白 / 超长」，并断言 schema 的 `pattern` 锚定且与 `AssetId` 常量一致、`maxLength` 等于长度上限（31 条目录契约 + 14 条工具契约）；**会话终止** —— 真实 HTTP：`initialize` 200 带 `Mcp-Session-Id`、通知 202、`DELETE /mcp` **200（不是 405）**、旧会话标识再请求 **404**；真实 SDK 客户端 `close()` 后服务端会话表回到基线（异步收敛用有界轮询断言，留下会话即失败）；无 `DELETE` 且无会话标识的删除请求被拒且不回显任何内容；**能力声明** —— 原始 `initialize` 报文的 `capabilities` 字段集合实测为 `["logging","tools"]`（`resources`/`prompts`/`completions` 已关闭；`logging` 是 MCP SDK 0.17.0 在 `McpAsyncServer` 构造器里无条件添加的，无开关，已如实写入 README 与 ADR），SDK 侧逐项断言 `tools` 非空、`resources`/`prompts`/`completions`/`experimental` 为空、`logging` 非空，容器层断言没有注册任何 resource/resource-template/prompt/completion 处理器；**关停** —— 模块测试与全仓测试的 JVM 退出都不再出现 `Surefire is going to kill self fork JVM`，`Commencing graceful shutdown` 与 `Graceful shutdown complete` 之间 9 ms（修复前是 30 秒后被强杀）；测试全部使用固定虚构演示数据，不访问任何外部服务 |
 | 资产 MCP 传输层收口证据（FD-0014-R2） | ✅ 已执行 | **基线先复现，再验收**（真实 HTTP + 真实流读取，1.2 秒窗口观察 EOF）：修复前 `resources/list`/`prompts/list`/`completion/complete`/`foo/bar` 四条请求的 200 响应流**永不结束**、非对象 `arguments` 是 **500 空响应**、畸形 JSON/顶层数组/缺 `method`/缺会话标识四种 400 响应体**含 `stackTrace` 与服务端类名行号**，并且该 JVM 退出时被 Surefire 强杀；修复后：畸形报文 → 400 + `-32700 Parse error`（同样的输入两次逐字节相同），非 JSON-RPC 报文（数组/裸字符串/数字/`null`/缺 `method`/`jsonrpc` 版本不符/两段拼接）→ 400 + `-32600`（两段拼接按 `-32700`），非对象 `arguments`（字符串/数组/数字/布尔/`null`）与形状不合法的 `params` → **200 + `-32602`** 且**工具与资产目录零调用**（计数目录 + 工具日志两条互补证据，另有正向对照证明计数有效），未实现的 7 个方法（含 `resources/templates/list`、`tools/delete`）→ **200 + `-32601 Method not found: <方法名>`，响应流在秒级窗口内 EOF**，形状异常的方法名不回显；所有错误响应体都通过**负向泄漏断言**（不含 `stackTrace`/`cause`/`lineNumber`/`nativeMethod`/`java.lang.`/`io.modelcontextprotocol`/`org.springframework`/`com.flowdesk`/`.java`/`Exception`/路径/配置字样，也不回显输入），SDK 自身错误路径（缺会话标识 400、未知会话 404）同样是固定 `{"code":-32600,"message":"Invalid request"}`；回归：`initialize`/握手通知 202/`ping`/`tools/list`/`asset_get` 命中与工具层错误（`isError=true` + `INVALID_ASSET_ID`）/未注册工具名仍为 `-32602`/`Origin` 403/回环绑定/SDK `close()` 与 `DELETE` 会话清理全部不变，被拒绝的方法之后同一会话仍能正常调用工具并正常结束会话；关停时间：模块跑与全仓跑的 `Commencing graceful shutdown` → `Graceful shutdown complete` 均为**毫秒级**，四次运行**无强杀、无 30 秒等待、无新 JVM dump** |
 | 闸门会话与版本校验证据（FD-0014-R3） | ✅ 已执行 | **真实 HTTP 覆盖两条提前回答路径**（未实现方法 `resources/list`、非法 `tools/call` 参数）：基线先复现绕过 —— 无会话标识 / 伪造 / 空串 / 已 `DELETE` 的会话标识下闸门都回 `200` + `-32601`/`-32602`，而传输层对同样请求实测为 `400`（缺会话标识）/ `404`（会话不存在）；修复后：三种无效会话（缺失、伪造、已删除）与空串会话下，两条路径都由**传输层**回答（400/404 + 固定脱敏 `{"code":-32600,"message":"Invalid request"}`，无 `stackTrace`/类名/路径，且断言响应体**不含** `Method not found`/`Invalid params`/`Unsupported protocol version`，证明闸门没有提前回答），删除场景先断言「删除前活跃会话确实走闸门」再断言删除后不再走；**协议版本**：活跃会话 + `1999-01-01` → 400 + 固定 `Unsupported protocol version`（两条路径各自覆盖，且不落到方法分派），传输层公布的 `[2024-11-05, 2025-03-26, 2025-06-18]` 逐个被接受（两条路径各断言 `-32601`/`-32602`），缺省版本头同样被接受，握手请求带不受支持版本**不被拒**（版本在会话里协商）；**未受影响**：`initialize` 200 + 会话标识、握手通知 202、`ping`/`tools/list` 200、`asset_get` 命中 `isError=false`、工具层错误 `isError=true` + `INVALID_ASSET_ID`、`DELETE` 200 全部照旧 |
+| 通知协议版本证据（FD-0014-R4） | ✅ 已执行 | **真实 HTTP**：活跃会话 + 不受支持版本（`1999-01-01`）时，`notifications/initialized` 与普通通知（`foo/notify`）**都返回 400**，响应体为 `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Unsupported protocol version"}}`（通知 `id` 为 `null`、固定错误码与固定文案、不回显版本值、无 `stackTrace`/类名/路径、响应有界），同时 `tools/list` 也返回 400（回显 `id`）；**正向对照**：传输层公布的每个版本（`2024-11-05`/`2025-03-26`/`2025-06-18`）下通知都是 202、`tools/list` 都是 200 且含 `asset_get`，**缺省版本头**同样如此；**空白版本头**（空串、`" "`、`"   "`，实测 Servlet 容器原样交给应用）按无效版本返回 400 而不是当作缺失；**优先级不变**：无会话标识 + 不受支持版本仍由传输层回 400 `Invalid request`，伪造/已删除会话仍回 404，均不含版本错误文案；被拒的通知不会破坏会话（随后缺省版本通知 202、工具调用照常、`DELETE` 200）；`initialize` 带不受支持版本仍 200（版本在会话里协商） |
 | PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证**；pgvector 集成测试（Testcontainers，镜像固定为带扩展版本的 `pgvector/pgvector:0.8.6-pg16`）在无 Docker 时跳过（当前跳过 26 条：15 条索引写入 + 11 条相似度检索），报告标注 POSTGRESQL_PGVECTOR_IT=NOT_RUN |
 | 真实 DashScope Embedding | ⚠️ **DASHSCOPE_LIVE=NOT_RUN** | 无 DASHSCOPE_API_KEY，**未对真实向量服务发起过任何请求**；全部自动化测试都不访问真实上游 |
 | 真实 DeepSeek | ⚠️ **LIVE_SMOKE=NOT_RUN** | 无 `DEEPSEEK_API_KEY`，**未对真实模型发起过任何请求** |
@@ -2200,7 +2204,7 @@ MCP 客户端的连接信息：**URL = `http://127.0.0.1:8091/mcp`**，传输 = 
 6. **未验证项**：`MCP_LIVE=NOT_RUN`（未对接任何外部 MCP 服务或真实资产系统）；
    `POSTGRES_LIVE`、`DASHSCOPE_LIVE`、`LIVE_SMOKE` 与本模块无关但全仓仍为 `NOT_RUN`。
 
-### 21.6 传输层错误与响应流（FD-0014-R2 / FD-0014-R3）
+### 21.6 传输层错误与响应流（FD-0014-R2 / FD-0014-R3 / FD-0014-R4）
 
 MCP SDK 0.17.0 的传输实现在三类请求上会给出**不可接受**的响应：畸形报文回传整段 Java 堆栈
 （含类名、文件名、行号），非对象 `arguments` 回 500 空响应，未实现的方法把错误写进
@@ -2208,7 +2212,8 @@ MCP SDK 0.17.0 的传输实现在三类请求上会给出**不可接受**的响�
 本模块在**自己的传输入口**上收口，不改依赖版本、不改 SDK 内部：
 
 - **闸门**（`McpRequestGateFilter`，只作用于 `POST /mcp`）在请求进入传输实现之前解析报文，
-  按固定规则回答；其余请求原样放行（请求体完整重放，传输层读到的原文一字不差）：
+  按下面的顺序与固定规则回答；其余请求原样放行（请求体完整重放，传输层读到的原文一字不差）：
+  **解析（不要求会话）→ `initialize` 放行 → 会话有效性 → 协议版本 → 请求/通知分流 → 方法分派**：
 
 | 请求 | 回答 | HTTP |
 | --- | --- | --- |
@@ -2217,8 +2222,8 @@ MCP SDK 0.17.0 的传输实现在三类请求上会给出**不可接受**的响�
 | 请求体超过 1 MiB | `{"error":{"code":-32600,"message":"Request body too large"}}` | 413 |
 | `initialize` | **原样放行**（握手不要求会话；协议版本在会话里协商） | 传输层 |
 | **会话缺失 / 空串 / 伪造 / 已删除 / 读不到会话表** | **原样放行** → 传输层回它自己的 `400`（缺会话标识）或 `404`（会话不存在），已脱敏 | 400 / 404 |
-| 通知（没有 `id` 成员，含 `notifications/initialized`） | **原样放行**（握手语义不能被吞掉） | 传输层 |
-| **会话有效 + `MCP-Protocol-Version` 不受支持** | `{"error":{"code":-32600,"message":"Unsupported protocol version"}}` | 400 |
+| **会话有效 + 版本不受支持**（含**存在但为空白**的版本头） | `{"error":{"code":-32600,"message":"Unsupported protocol version"}}` —— **请求回显 `id`，通知为 `id:null`；请求与通知一律 400** | 400 |
+| 会话有效 + 版本受支持或缺省 + 通知（没有 `id` 成员，含 `notifications/initialized`） | **原样放行**（握手语义不能被吞掉，传输层回 202） | 传输层 |
 | 会话有效 + 版本受支持或缺省 + 带 `id` 且方法未实现（`resources/list`、`prompts/list`、任意未知方法…） | `{"error":{"code":-32601,"message":"Method not found: <方法名>"}}`，**普通 JSON，因此流立即结束** | 200 |
 | 会话有效 + 版本受支持或缺省 + `tools/call` 的 `params`/`name`/`arguments` 形状不合法 | `{"error":{"code":-32602,"message":"Invalid params: arguments must be a JSON object"}}`，**工具与资产目录都不会被调用** | 200 |
 | 会话有效 + 版本受支持或缺省 + 合法工具调用、`tools/list`、`ping`、`logging/setLevel` | **原样放行** | 传输层 |
@@ -2227,10 +2232,12 @@ MCP SDK 0.17.0 的传输实现在三类请求上会给出**不可接受**的响�
   必须带**活跃**会话 —— 真的在传输层的会话表里，而不是「非空即可」（实测传输层：缺会话标识 → 400，
   伪造 / 空串 / 已 `DELETE` → 404）。会话有效性由 `McpTransportState` 只读反射查询 SDK 的会话表
   （接口上没有查询方法），返回 `LIVE`/`ABSENT`/`INDETERMINATE`；**读不到就放行**，闸门宁可少回答也不猜；
-- **协议版本**：支持的版本列表取自传输层自己公布的 `protocolVersions()`
-  （实测 `[2024-11-05, 2025-03-26, 2025-06-18]`），不另维护一份。传输层**完全不校验**这个头
-  （实测带 `1999-01-01` 仍照常返回 200），这里按规范补上：不受支持 → 400；
-  **缺省版本头仍然放行**，以免凭空拒绝正常客户端。这也是「未实现的方法必须有界」的前提；
+- **协议版本校验在「会话校验之后、请求/通知分流之前」**（FD-0014-R4）：合法请求与通知遵守同一条规则 ——
+  活跃会话 + 不受支持的版本时，**通知也返回 400**，错误体是 `id:null` + 固定错误码与固定文案。
+  支持的版本列表取自传输层自己公布的 `protocolVersions()`（实测 `[2024-11-05, 2025-03-26, 2025-06-18]`），
+  不另维护一份；传输层**完全不校验**这个头（实测带 `1999-01-01` 仍照常返回 200），这里按规范补上。
+  **缺失版本头继续兼容**（老客户端照常 202/200）；**存在但为空白的值按无效版本处理**
+  （空串不是合法版本值，不能因为「看起来像没给」就放过去；实测容器会把它原样交给应用）；
 - **解析层面的错误不要求会话**：传输层同样先解析、后查会话（实测畸形报文 + 无会话得到的是解析失败）；
 - **兜底序列化器**（`McpErrorJsonSerializer`）：SDK 在其余错误路径上仍会把 `McpError`
   （一个 `RuntimeException`）直接当响应体，Jackson 会按 `Throwable` 序列化。该序列化器把这类
@@ -2243,7 +2250,8 @@ MCP SDK 0.17.0 的传输实现在三类请求上会给出**不可接受**的响�
   我们只是让它们到不了客户端；会话表读取依赖 SDK 私有字段，读不到时闸门自动退化为「全部放行」
   （只 WARN，不 500）。`GET /mcp` 的事件流与 `DELETE` 会话清理行为不变
   （GET 的流按协议在会话结束时结束）。升级 MCP SDK 时应当先重跑
-  `AssetMcpTransportErrorTests` 与 `AssetMcpGateSessionTests`，确认这些补偿能否撤掉。
+  `AssetMcpTransportErrorTests`、`AssetMcpGateSessionTests` 与 `AssetMcpNotificationVersionTests`，
+  确认这些补偿能否撤掉。
 
 > 完整的最小复现、基线实测表与备选方案（升级依赖 / 劫持同名类 / 自写传输层）的影响评估，
 > 见 [`docs/adr/0011-asset-mcp-server-protocol-and-tool.md`](docs/adr/0011-asset-mcp-server-protocol-and-tool.md) 的 FD-0014-R2 与 FD-0014-R3 章节。

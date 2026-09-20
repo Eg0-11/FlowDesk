@@ -75,15 +75,20 @@ public final class McpTransportState {
     /**
      * 协议版本是否受支持。
      *
-     * <p>缺省（请求头不存在或为空）视为受支持：MCP Java SDK 0.17.0 的服务端根本不校验这个头
-     * （实测：带一个不受支持的版本仍然照常处理），因此把「缺省」判成不支持会凭空拒绝正常客户端。
-     * 传输层没有公布版本列表时同样放行（不拿我们自己的猜测替代它的答案）。</p>
+     * <p>三态语义（FD-0014-R3 / FD-0014-R4）：</p>
+     * <ul>
+     *   <li>{@code null} = <b>头缺失</b> → 受支持。MCP Java SDK 0.17.0 的服务端根本不校验这个头
+     *       （实测：带一个不受支持的版本仍然照常处理），把「缺失」判成不支持会凭空拒绝正常客户端；</li>
+     *   <li>头存在（含空串或纯空白）→ 必须出现在传输层公布的列表里，否则视为无效版本
+     *       （空串不是合法版本值，不能因为「看起来像没给」就放过去）；</li>
+     *   <li>传输层没有公布版本列表 → 放行：不拿我们自己的猜测替代它的答案。</li>
+     * </ul>
      *
-     * @param protocolVersion 请求头 {@code MCP-Protocol-Version} 的值
+     * @param protocolVersion 请求头 {@code MCP-Protocol-Version} 的值；头缺失时传 {@code null}
      * @return 是否受支持
      */
     public boolean supportsProtocolVersion(String protocolVersion) {
-        if (protocolVersion == null || protocolVersion.isBlank()) {
+        if (protocolVersion == null) {
             return true;
         }
         List<String> supported = this.transport.protocolVersions();
