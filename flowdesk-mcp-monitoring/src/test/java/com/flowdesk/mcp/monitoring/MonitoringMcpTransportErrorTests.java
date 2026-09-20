@@ -72,7 +72,7 @@ class MonitoringMcpTransportErrorTests {
             "secret",
             "password",
             "apiKey",
-            "asset-db.properties");
+            "monitoring-source.properties");
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 

@@ -37,7 +37,7 @@ import org.springframework.ai.tool.definition.ToolDefinition;
  *       <td>{@code {"error":"INVALID_ASSET_ID","message":"assetId 必须形如 AST-000001（AST- 加 6 位数字）"}}<br>
  *       入参必须<b>恰好</b>是「只含一个 {@code assetId} 字符串字段的 JSON 对象」：
  *       额外字段、非对象、缺失或非字符串一律按非法处理（见 {@link #rawAssetId(String)}）</td></tr>
- *   <tr><td>数据源不可用 / 内部异常</td><td>{@code true}</td>
+ *   <tr><td>数据源不可用 / 内部异常 / 非法响应（{@code origin()} 返回 {@code null}）</td><td>{@code true}</td>
  *       <td>{@code {"error":"MONITORING_SOURCE_UNAVAILABLE","message":"监控数据源当前不可用"}}</td></tr>
  * </table>
  *
@@ -45,6 +45,12 @@ import org.springframework.ai.tool.definition.ToolDefinition;
  * 「这次<b>调用</b>有没有失败」，不是「查询结果好不好」。这个资产没有快照是查询正常给出的答案；
  * 把它标成错误会让调用方以为工具坏了，从而去重试或降级。真正的执行失败
  * （输入非法、数据源不可用）才置 {@code isError=true}。</p>
+ *
+ * <p><b>「未找到」必须带血缘</b>：未命中时来源取自
+ * {@link MonitoringSnapshotSource#origin()}，而它<b>必须非 null</b>。
+ * 返回 {@code null} 属于<b>非法数据源响应</b>（说了「查过没有」却说不出来源），
+ * 工具不会把它写成 {@code source:null}，而是与其它内部问题一样收敛为
+ * {@code MONITORING_SOURCE_UNAVAILABLE}（不新增错误码）。</p>
  *
  * <h2>输出的确定性</h2>
  * <p>命中结果按固定字段顺序输出：{@code assetId}、{@code observedAt}、{@code health}、
@@ -156,6 +162,16 @@ public final class MonitoringSnapshotGetTool implements ToolCallback {
             throw new MonitoringToolException(MonitoringToolError.MONITORING_SOURCE_UNAVAILABLE);
         }
 
+        // 非法数据源响应：未命中却说不出来源（origin() 返回 null）。
+        // 这类响应不得被写成「未找到 + source:null」—— 那是一条自相矛盾的答案，
+        // 调用方无法判断「是这个资产没有快照」还是「我们根本不知道自己在说什么」。
+        // 因此与其它内部问题一样收敛为 MONITORING_SOURCE_UNAVAILABLE：不新增错误码，
+        // 不把 null 或数据源实现细节带进响应，也不回显输入。
+        if (origin == null) {
+            logFailure(MonitoringToolError.MONITORING_SOURCE_UNAVAILABLE, null, startedAt);
+            throw new MonitoringToolException(MonitoringToolError.MONITORING_SOURCE_UNAVAILABLE);
+        }
+
         if (snapshot == null || snapshot.isEmpty()) {
             logOutcome(RESULT_NOT_FOUND, startedAt);
             return notFound(rawAssetId, origin);
@@ -224,8 +240,12 @@ public final class MonitoringSnapshotGetTool implements ToolCallback {
     /**
      * 合法但未找到：调用成功（{@code isError=false}），内容里带来源血缘。
      *
+     * <p>{@code origin} 在这里<b>一定非 null</b>：{@link #call(String)} 已经把
+     * 「数据源给不出血缘」判成非法响应并转为 {@code MONITORING_SOURCE_UNAVAILABLE}，
+     * 因此这个载荷永远不会出现 {@code "source":null}。</p>
+     *
      * @param assetId 已经过格式校验的资产标识
-     * @param origin  数据源来源
+     * @param origin  数据源来源（构造期保证非 null）
      * @return JSON 文本
      */
     private static String notFound(String assetId, SnapshotOrigin origin) {
@@ -234,7 +254,7 @@ public final class MonitoringSnapshotGetTool implements ToolCallback {
         payload.put("found", Boolean.FALSE);
         payload.put("error", RESULT_NOT_FOUND);
         payload.put("message", "未找到该资产的监控快照");
-        payload.put("source", origin == null ? null : origin.name());
+        payload.put("source", origin.name());
         return json(payload);
     }
 

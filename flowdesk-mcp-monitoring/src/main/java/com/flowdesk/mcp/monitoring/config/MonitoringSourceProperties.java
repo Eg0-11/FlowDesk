@@ -22,6 +22,9 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * 因此这里按原始字符串接收，再用 {@link #resolvedMode()} 做<b>逐字符</b>匹配：
  * {@code unavailable} 与 {@code demo} 是仅有的两个合法值，其它一律拒绝（包括 {@code DEMO}、
  * {@code " demo "}、{@code "demo "}）。</p>
+ *
+ * <p>生产代码只经过 {@link #resolvedMode()} 这一个入口：装配期闸门
+ * （{@code MonitoringMcpBindingGuard}）与数据源装配都调用它，因此不存在「两套校验」。</p>
  */
 @ConfigurationProperties(prefix = "flowdesk.monitoring.source")
 public class MonitoringSourceProperties {
@@ -76,14 +79,5 @@ public class MonitoringSourceProperties {
         throw new IllegalStateException("flowdesk.monitoring.source.mode 只允许精确的 "
                 + MODE_UNAVAILABLE + " 或 " + MODE_DEMO
                 + "（不接受未知值、大小写变体或带空白的值）");
-    }
-
-    /**
-     * 严格校验：模式必须是两个合法字面量之一。
-     *
-     * @throws IllegalStateException 模式不合法
-     */
-    public void validate() {
-        resolvedMode();
     }
 }

@@ -60,12 +60,4 @@ class MonitoringSourcePropertiesTest {
                     .hasMessageNotContaining(value);
         }
     }
-
-    @Test
-    void validateDelegatesToTheSameStrictResolution() {
-        MonitoringSourceProperties properties = new MonitoringSourceProperties();
-        properties.setMode("Demo");
-
-        assertThatThrownBy(properties::validate).isInstanceOf(IllegalStateException.class);
-    }
 }

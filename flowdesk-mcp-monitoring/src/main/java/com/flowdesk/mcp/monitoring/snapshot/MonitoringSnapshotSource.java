@@ -32,7 +32,12 @@ public interface MonitoringSnapshotSource {
      * <p>「未找到」也要带来源：演示数据说「没有」与真实监控系统说「没有」是两件不同的事。
      * 数据源不可用时该方法不产生任何来源声明（它会抛异常）。</p>
      *
-     * @return 来源标识
+     * <p><b>不得返回 {@code null}</b>：未命中却没有来源，等于给出「查过了没有」却说不清
+     * 这话是谁说的。{@code null} 被视为<b>非法数据源响应</b>，工具层会把它收敛为
+     * {@code MONITORING_SOURCE_UNAVAILABLE}（{@code isError=true}），
+     * 而不是写成 {@code MONITORING_SNAPSHOT_NOT_FOUND + "source":null}。</p>
+     *
+     * @return 来源标识，<b>必须非 null</b>
      */
     SnapshotOrigin origin();
 }

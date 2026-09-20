@@ -5,7 +5,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import io.modelcontextprotocol.client.McpSyncClient;
 import io.modelcontextprotocol.server.transport.WebMvcStreamableServerTransportProvider;
 import java.time.Duration;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -99,48 +101,67 @@ class MonitoringMcpSessionTests {
     }
 
     /**
-     * 真实 SDK 客户端 {@code close()} 之后，服务端不再保留会话。
+     * 真实 SDK 客户端 {@code close()} 之后，服务端不再保留<b>它自己的那一个</b>会话。
      *
      * <p>这是 FD-0015 里「测试 JVM 退不出去」的直接原因：会话留着，它打开的流也留着，
      * 上下文关闭时 Tomcat 优雅关停就在等这个活跃请求。</p>
      *
      * <p>SDK 的 {@code close()} 是<b>异步</b>的：它发出 {@code DELETE /mcp} 之后不等响应
-     * （实测：close 返回瞬间会话还在，250 ms 内消失）。因此这里等的是「收敛」本身，
-     * 用的是有界轮询（最多 5 秒、每 25 ms 一次）而不是「把超时调大」：
-     * 会话如果真的留下来，本测试会在 5 秒后失败，而不是被放过。</p>
+     * （实测：close 返回瞬间会话还在，250 ms 内消失）。因此这里用有界轮询（最多 5 秒、
+     * 每 25 ms 一次）等待<b>这个具体会话标识</b>消失；超时不会把测试变成通过 ——
+     * 紧随其后的断言会以「这个标识还在」失败。</p>
+     *
+     * <p><b>为什么按标识而不是按会话总数</b>：同一个 Spring 上下文被多个测试类共享，
+     * 别处（或同上下文里上一个用例）异步关闭中的会话会让「总数回到 before」成为一条
+     * 有竞态的断言 —— 别人先关掉一个会话，就会让本用例的结论变得不可信。
+     * 只关心本用例新建的那个标识，其他会话的来去都不影响结论。</p>
+     *
+     * @throws Exception 等待被打断
      */
     @Test
     void closingARealSdkClientLeavesNoLiveServerSideSession() throws Exception {
-        int before = liveSessions().size();
+        Object sessionId = openClientAndReturnItsNewSessionId();
+
+        awaitSessionGone(sessionId);
+
+        assertThat(liveSessions())
+                .as("客户端 close() 必须真的结束它自己的会话 %s，不能留下悬挂的会话与流", sessionId)
+                .doesNotContainKey(sessionId);
+    }
+
+    /**
+     * 建一个真实 SDK 客户端、完成初始化、再 {@code close()}，返回它在服务端会话表里新增的那个标识。
+     *
+     * @return 本次新建的会话标识
+     */
+    private Object openClientAndReturnItsNewSessionId() {
+        Set<Object> sessionsBefore = new HashSet<>(liveSessions().keySet());
 
         try (McpSyncClient client = MonitoringMcpTestClient.connect(this.port)) {
             client.initialize();
 
-            assertThat(liveSessions().size())
-                    .as("会话建立后，服务端必须真的持有它（否则本测试没有意义）")
-                    .isEqualTo(before + 1);
+            Set<Object> added = new HashSet<>(liveSessions().keySet());
+            added.removeAll(sessionsBefore);
+
+            assertThat(added)
+                    .as("会话建立后，服务端必须真的新增恰好一个会话（否则「它消失了」无从谈起）")
+                    .hasSize(1);
+            return added.iterator().next();
         }
-
-        awaitSessionCount(before);
-
-        assertThat(liveSessions().size())
-                .as("客户端 close() 必须真的结束服务端会话，不能留下悬挂的会话与流")
-                .isEqualTo(before);
     }
 
     /**
-     * 等待服务端会话表收敛到期望条数（有界轮询，超时即失败）。
+     * 有界等待某个具体会话标识从服务端会话表里消失（最多 5 秒、每 25 ms 一次）。
      *
-     * @param expected 期望的会话条数
+     * <p>超时后<b>不</b>吞掉失败：调用方的断言会给出结论。</p>
+     *
+     * @param sessionId 要等待消失的会话标识
      * @throws InterruptedException 等待被打断
      */
-    private void awaitSessionCount(int expected) throws InterruptedException {
+    private void awaitSessionGone(Object sessionId) throws InterruptedException {
         long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
 
-        while (System.nanoTime() < deadline) {
-            if (liveSessions().size() == expected) {
-                return;
-            }
+        while (System.nanoTime() < deadline && liveSessions().containsKey(sessionId)) {
             Thread.sleep(25);
         }
     }
@@ -149,14 +170,18 @@ class MonitoringMcpSessionTests {
      * 读取服务端会话表（SDK 0.17 的 Streamable HTTP 传输层把它放在私有字段里，
      * 因此这里用 {@code ReflectionTestUtils}；字段改名会让本测试直接失败，而不是悄悄跳过）。
      *
+     * <p>返回 {@code Map<Object, Object>} 而不是通配类型：本类要按具体会话标识（key）做断言，
+     * 通配类型会让 key 变成 capture，无法把「刚从表里取出来的那个标识」再传回去比对。</p>
+     *
      * @return 服务端当前的会话表
      */
-    private Map<?, ?> liveSessions() {
+    @SuppressWarnings("unchecked")
+    private Map<Object, Object> liveSessions() {
         Object sessions = ReflectionTestUtils.getField(this.transportProvider, "sessions");
 
         assertThat(sessions)
                 .as("找不到会话表说明 SDK 的内部结构变了，本测试必须显式失败")
                 .isInstanceOf(Map.class);
-        return (Map<?, ?>) sessions;
+        return (Map<Object, Object>) sessions;
     }
 }

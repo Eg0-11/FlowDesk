@@ -263,6 +263,44 @@ class MonitoringSnapshotGetToolTest {
                 .contains("MONITORING_SOURCE_UNAVAILABLE");
     }
 
+    /**
+     * 非法数据源响应：未命中却给不出来源（{@code origin()} 返回 {@code null}）。
+     *
+     * <p>它<b>不得</b>变成「未找到 + source:null」——那是一条自相矛盾的答案。
+     * 正确的收口是 {@code isError=true} + 稳定且<b>已存在</b>的
+     * {@code MONITORING_SOURCE_UNAVAILABLE}（不新增错误码），内容里不出现 {@code null}、
+     * 不出现「未找到」、也不回显输入。</p>
+     *
+     * @throws Exception 载荷解析失败
+     */
+    @Test
+    void aNullOriginIsAnIllegalSourceResponseAndNeverBecomesANullSource() throws Exception {
+        ToolCallback nullOrigin = new MonitoringSnapshotGetTool(new NullOriginSnapshotSource());
+
+        Throwable thrown = catchThrowable(() -> nullOrigin.call("{\"assetId\":\"AST-900001\"}"));
+
+        assertThat(thrown)
+                .as("非法响应属于执行失败，不能返回 isError=false 的「未找到」")
+                .isInstanceOf(MonitoringToolException.class);
+        assertThat(((MonitoringToolException) thrown).error())
+                .as("复用既有错误码，不新增")
+                .isEqualTo(MonitoringToolError.MONITORING_SOURCE_UNAVAILABLE);
+
+        String content = thrown.getMessage();
+        assertThat(content)
+                .as("内容就是固定的 MONITORING_SOURCE_UNAVAILABLE 载荷")
+                .isEqualTo(MonitoringToolError.MONITORING_SOURCE_UNAVAILABLE.content());
+        assertThat(content)
+                .as("不得出现 null、不得出现「未找到」，也不回显输入")
+                .doesNotContain("null")
+                .doesNotContain(MonitoringSnapshotGetTool.RESULT_NOT_FOUND)
+                .doesNotContain("\"found\"")
+                .doesNotContain("AST-900001");
+
+        JsonNode payload = MAPPER.readTree(content);
+        assertThat(payload.fieldNames()).toIterable().containsExactly("error", "message");
+    }
+
     // ---------- 内容形状 ----------
 
     @Test
@@ -330,6 +368,20 @@ class MonitoringSnapshotGetToolTest {
         @Override
         public SnapshotOrigin origin() {
             return SnapshotOrigin.REAL;
+        }
+    }
+
+    /** 未命中且<b>给不出来源</b>（{@code origin()} 返回 {@code null}）的非法数据源替身。 */
+    private static final class NullOriginSnapshotSource implements MonitoringSnapshotSource {
+
+        @Override
+        public Optional<MonitoringSnapshot> findSnapshotById(String assetId) {
+            return Optional.empty();
+        }
+
+        @Override
+        public SnapshotOrigin origin() {
+            return null;
         }
     }
 
