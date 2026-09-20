@@ -2,7 +2,39 @@ spring:
   application:
     name: flowdesk-mcp-monitoring
 
+  ai:
+    mcp:
+      server:
+        # 独立监控 MCP 服务（FD-0015）：只提供只读查询，不注册任何写工具。
+        name: flowdesk-mcp-monitoring
+        # 同步服务器 + Streamable HTTP：工具以 Spring AI ToolCallback Bean 注册（同步调用模型）。
+        type: SYNC
+        protocol: STREAMABLE
+        instructions: FlowDesk 监控快照只读查询服务：目前只提供 monitoring_snapshot_get（按资产标识查询一条监控快照）。
+        # 能力面必须与实现一致：本服务只有 tools，没有 resources / prompts / completions。
+        # Spring AI 1.1.2 里这三项的默认值都是 true，不显式关闭就会让 initialize 响应
+        # 声明出并不存在的能力。
+        capabilities:
+          tool: true
+          resource: false
+          prompt: false
+          completion: false
+        streamable-http:
+          # MCP 端点路径（唯一公开的 MCP 入口）
+          mcp-endpoint: /mcp
+          # 允许客户端用 DELETE 结束自己的 MCP 会话：这是协议层的会话清理，不是监控写操作。
+          # 设为 true 时 DELETE 会得到 405 且会话不从会话表移除，客户端 close() 之后
+          # 会话与它打开的流仍然活着，关闭上下文时 Tomcat 优雅关停会一直等活跃请求，
+          # 测试 JVM 因此无法在 30 秒内退出并被 Surefire 强杀。
+          disallow-delete: false
+
 server:
+  # 只监听本机回环地址。这不是「默认值而已」：server.address 必须是字面量回环地址
+  # （127.0.0.0/8 的完整四段十进制写法，或 IPv6 回环 ::1），否则应用启动失败。
+  # 主闸门 MonitoringMcpBindingGuard（经 META-INF/spring.factories 注册）在环境准备阶段就拒绝，
+  # 那时还没有创建 Web 服务器；MonitoringMcpConfiguration 的装配期校验是第二道闸门。
+  # 判定只做字面匹配、不做 DNS 解析，因此 0.0.0.0 / 外网地址 / 主机名（含 localhost）都被拒绝。
+  address: 127.0.0.1
   port: 8092
 
 management:
@@ -10,3 +42,12 @@ management:
     web:
       exposure:
         include: health,info
+
+flowdesk:
+  monitoring:
+    source:
+      # unavailable（默认）：本阶段没有真实监控系统，monitoring_snapshot_get 返回稳定的
+      #   MONITORING_SOURCE_UNAVAILABLE，绝不用虚构数据冒充真实监控。
+      # demo：内置少量固定虚构快照（结果里 source=DEMO），仅供演示与自动化测试。
+      # 只接受这两个精确值：未知值、大小写变体（DEMO/Demo）与带空白的值一律启动失败。
+      mode: unavailable

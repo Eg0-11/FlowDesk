@@ -1,0 +1,154 @@
+package com.flowdesk.mcp.monitoring.config;
+
+import com.flowdesk.mcp.monitoring.snapshot.DemoSnapshotSource;
+import com.flowdesk.mcp.monitoring.snapshot.MonitoringSnapshotSource;
+import com.flowdesk.mcp.monitoring.snapshot.UnavailableSnapshotSource;
+import com.flowdesk.mcp.monitoring.tool.MonitoringSnapshotGetTool;
+import com.flowdesk.mcp.monitoring.transport.McpErrorJsonSerializer;
+import com.flowdesk.mcp.monitoring.transport.McpRequestGateFilter;
+import com.flowdesk.mcp.monitoring.transport.McpTransportState;
+import io.modelcontextprotocol.spec.McpStreamableServerTransportProvider;
+import org.springframework.ai.tool.ToolCallback;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.jackson.Jackson2ObjectMapperBuilderCustomizer;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.env.Environment;
+
+/**
+ * 监控 MCP 服务的装配（FD-0015）。
+ *
+ * <p>分工：</p>
+ * <ul>
+ *   <li>{@link MonitoringSnapshotSource}：监控快照查询端口 —— 按
+ *       {@code flowdesk.monitoring.source.mode} 装配演示数据或「不可用」实现；</li>
+ *   <li>{@link MonitoringSnapshotGetTool}：协议适配层，产出唯一的 MCP 工具规格；</li>
+ *   <li>本类：把两者接起来，并守住安全边界（只监听回环、拒绝带 Origin 的请求、
+ *       传输层入口闸门）。</li>
+ * </ul>
+ *
+ * <p>只注册<b>一个</b>工具规格（{@code monitoring_snapshot_get}）：本模块只有一个
+ * {@link ToolCallback} Bean，而 MCP Server starter 只从 {@code ToolCallback} /
+ * {@code ToolCallbackProvider} Bean 收集工具，因此「注册几个」在这里是显式且可数的。</p>
+ */
+@Configuration(proxyBeanMethods = false)
+@EnableConfigurationProperties(MonitoringSourceProperties.class)
+public class MonitoringMcpConfiguration {
+
+    /**
+     * 监控快照查询端口。
+     *
+     * <p>默认（{@code mode=unavailable}）装配「每次查询都明确失败」的实现 ——
+     * 本阶段没有真实监控系统，工具会返回稳定的 {@code MONITORING_SOURCE_UNAVAILABLE}，
+     * 而不是把虚构数据冒充真实监控。演示数据必须显式开启。</p>
+     *
+     * @param properties 数据源配置
+     * @return 监控快照查询端口
+     */
+    @Bean
+    public MonitoringSnapshotSource monitoringSnapshotSource(MonitoringSourceProperties properties) {
+        // 严格解析：未知、大小写错误或带空白的值都在这里让启动失败
+        return properties.resolvedMode() == MonitoringSourceProperties.Mode.DEMO
+                ? new DemoSnapshotSource()
+                : new UnavailableSnapshotSource();
+    }
+
+    /**
+     * 唯一的 MCP 工具（{@code monitoring_snapshot_get}，只读）。
+     *
+     * <p>注册的是 Spring AI 的 {@link ToolCallback}：MCP Server starter 会把容器里的
+     * {@code ToolCallback} Bean 转换成 MCP 工具规格并挂到服务器上（实现见
+     * {@code ToolCallbackConverterAutoConfiguration.syncTools}）。因此「注册几个工具」在这里
+     * 显式且可数 —— 本模块只有这一个 Bean，没有写工具。</p>
+     *
+     * @param source 监控快照查询端口
+     * @return 工具回调
+     */
+    @Bean
+    public ToolCallback monitoringSnapshotGetTool(MonitoringSnapshotSource source) {
+        return new MonitoringSnapshotGetTool(source);
+    }
+
+    /**
+     * 启动期校验：监听地址必须是字面量回环地址，且数据源模式合法（第二道闸门）。
+     *
+     * <p><b>第一道闸门是 {@link MonitoringMcpBindingGuard}</b>：它在环境准备阶段就拒绝，
+     * 那时还没有创建 Web 服务器、也没有绑定任何端口。这里再校验一次，用于兜住
+     * 「绕过监听器直接刷新上下文」的路径（例如自定义引导代码），两处共享同一份判定与同一条文案。</p>
+     *
+     * <p>这正是「不能只靠 application.yml 默认值」的含义：默认值只是默认，
+     * 配置覆盖必须被拦下。</p>
+     *
+     * @param environment 配置环境
+     * @return 校验通过标记
+     */
+    @Bean
+    public Boolean monitoringMcpConsistency(Environment environment) {
+        MonitoringMcpBindingGuard.requireLoopbackBinding(environment);
+        MonitoringMcpBindingGuard.requireSupportedMode(environment);
+        return Boolean.TRUE;
+    }
+
+    /**
+     * 给 MCP 端点挂上 Origin 拒绝过滤器。
+     *
+     * <p>只作用于 {@code /mcp}：健康检查等其它端点不受影响。</p>
+     *
+     * @param mcpEndpoint MCP 端点路径（与 {@code spring.ai.mcp.server.streamable-http.mcp-endpoint} 一致）
+     * @return 过滤器注册
+     */
+    @Bean
+    public FilterRegistrationBean<McpOriginRejectionFilter> mcpOriginRejectionFilter(
+            @Value("${spring.ai.mcp.server.streamable-http.mcp-endpoint:/mcp}") String mcpEndpoint) {
+
+        FilterRegistrationBean<McpOriginRejectionFilter> registration =
+                new FilterRegistrationBean<>(new McpOriginRejectionFilter());
+        registration.addUrlPatterns(mcpEndpoint);
+        registration.setName("mcpOriginRejectionFilter");
+        registration.setOrder(0);
+        return registration;
+    }
+
+    /**
+     * 给 MCP 端点挂上传输层入口闸门（FD-0015，与资产 MCP 服务已验收的基线等价）。
+     *
+     * <p>顺序在 Origin 过滤器之后：带 {@code Origin} 的浏览器请求先被 403 挡掉，
+     * 闸门只处理「已经到了 MCP 端点门口」的请求。</p>
+     *
+     * <p>闸门需要传输层状态：非 {@code initialize} 的请求只有在会话<b>活跃</b>、
+     * 协议版本受支持时，闸门才允许提前回答；否则一律放行，由传输层按自己的语义回答
+     * （缺少会话标识 → 400，伪造或已删除 → 404）。</p>
+     *
+     * @param mcpEndpoint MCP 端点路径
+     * @param transport   MCP 传输实现（Spring AI 自动装配的 Streamable HTTP provider）
+     * @return 过滤器注册
+     */
+    @Bean
+    public FilterRegistrationBean<McpRequestGateFilter> mcpRequestGateFilter(
+            @Value("${spring.ai.mcp.server.streamable-http.mcp-endpoint:/mcp}") String mcpEndpoint,
+            McpStreamableServerTransportProvider transport) {
+
+        FilterRegistrationBean<McpRequestGateFilter> registration =
+                new FilterRegistrationBean<>(new McpRequestGateFilter(new McpTransportState(transport)));
+        registration.addUrlPatterns(mcpEndpoint);
+        registration.setName("mcpRequestGateFilter");
+        registration.setOrder(1);
+        return registration;
+    }
+
+    /**
+     * 兜底：让 MCP SDK 的 {@link io.modelcontextprotocol.spec.McpError} 不再按 {@code Throwable} 序列化。
+     *
+     * <p>SDK 0.17.0 在多条错误路径上把 {@code McpError}（继承 {@code RuntimeException}）直接
+     * 当作响应体返回，Jackson 会把堆栈、类名与行号一并写出去。闸门能提前拦下的请求已经不走到这里，
+     * 这一条覆盖剩下的路径（缺会话标识、Accept 头不合法、SDK 内部异常等）。</p>
+     *
+     * @return 定制器
+     */
+    @Bean
+    public Jackson2ObjectMapperBuilderCustomizer mcpErrorSerializationCustomizer() {
+        return builder -> builder.modulesToInstall(McpErrorJsonSerializer.module());
+    }
+}

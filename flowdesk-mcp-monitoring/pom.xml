@@ -29,6 +29,18 @@
       <artifactId>spring-boot-starter-actuator</artifactId>
     </dependency>
 
+    <!--
+      MCP Server（WebMVC / Streamable HTTP）：FD-0015，与资产 MCP 服务同一条已验收基线。
+      版本由根 pom 导入的 spring-ai-bom（1.1.2）管理，此处不写版本 —— 与本仓库其它 Spring AI
+      依赖保持同一条版本基线，不单独升级 Spring AI / Spring Boot。
+      用 WebMVC 变体而不是 WebFlux：本模块本来就是 Servlet 栈（spring-boot-starter-web），
+      引入 WebFlux 会同时存在两套 Web 运行时。
+    -->
+    <dependency>
+      <groupId>org.springframework.ai</groupId>
+      <artifactId>spring-ai-starter-mcp-server-webmvc</artifactId>
+    </dependency>
+
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-test</artifactId>

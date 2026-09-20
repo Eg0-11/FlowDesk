@@ -1,6 +1,6 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0014-R4 —— 通知与请求遵守同一条协议版本规则（已完成）**
+> **当前阶段：FD-0015 —— 独立监控 MCP 服务与只读监控快照工具（已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
@@ -32,10 +32,14 @@
 > 闸门校验收口（提前回答前先确认会话**活跃**并与传输层一致、补上 `MCP-Protocol-Version`
 > 校验；缺失/伪造/已删除的会话标识改由传输层回答 400/404）（FD-0014-R3）、
 > 通知同样遵守版本规则（版本校验移到请求/通知分流之前；空白版本头按无效版本处理，
-> 通知错误体为 `id:null` + 固定文案）（FD-0014-R4）。
+> 通知错误体为 `id:null` + 固定文案）（FD-0014-R4）、
+> 独立监控 MCP 服务与只读监控快照工具（Streamable HTTP `/mcp`、唯一只读工具
+> `monitoring_snapshot_get`、固定演示快照与「未找到 ≠ 调用失败」、与资产 MCP 服务同一条安全基线；
+> **尚未接入主 Agent**）（FD-0015）。
 > 尚未实现：全文检索与混合检索、任意切片读取接口、文档列表/下载/删除、
 > 孤立文件清理任务、`PARSING`/`INDEXING` 悬挂的恢复扫描、问答的流式输出与会话记忆、
-> 游标分页、PostgreSQL 全文检索与 pg_trgm、监控 MCP 服务的能力实现、Agent Graph、鉴权与前端。
+> 游标分页、PostgreSQL 全文检索与 pg_trgm、真实资产/监控数据源、Agent 联合调用资产与监控工具、
+> Agent Graph、鉴权与前端。
 
 ## 一、项目简介
 
@@ -67,7 +71,7 @@ Tool 调用、MCP 资产/监控服务以及基于 Agent Graph 的自动化编排
 | `flowdesk-infrastructure` | 持久化与模型适配器 | 已提供 JDBC 工单存储（`…ticket.persistence.jdbc`）、DeepSeek 传输适配，以及知识文档的 JDBC 存储、本地文件系统内容读写、Tika 解析适配器、确定性切片器、DashScope 文档/查询 Embedding 适配器、pgvector 向量写入与相似度检索适配器、DashScope 文本重排适配器（`…knowledge.*`） |
 | `flowdesk-bootstrap` | FlowDesk 主服务启动模块（Web + Validation + Actuator + AI 接口 + 工单 REST 接口 + 知识文档 REST 接口 + 知识检索接口 + 知识问答接口） | 可启动，端口 8080 |
 | `flowdesk-mcp-asset` | 独立资产 MCP 服务（Web + Actuator + MCP Streamable HTTP `/mcp`） | 可启动，端口 8091；已实现 `asset_get` 只读查询工具（演示/不可用两种数据源模式） |
-| `flowdesk-mcp-monitoring` | 独立监控 MCP 服务（Web + Actuator） | 可启动，端口 8092 |
+| `flowdesk-mcp-monitoring` | 独立监控 MCP 服务（Web + Actuator + MCP Streamable HTTP `/mcp`） | 可启动，端口 8092；已实现 `monitoring_snapshot_get` 只读查询工具（演示/不可用两种数据源模式） |
 
 ## 三、模块依赖关系
 
@@ -100,7 +104,7 @@ flowdesk-mcp-monitoring     ← 只依赖 flowdesk-shared
 | JDK | 17（Release 固定 17，Enforcer 校验 `[17,18)`） |
 | Maven | 3.9+（Enforcer 校验 `[3.9,)`） |
 | Spring Boot | 3.5.8（父 POM + BOM） |
-| Spring AI | 1.1.2（BOM 管理；实际使用 `spring-ai-client-chat`、`spring-ai-starter-model-openai` 与 `spring-ai-starter-mcp-server-webmvc`（FD-0014，随附 MCP Java SDK 0.17.0，版本由 BOM 管理，未手工指定版本）） |
+| Spring AI | 1.1.2（BOM 管理；实际使用 `spring-ai-client-chat`、`spring-ai-starter-model-openai` 与 `spring-ai-starter-mcp-server-webmvc`（FD-0014 资产 MCP 服务与 FD-0015 监控 MCP 服务共用，随附 MCP Java SDK 0.17.0，版本由 BOM 管理，未手工指定版本）） |
 | Spring AI Alibaba | 1.1.2.2（BOM 管理；实际使用 `spring-ai-alibaba-starter-dashscope`，只在 `dashscope-embedding` profile 下提供 `EmbeddingModel`；Agent Framework 留待后续阶段） |
 | Spring AI Alibaba Extensions | 1.1.2.2（**仅导入 BOM**） |
 | DeepSeek 传输 | OpenAI 兼容 Chat Completions（`spring-ai-starter-model-openai`，见 [ADR 0001](docs/adr/0001-deepseek-openai-compatible-transport.md)） |
@@ -133,7 +137,7 @@ mvnw.cmd clean package
 | --- | --- | --- | --- |
 | FlowDesk 主服务 | `flowdesk-bootstrap` | 8080 | `http://localhost:8080/actuator/health` |
 | 资产 MCP 服务 | `flowdesk-mcp-asset` | 8091（**只监听 `127.0.0.1`**，MCP 端点为 `/mcp`） | `http://127.0.0.1:8091/actuator/health` |
-| 监控 MCP 服务 | `flowdesk-mcp-monitoring` | 8092 | `http://localhost:8092/actuator/health` |
+| 监控 MCP 服务 | `flowdesk-mcp-monitoring` | 8092（**只监听 `127.0.0.1`**，MCP 端点为 `/mcp`） | `http://127.0.0.1:8092/actuator/health` |
 
 启动方式（示例）：
 
@@ -751,11 +755,12 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0014-R2 | 传输层收口：畸形报文回固定协议错误（无堆栈/类名/路径/原始异常消息）、非对象 `arguments` 回明确的 `-32602`、未实现方法回 `-32601` 且响应流有界 | ✅ 已完成 |
 | FD-0014-R3 | 闸门校验收口：提前回答前必须会话**活跃**（缺失/伪造/已删除一律交传输层回 400/404）、补 `MCP-Protocol-Version` 校验 | ✅ 已完成 |
 | FD-0014-R4 | 通知同样遵守版本规则：版本校验移到请求/通知分流之前（通知也回 400、`id:null`）、空白版本头按无效版本处理 | ✅ 已完成 |
+| FD-0015 | 独立监控 MCP 服务：Streamable HTTP `/mcp` + 只读工具 `monitoring_snapshot_get` + 固定演示快照 + 与资产服务同一条安全基线（尚未接入主 Agent） | ✅ 已完成 |
 | 后续 | 问答流式输出与会话记忆（当前为一次性完整响应、无历史轮次） | 未开始 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm`（混合检索） | 未开始 |
 | 后续 | 孤立文件清理任务 | 未开始 |
 | 后续 | Tool 体系扩展：面向工单与知识的工具注册 | 未开始 |
-| 后续 | MCP：监控 MCP 服务的能力实现（资产 MCP 服务已由 FD-0014 交付，见第二十一章） | 未开始 |
+| 后续 | MCP：Agent 联合调用资产与监控工具（两个 MCP 服务均已交付：资产见第二十一章、监控见第二十二章） | 未开始 |
 | 后续 | Agent Graph：基于 Spring AI Alibaba Agent Framework 的多节点编排 | 未开始 |
 
 ## 十四、真实验证状态（重要）
@@ -775,6 +780,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | 资产 MCP 传输层收口证据（FD-0014-R2） | ✅ 已执行 | **基线先复现，再验收**（真实 HTTP + 真实流读取，1.2 秒窗口观察 EOF）：修复前 `resources/list`/`prompts/list`/`completion/complete`/`foo/bar` 四条请求的 200 响应流**永不结束**、非对象 `arguments` 是 **500 空响应**、畸形 JSON/顶层数组/缺 `method`/缺会话标识四种 400 响应体**含 `stackTrace` 与服务端类名行号**，并且该 JVM 退出时被 Surefire 强杀；修复后：畸形报文 → 400 + `-32700 Parse error`（同样的输入两次逐字节相同），非 JSON-RPC 报文（数组/裸字符串/数字/`null`/缺 `method`/`jsonrpc` 版本不符/两段拼接）→ 400 + `-32600`（两段拼接按 `-32700`），非对象 `arguments`（字符串/数组/数字/布尔/`null`）与形状不合法的 `params` → **200 + `-32602`** 且**工具与资产目录零调用**（计数目录 + 工具日志两条互补证据，另有正向对照证明计数有效），未实现的 7 个方法（含 `resources/templates/list`、`tools/delete`）→ **200 + `-32601 Method not found: <方法名>`，响应流在秒级窗口内 EOF**，形状异常的方法名不回显；所有错误响应体都通过**负向泄漏断言**（不含 `stackTrace`/`cause`/`lineNumber`/`nativeMethod`/`java.lang.`/`io.modelcontextprotocol`/`org.springframework`/`com.flowdesk`/`.java`/`Exception`/路径/配置字样，也不回显输入），SDK 自身错误路径（缺会话标识 400、未知会话 404）同样是固定 `{"code":-32600,"message":"Invalid request"}`；回归：`initialize`/握手通知 202/`ping`/`tools/list`/`asset_get` 命中与工具层错误（`isError=true` + `INVALID_ASSET_ID`）/未注册工具名仍为 `-32602`/`Origin` 403/回环绑定/SDK `close()` 与 `DELETE` 会话清理全部不变，被拒绝的方法之后同一会话仍能正常调用工具并正常结束会话；关停时间：模块跑与全仓跑的 `Commencing graceful shutdown` → `Graceful shutdown complete` 均为**毫秒级**，四次运行**无强杀、无 30 秒等待、无新 JVM dump** |
 | 闸门会话与版本校验证据（FD-0014-R3） | ✅ 已执行 | **真实 HTTP 覆盖两条提前回答路径**（未实现方法 `resources/list`、非法 `tools/call` 参数）：基线先复现绕过 —— 无会话标识 / 伪造 / 空串 / 已 `DELETE` 的会话标识下闸门都回 `200` + `-32601`/`-32602`，而传输层对同样请求实测为 `400`（缺会话标识）/ `404`（会话不存在）；修复后：三种无效会话（缺失、伪造、已删除）与空串会话下，两条路径都由**传输层**回答（400/404 + 固定脱敏 `{"code":-32600,"message":"Invalid request"}`，无 `stackTrace`/类名/路径，且断言响应体**不含** `Method not found`/`Invalid params`/`Unsupported protocol version`，证明闸门没有提前回答），删除场景先断言「删除前活跃会话确实走闸门」再断言删除后不再走；**协议版本**：活跃会话 + `1999-01-01` → 400 + 固定 `Unsupported protocol version`（两条路径各自覆盖，且不落到方法分派），传输层公布的 `[2024-11-05, 2025-03-26, 2025-06-18]` 逐个被接受（两条路径各断言 `-32601`/`-32602`），缺省版本头同样被接受，握手请求带不受支持版本**不被拒**（版本在会话里协商）；**未受影响**：`initialize` 200 + 会话标识、握手通知 202、`ping`/`tools/list` 200、`asset_get` 命中 `isError=false`、工具层错误 `isError=true` + `INVALID_ASSET_ID`、`DELETE` 200 全部照旧 |
 | 通知协议版本证据（FD-0014-R4） | ✅ 已执行 | **真实 HTTP**：活跃会话 + 不受支持版本（`1999-01-01`）时，`notifications/initialized` 与普通通知（`foo/notify`）**都返回 400**，响应体为 `{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Unsupported protocol version"}}`（通知 `id` 为 `null`、固定错误码与固定文案、不回显版本值、无 `stackTrace`/类名/路径、响应有界），同时 `tools/list` 也返回 400（回显 `id`）；**正向对照**：传输层公布的每个版本（`2024-11-05`/`2025-03-26`/`2025-06-18`）下通知都是 202、`tools/list` 都是 200 且含 `asset_get`，**缺省版本头**同样如此；**空白版本头**（空串、`" "`、`"   "`，实测 Servlet 容器原样交给应用）按无效版本返回 400 而不是当作缺失；**优先级不变**：无会话标识 + 不受支持版本仍由传输层回 400 `Invalid request`，伪造/已删除会话仍回 404，均不含版本错误文案；被拒的通知不会破坏会话（随后缺省版本通知 202、工具调用照常、`DELETE` 200）；`initialize` 带不受支持版本仍 200（版本在会话里协商） |
+| 监控 MCP 服务证据（FD-0015） | ✅ 已执行 | **真实 MCP 客户端 + 真实 Streamable HTTP**（官方 SDK 客户端连真实启动的进程）：`initialize` 成功、`tools/list` **恰好一个** `monitoring_snapshot_get`（无写工具）、命中两条固定演示记录（`AST-900001` → `observedAt=2026-01-01T00:00:00Z`/`DEGRADED`/92/68/1、`AST-900002` → `HEALTHY`/18/35/0，字段顺序断言为 `assetId,observedAt,health,cpuUtilizationPercent,memoryUtilizationPercent,activeAlertCount,source`，且同样输入两次逐字节相同）、`AST-900003` 返回 `isError=false` + `MONITORING_SNAPSHOT_NOT_FOUND` + `source=DEMO`（**「没有快照」不是工具失败**）、非法 assetId（空/空白/位数不符/小写/含空格/超长）与缺失字段、非字符串字段、**额外字段**、非对象入参一律 `isError=true` + 固定 `INVALID_ASSET_ID` 且错误内容与固定文案**逐字相等**（因此同时排除回显输入）；**纯 Java 层**：18 条快照不变量与记录形状用例（id 形态、`observedAt`/`health`/origin 非空、百分比 `0..100` 越界即构造失败、告警数非负、`health` 恰好四个枚举值、记录组件恰好七个）、9 条端口契约用例（接口上无写方法、演示数据固定且都带 `DEMO`、`AST-900003` 无快照、不可用数据源抛固定文案异常而不是返回空）、17 条工具契约用例（同一条 schema 与执行校验的 pattern/maxLength 一致性、命中/未找到、命中来源取自记录本身而不是数据源自称的 origin、四类失败形状、错误内容本身是合法 JSON）；**模式严格性**：默认 `unavailable`、显式 `demo` 可启动、`DEMO`/`Demo`/` demo `/`real`/空值等一律**启动失败**且错误信息不回显配置值，并且拒绝发生在**创建 Web 服务器之前**；**安全基线**：`Origin` 任意值 → 固定 403（`/actuator/health` 带同样的 `Origin` 仍为 200，证明过滤器只作用于 `/mcp`）、非回环 `server.address` 启动失败、交付配置锁定为端口 `8092` + 回环 `127.0.0.1` + 端点 `/mcp` + 默认 `unavailable`、能力声明实测为 `tools` + SDK 强加的 `logging`（`resources`/`prompts`/`completions` 已关闭且容器内无对应处理器）、`DELETE /mcp` 200 结束会话、未实现方法/非对象 `arguments`/畸形报文 → 固定脱敏且有界的 `-32601`/`-32602`/`-32700`、缺失/伪造/空白/已删除会话保持 400/404、请求与通知都执行版本校验（缺失版本头兼容）；**日志脱敏**：命中、未找到与内部异常三条路径的日志都断言不含 assetId、监控数值、演示记录正文、异常消息与堆栈（只出现稳定错误码与异常类名）；测试全部使用本机回环与固定虚构数据，**不访问任何真实监控系统或外部网络** |
 | PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证**；pgvector 集成测试（Testcontainers，镜像固定为带扩展版本的 `pgvector/pgvector:0.8.6-pg16`）在无 Docker 时跳过（当前跳过 26 条：15 条索引写入 + 11 条相似度检索），报告标注 POSTGRESQL_PGVECTOR_IT=NOT_RUN |
 | 真实 DashScope Embedding | ⚠️ **DASHSCOPE_LIVE=NOT_RUN** | 无 DASHSCOPE_API_KEY，**未对真实向量服务发起过任何请求**；全部自动化测试都不访问真实上游 |
 | 真实 DeepSeek | ⚠️ **LIVE_SMOKE=NOT_RUN** | 无 `DEEPSEEK_API_KEY`，**未对真实模型发起过任何请求** |
@@ -2255,3 +2261,155 @@ MCP SDK 0.17.0 的传输实现在三类请求上会给出**不可接受**的响�
 
 > 完整的最小复现、基线实测表与备选方案（升级依赖 / 劫持同名类 / 自写传输层）的影响评估，
 > 见 [`docs/adr/0011-asset-mcp-server-protocol-and-tool.md`](docs/adr/0011-asset-mcp-server-protocol-and-tool.md) 的 FD-0014-R2 与 FD-0014-R3 章节。
+
+## 二十二、独立监控 MCP 服务（FD-0015）
+
+设计取舍见 [`docs/adr/0012-monitoring-mcp-server.md`](docs/adr/0012-monitoring-mcp-server.md)。
+
+本阶段把 `flowdesk-mcp-monitoring` 从「只有健康检查的 Web 骨架」变成**可被 MCP 客户端连接**的
+独立服务：`initialize` → `tools/list` → `tools/call`，只暴露**一个只读工具**
+`monitoring_snapshot_get`，按资产标识查询该资产的一条监控快照。
+
+> **边界先行**：本阶段只做**协议、工具契约与安全基线**。**没有**接入真实监控系统，
+> 也**没有**接入主 Agent —— 工具不会注册到 DeepSeek ChatClient，RAG 问答也不会自动调用它，
+> 更不会「联合调用」资产与监控工具（那是后续阶段的事）。
+
+| 项 | 值 |
+| --- | --- |
+| 模块 | `flowdesk-mcp-monitoring`（只依赖 `flowdesk-shared`，**不依赖资产 MCP 模块或主服务**） |
+| Starter | `spring-ai-starter-mcp-server-webmvc`（Spring AI 1.1.2，版本由既有 BOM 管理） |
+| 传输 | **Streamable HTTP**（`spring.ai.mcp.server.protocol=STREAMABLE`，`type=SYNC`） |
+| 端点 | `POST /mcp`（`spring.ai.mcp.server.streamable-http.mcp-endpoint=/mcp`） |
+| 端口 / 监听 | `8092`，且**只监听 `127.0.0.1`** |
+| 工具 | 恰好一个：`monitoring_snapshot_get`（只读） |
+| 健康检查 | `GET /actuator/health` |
+
+### 22.1 工具契约（`monitoring_snapshot_get`）
+
+输入（`tools/list` 里的 input schema）：
+
+```json
+{"type":"object",
+ "properties":{"assetId":{"type":"string","description":"资产标识，格式为 AST- 加 6 位数字，例如 AST-900001",
+                          "pattern":"^AST-[0-9]{6}$","maxLength":10}},
+ "required":["assetId"],
+ "additionalProperties":false}
+```
+
+- 唯一入参 `assetId`，**必填**；格式固定 `AST-[0-9]{6}`（大写前缀 + 恰好六位数字）；
+- **不 trim、不做大小写归一**：`" AST-900001"`、`ast-900001` 都是非法输入，而不是被「修好」再用；
+- 入参必须**恰好**是「只含一个 `assetId` 字符串字段的 JSON 对象」：额外字段、字段名写错、
+  非对象（数组/字符串/数字/布尔/`null`）、`assetId` 非字符串、畸形 JSON、**两段 JSON 拼接**
+  全部拒绝；
+- 公布的 schema 与运行时校验**完全一致**：`pattern` 是锚定的（JSON Schema 的 `pattern` 是部分匹配，
+  不锚定就会比执行校验更宽松），`pattern`/`maxLength` 直接取自 `AssetId` 常量；
+- **没有**任何写工具（上报/修改监控数据在本阶段不可表达），底层端口也没有写方法。
+
+输出（MCP `CallToolResult` 的单个 text content，四种固定形状）：
+
+| 情形 | `isError` | 内容 |
+| --- | --- | --- |
+| 命中 | `false` | `{"assetId":"AST-900001","observedAt":"2026-01-01T00:00:00Z","health":"DEGRADED","cpuUtilizationPercent":92,"memoryUtilizationPercent":68,"activeAlertCount":1,"source":"DEMO"}` |
+| 合法但没有快照 | `false` | `{"assetId":"AST-900003","found":false,"error":"MONITORING_SNAPSHOT_NOT_FOUND","message":"未找到该资产的监控快照","source":"DEMO"}` |
+| 输入非法 | `true` | `{"error":"INVALID_ASSET_ID","message":"assetId 必须形如 AST-000001（AST- 加 6 位数字）"}` |
+| 数据源不可用 / 内部异常 | `true` | `{"error":"MONITORING_SOURCE_UNAVAILABLE","message":"监控数据源当前不可用"}` |
+
+命中结果的**字段顺序固定**为 `assetId`、`observedAt`、`health`、`cpuUtilizationPercent`、
+`memoryUtilizationPercent`、`activeAlertCount`、`source`；`observedAt` 来自数据源的**固定时刻**，
+工具不读系统当前时间，因此同样输入永远得到逐字节相同的输出。
+
+**「未找到」不是「工具执行失败」**：`isError` 表达的是「这次**调用**有没有失败」，
+不是「查询结果好不好」。「这个资产没有快照」是查询正常给出的答案；标成错误会让调用方
+以为工具坏了而重试或降级。真正的执行失败（输入非法、数据源不可用、内部异常）才置 `isError=true`。
+「未找到」也带 `source`（演示数据说没有 ≠ 真实监控系统说没有）；
+数据源不可用时**不产生任何来源声明**。
+
+**数据与错误内容都不泄漏**：快照字段由不可变类型限定（`health` 只能是四个枚举值、
+百分比 `0..100`、告警数 `>= 0`、`observedAt` 必须是合法 `Instant`，否则构造即失败），
+类型上**没有** IP、主机名、内部地址、凭证或异常信息的字段；错误文案来自固定枚举，
+不含路径、配置、凭据、异常消息或堆栈。日志只记操作、稳定结果码、耗时与异常**类名**。
+
+### 22.2 数据源：默认「不可用」，演示数据必须显式打开
+
+```yaml
+flowdesk:
+  monitoring:
+    source:
+      mode: unavailable   # 默认；也可以显式设为 demo
+```
+
+| 模式 | 行为 |
+| --- | --- |
+| `unavailable`（**默认**） | 没有真实数据源：每次查询都以稳定的 `MONITORING_SOURCE_UNAVAILABLE` 失败（`isError=true`）。**不会**用虚构数据冒充真实监控，也**不会**返回「没有快照」这种业务结论 |
+| `demo` | 内置两条固定虚构快照，所有结果都带 `source=DEMO` |
+
+**模式值严格匹配**：只接受精确的 `unavailable` 与 `demo`；未知值（`real`）、大小写变体
+（`DEMO`/`Demo`）、带空白的值（`" demo "`）**一律启动失败**，而且拒绝发生在
+**创建 Web 服务器之前**。这一点与枚举绑定不同 —— Spring Boot 的宽松绑定会把
+`DEMO`/`Demo`/`demo` 视作同一个常量，本模块刻意不做这种宽容。
+
+固定演示记录（`observedAt` 是固定时刻，不读系统时间）：
+
+| assetId | health | CPU | 内存 | 告警数 | observedAt |
+| --- | --- | --- | --- | --- | --- |
+| `AST-900001` | `DEGRADED` | 92 | 68 | 1 | `2026-01-01T00:00:00Z` |
+| `AST-900002` | `HEALTHY` | 18 | 35 | 0 | `2026-01-01T00:05:00Z` |
+| `AST-900003` | — | — | — | — | 刻意**没有**快照，用于验证「合法但未找到」 |
+
+### 22.3 启动与调用
+
+```powershell
+# 1) 打包并启动（默认模式：没有数据源）
+.\mvnw.cmd clean package
+java -jar flowdesk-mcp-monitoring/target/flowdesk-mcp-monitoring-0.1.0-SNAPSHOT.jar
+
+# 2) 演示模式（可选）：进程级参数显式打开
+java -jar flowdesk-mcp-monitoring/target/flowdesk-mcp-monitoring-0.1.0-SNAPSHOT.jar `
+     --flowdesk.monitoring.source.mode=demo
+
+# 3) 健康检查
+curl.exe http://127.0.0.1:8092/actuator/health
+```
+
+MCP 客户端的连接信息：**URL = `http://127.0.0.1:8092/mcp`**，传输 = Streamable HTTP，
+不需要任何鉴权头（本阶段没有鉴权，因此严格限制在本机回环）。请求示例：
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call",
+ "params":{"name":"monitoring_snapshot_get","arguments":{"assetId":"AST-900001"}}}
+```
+
+### 22.4 安全边界
+
+监控服务与资产 MCP 服务**同一条基线**（逐条对照见第二十一章 21.6 与 ADR 0012）：
+
+- **只监听本机回环**：`server.address` 必须是无歧义的回环字面量，否则在**创建 Web 服务器之前**
+  启动失败；判定只做字面匹配、不做 DNS 解析；
+- **浏览器跨源一律 403**：`/mcp` 请求带任意 `Origin`（含 `null`）→ 固定 problem + `ORIGIN_NOT_ALLOWED`，
+  不配置宽松 CORS，Actuator 不受影响；
+- **能力面与实现一致**：只声明 `tools`，显式关闭 `resources`/`prompts`/`completions`
+  （容器里也没有对应处理器）。**`logging` 关不掉**：MCP Java SDK 0.17.0 无条件声明它，
+  无开关 —— 因此真实能力集是 `tools` + `logging`，如实记录；
+- **会话可清理**：允许 `DELETE /mcp`；拒绝它会让会话与其响应流一直存活，
+  关停时 Tomcat 优雅关停等满 30 秒、测试 JVM 被 Surefire 强杀；
+- **协议错误固定、脱敏、有界**：畸形报文 `-32700`、不是 JSON-RPC 请求 `-32600`、
+  未实现方法 `-32601`、非法 `tools/call` 参数 `-32602`，都是普通 JSON（流立即结束）、
+  不含堆栈/类名/路径/配置，且不回显输入；
+- **会话与协议版本校验**：非 `initialize` 的请求必须带**活跃**会话（缺失 → 400、伪造/空白/已删除 → 404），
+  版本校验在「会话之后、请求/通知分流之前」，请求与通知同规则（缺失版本头兼容、空白或不支持的值 → 400）。
+
+> 这些组件在本模块内**各自实现了一份等价代码**（闸门、传输层状态查询、固定协议错误、
+> `McpError` 安全序列化、回环策略与 Origin 过滤器）。代码重复的原因与将来抽取
+> `flowdesk-mcp-support` 公共模块的触发条件，写在 ADR 0012 里。
+
+### 22.5 已知边界
+
+1. **没有真实监控数据源**：默认模式返回 `MONITORING_SOURCE_UNAVAILABLE`，未接入任何监控系统；
+2. **没有鉴权/授权**：任何能访问本机回环端口的进程都可以调用工具（这也是只监听回环的原因）；
+3. **只读、单工具**：没有上报/修改，也没有列表、分页、历史区间或聚合查询；
+4. **只有 tools 能力**（外加 SDK 强加的 `logging` 声明）：不提供 MCP resources / prompts / completions；
+5. **不接入主 Agent**：工具不会注册到 DeepSeek ChatClient，RAG 问答不会自动调用它，
+   也**尚未**实现「Agent 联合调用资产与监控工具」；
+6. **协议保护代码在仓库里有两份**（asset 与 monitoring 各一份，见 ADR 0012 的取舍与触发条件）；
+7. **未验证项**：`MCP_LIVE=NOT_RUN`（未对接任何外部 MCP 服务或真实监控系统）；
+   `POSTGRES_LIVE`、`DASHSCOPE_LIVE`、`LIVE_SMOKE` 与本模块无关但全仓仍为 `NOT_RUN`。
