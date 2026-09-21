@@ -85,6 +85,13 @@ flowdesk:
         base-url: http://127.0.0.1:8092
       # 初始化、单次调用与建连共用的上界；必须是正数且不超过 30 秒。
       request-timeout: 5s
+      # 官方 MCP SDK 的客户端日志（只作用于 io.modelcontextprotocol 这一个 logger）：
+      #   OFF（默认）：不输出。SDK 在 INFO 会打印远端 serverInfo 与 instructions 原文，
+      #               失败路径还会打印异常消息与堆栈，因此交付默认必须关掉；
+      #   允许值：OFF / ERROR / WARN / INFO / DEBUG / TRACE（其它值启动失败）；
+      #   排障时临时打开的风险见 README 二十三.5：会把远端原文与内部细节写进日志。
+      # 本项目自己的固定元数据查询日志（mcp query completed …）不受这个开关影响。
+      sdk-log-level: OFF
 
   knowledge:
     upload:

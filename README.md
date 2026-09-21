@@ -786,6 +786,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | 监控 MCP 服务证据（FD-0015） | ✅ 已执行 | **真实 MCP 客户端 + 真实 Streamable HTTP**（官方 SDK 客户端连真实启动的进程）：`initialize` 成功、`tools/list` **恰好一个** `monitoring_snapshot_get`（无写工具）、命中两条固定演示记录（`AST-900001` → `observedAt=2026-01-01T00:00:00Z`/`DEGRADED`/92/68/1、`AST-900002` → `HEALTHY`/18/35/0，字段顺序断言为 `assetId,observedAt,health,cpuUtilizationPercent,memoryUtilizationPercent,activeAlertCount,source`，且同样输入两次逐字节相同）、`AST-900003` 返回 `isError=false` + `MONITORING_SNAPSHOT_NOT_FOUND` + `source=DEMO`（**「没有快照」不是工具失败**）、非法 assetId（空/空白/位数不符/小写/含空格/超长）与缺失字段、非字符串字段、**额外字段**、非对象入参一律 `isError=true` + 固定 `INVALID_ASSET_ID` 且错误内容与固定文案**逐字相等**（因此同时排除回显输入）；**纯 Java 层**：18 条快照不变量与记录形状用例（id 形态、`observedAt`/`health`/origin 非空、百分比 `0..100` 越界即构造失败、告警数非负、`health` 恰好四个枚举值、记录组件恰好七个）、9 条端口契约用例（接口上无写方法、演示数据固定且都带 `DEMO`、`AST-900003` 无快照、不可用数据源抛固定文案异常而不是返回空）、18 条工具契约用例（同一条 schema 与执行校验的 pattern/maxLength 一致性、命中/未找到、命中来源取自记录本身而不是数据源自称的 origin、`origin()` 返回 `null` 时收敛为 `MONITORING_SOURCE_UNAVAILABLE` 而不是 `source:null`、四类失败形状、错误内容本身是合法 JSON）；**模式严格性**：默认 `unavailable`、显式 `demo` 可启动、`DEMO`/`Demo`/` demo `/`real`/空值等一律**启动失败**且错误信息不回显配置值，并且拒绝发生在**创建 Web 服务器之前**；**安全基线**：`Origin` 任意值 → 固定 403（`/actuator/health` 带同样的 `Origin` 仍为 200，证明过滤器只作用于 `/mcp`）、非回环 `server.address` 启动失败、交付配置锁定为端口 `8092` + 回环 `127.0.0.1` + 端点 `/mcp` + 默认 `unavailable`、能力声明实测为 `tools` + SDK 强加的 `logging`（`resources`/`prompts`/`completions` 已关闭且容器内无对应处理器）、`DELETE /mcp` 200 结束会话、未实现方法/非对象 `arguments`/畸形报文 → 固定脱敏且有界的 `-32601`/`-32602`/`-32700`、缺失/伪造/空白/已删除会话保持 400/404、请求与通知都执行版本校验（缺失版本头兼容）；**日志脱敏**：命中、未找到与内部异常三条路径的日志都做**结构化断言**（模板必须是两种固定文案之一，参数位逐个钉死为固定常量 / 稳定结果码 / 异常类名 / 唯一的数值参数即耗时，耗时取值不参与断言），因此既不依赖耗时具体数值、也不可能漏掉 assetId、`health`、监控数值与告警数；异常消息、路径与演示记录正文另由单一文本哨兵逐条排除；测试全部使用本机回环与固定虚构数据，**不访问任何真实监控系统或外部网络** |
 | 监控来源血缘与测试确定性证据（FD-0015-R1） | ✅ 已执行 | **非法来源不再变成 `source:null`**：数据源未命中却让 `origin()` 返回 `null` 时，协议层（真实 MCP 客户端）实测得到 `isError=true` + 固定 `{"error":"MONITORING_SOURCE_UNAVAILABLE","message":"监控数据源当前不可用"}`，内容**逐字相等**且不含 `null`/`"found"`/`MONITORING_SNAPSHOT_NOT_FOUND`/`"source"`/输入回显（工具层与协议层各一条用例），**未新增错误码**；**日志测试不再空转**：替身数据源在未注入异常时**委托演示数据源**，因此 `AST-900001` 真的命中（响应里确实有 `cpuUtilizationPercent:92`/`memoryUtilizationPercent:68`/`health:DEGRADED`/`source:DEMO`）、`AST-999999` 真的未找到 —— 先证明这些值存在，再断言它们没有进日志；**不再扫描耗时数字**：断言改为「模板必须是两种固定文案之一 + 参数位逐个钉死（固定常量 / 稳定结果码 / 异常类名 / 唯一的数值参数即耗时）」，耗时只断言「是数字」而取值从不参与，因此耗时恰好是 92/68 毫秒也不会假失败，而 assetId、`health`、监控数值与告警数在任何参数位都**无处可放**；**会话测试按标识而不是按总数**：从会话 key 集合取出本用例新增的唯一会话标识，`close()` 后只等待**这一个标识**消失（5 秒有界轮询、每 25 ms 一次，超时由紧随其后的断言判失败），同上下文里其它异步关闭中的会话不再影响结论；两个用例类连续各运行 6 次（合计 12 次）**无随机失败** |
 | 主服务 MCP 客户端证据（FD-0016） | ✅ 已执行 | **真实 SDK + 真实 HTTP 端点**：用一个可控的本机 Streamable HTTP 端点（`com.sun.net.httpserver`，随机端口、只绑回环、帧格式对照两个真实服务实测结果）打**真实 MCP Java SDK 客户端**，覆盖 `initialize` → 固定工具调用 → `DELETE /mcp` 释放会话（计数端点断言 `liveSessions` 为空、`DELETE` 次数等于调用次数、每次查询都是新会话、被调用的工具名恰好是 `asset_get`/`monitoring_snapshot_get`）；**三态与分类**：命中/未找到/远端 `isError=true` 的 `*_SOURCE_UNAVAILABLE` → `UNAVAILABLE`、未知错误码与 JSON-RPC 错误 → `REMOTE_TOOL_ERROR`、5xx 与连接被拒 → `UNAVAILABLE`、挂起不响应 → `TIMEOUT`（有界结束）、非法输入（空/空白/位数不符/小写/含空格/下划线/超长/non-字符串）→ `INVALID_INPUT` 且**端点计数不变（零请求）**；**非法载荷逐条被拒**（各 21/16 条参数化用例）：缺字段、多字段、类型不符、未知枚举（`health=WARM`）、百分比越界与非整数、告警数为负、`observedAt` 非法、编号错配、`source` 缺失/`null`/未知、非法 JSON、两段 JSON 拼接、非对象、多 content、非 text content、非空 `structuredContent`；**装配证据**：`enabled=true` 时上下文启动后端点计数仍为 0（启动期不连接）、`enabled=false`（含写错的 URL 与非法超时）时上下文照常启动且零请求、结果明确为 `DISABLED` 且 `isNotFound=false`；端点规则 41 条用例（回环字面量通过；`https`/主机名/`127.1`/`2130706433`/`0127.0.0.1`/userinfo/query/fragment/自定义路径/缺端口/越界端口/前后空格一律拒绝），超时配置用例覆盖 `null/0/负/31s/600s` 拒绝与 `1ms/5s/30s` 通过；**日志**：结构化断言行模板与四个参数位（别名/工具名/结果分类/唯一数值耗时），因此 assetId、监控数值与响应正文无位置可放；**默认上下文**：真实 `FlowDeskApplication` 默认配置下两个端口是 `DISABLED` 适配器、上下文中**没有** `ToolCallback` Bean、也没有 Spring AI 的 MCP 客户端自动装配 Bean，工单与知识文档控制器仍在；**对着两个真实已验收服务的端到端**：演示模式下资产命中（`SERVER`/`IN_SERVICE`/`DEMO`）与监控命中（`observedAt`/`DEGRADED`/92/68/1/`DEMO`）都是 `FOUND`、两端未命中（`AST-999999`/`AST-900003`）都是 `NOT_FOUND` 且带来源、资产服务跑默认（无数据源）模式时映射为 `UNAVAILABLE` |
+| MCP 客户端日志与中断语义证据（FD-0016-R1） | ✅ 已执行 | **SDK 日志旁路收口**：把唯一哨兵分别注入 initialize 响应（`serverInfo.name` 与 `instructions`）与失败响应（JSON-RPC 错误消息），用挂在 **root** logger 上的捕获器验证 —— **正向对照**：显式打开诊断档（`DEBUG`）时 SDK 确实把哨兵写进日志（证明请求真的发生、哨兵真的到过客户端、这条旁路真实存在）；**交付默认**（`sdk-log-level=OFF`）下同一条链路（端点计数增长证明请求发生、异常 cause 链里确实带着远端错误原文）日志里**不出现任何哨兵**，且来自 `io.modelcontextprotocol` 的事件数为 **0**；同时断言项目自己的固定元数据日志（`McpQueryLogger` 的模板与四个参数位）仍然照常输出，证明日志控制**只作用于 SDK 的包名**；级别取值 `OFF/ERROR/WARN/INFO/DEBUG/TRACE` 通过、`VERBOSE`/空/`OFFF` 等一律启动失败且不回显原值，启用装配后 SDK logger 实测为 `OFF`；**中断传播**：直接中断、运行期包装、`IOException` 包装、`McpTransportException` 包装、五层深链与自引用环链全部在**同一线程**断言「分类为 `UNAVAILABLE` 且中断标志被恢复」（自引用环链有界终止、非中断路径不得置位），中断标志在 `finally` 清理；**应用层结果契约**：两个结果记录的三态、11 类自相矛盾组合、必需字段缺失与 `require*` 错误状态共 12 条直连单元测试 |
 | PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证**；pgvector 集成测试（Testcontainers，镜像固定为带扩展版本的 `pgvector/pgvector:0.8.6-pg16`）在无 Docker 时跳过（当前跳过 26 条：15 条索引写入 + 11 条相似度检索），报告标注 POSTGRESQL_PGVECTOR_IT=NOT_RUN |
 | 真实 DashScope Embedding | ⚠️ **DASHSCOPE_LIVE=NOT_RUN** | 无 DASHSCOPE_API_KEY，**未对真实向量服务发起过任何请求**；全部自动化测试都不访问真实上游 |
 | 真实 DeepSeek | ⚠️ **LIVE_SMOKE=NOT_RUN** | 无 `DEEPSEEK_API_KEY`，**未对真实模型发起过任何请求** |
@@ -2459,6 +2460,7 @@ flowdesk:
       monitoring:
         base-url: http://127.0.0.1:8092
       request-timeout: 5s               # 初始化 / 单次调用 / 建连共用的上界；正数且 <= 30s
+      sdk-log-level: OFF                # 官方 MCP SDK 客户端日志（按包名控制，见 23.5）
 ```
 
 - **关闭时**：不创建 SDK 客户端、不绑定 MCP 配置、不初始化、不发送任何请求；
@@ -2524,7 +2526,31 @@ mcp query completed alias=asset tool=asset_get result=FOUND durationMs=12
 ```
 
 刻意**不记**：`assetId` 原值、监控数值、完整响应正文、异常消息、异常类名、堆栈、
-完整端点与配置。中断语义保持：被中断的调用会恢复线程中断标志，绝不吞掉中断。
+完整端点与配置。中断语义保持：被中断的调用会恢复线程中断标志（整条 cause 链都扫，
+外层是 `IOException`/传输异常也不会漏），关闭路径同样不会吞掉中断。
+
+**官方 MCP SDK 的日志旁路（FD-0016-R1）**：只看我们自己的 logger 是不够的 —— SDK 的
+客户端日志会写出**远端原文与内部细节**（实测 SDK 0.17.0）：`LifecycleInitializer` 在
+**INFO** 打印 `Server response with Protocol: …, Capabilities: …, Info: … and Instructions …`
+（即远端的 `serverInfo` 与 `instructions` 原文），`LifecycleInitializer` / `McpSyncClient` /
+`McpAsyncClient` 在 **WARN/ERROR** 打印异常对象（消息 + 堆栈），
+`HttpClientStreamableHttpTransport` 还会打印会话标识与传输细节。
+
+日志控制的范围是**按包名**的，因此明确而有限：
+
+| 项 | 说明 |
+| --- | --- |
+| 配置项 | `flowdesk.mcp.client.sdk-log-level`，默认 **`OFF`** |
+| 允许值 | `OFF` / `ERROR` / `WARN` / `INFO` / `DEBUG` / `TRACE`（其它值**启动失败**，文案不回显原值） |
+| 作用对象 | 只调整 `io.modelcontextprotocol` 这一个 logger |
+| 不影响 | 根 logger、应用自身与其它依赖的日志、日志格式与 appender；本项目自己的元数据查询日志（`mcp query completed …`）照常输出 |
+| 实现位置 | `McpSdkLogControl`（生产代码，启用装配时生效），不是测试环境额外的日志配置 |
+| 调整方式 | 请用本配置项；直接写 `logging.level.io.modelcontextprotocol` 会在**装配期被本配置项覆盖**（这就是「控制范围必须由我们声明」的代价，因此不把它藏起来） |
+| 后端不支持时 | 若日志后端不是 Logback，不做任何改动，只输出一行提示，不猜测别人的日志配置 |
+
+> **手动开启诊断日志的风险**：把 `sdk-log-level` 调到 `DEBUG`/`INFO` 会把你正在排查的
+> 远端数据（`serverInfo`、`instructions`）与内部细节（异常消息、堆栈、会话标识、报文跟踪）
+> 写进日志。因此只在本地临时开启，排障结束后改回 `OFF`，不要留在交付配置里。
 
 ### 23.6 已知边界
 

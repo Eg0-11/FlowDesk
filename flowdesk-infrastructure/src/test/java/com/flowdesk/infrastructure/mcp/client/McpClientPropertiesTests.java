@@ -49,4 +49,41 @@ class McpClientPropertiesTests {
                     .hasMessageNotContaining("600");
         }
     }
+
+    @Test
+    void theSdkLogLevelDefaultsToOff() {
+        McpClientProperties properties = new McpClientProperties();
+
+        assertThat(properties.getSdkLogLevel()).as("SDK 客户端日志默认不输出").isEqualTo("OFF");
+        assertThatCode(properties::validateSdkLogLevel).doesNotThrowAnyException();
+    }
+
+    @Test
+    void everyDocumentedSdkLogLevelIsAccepted() {
+        for (String level : new String[] { "OFF", "ERROR", "WARN", "INFO", "DEBUG", "TRACE", "off", "Debug" }) {
+            McpClientProperties properties = new McpClientProperties();
+            properties.setSdkLogLevel(level);
+
+            assertThatCode(properties::validateSdkLogLevel).as("level=%s", level).doesNotThrowAnyException();
+            assertThat(McpSdkLogControl.normalizeLevel(level)).as("level=%s", level).isNotBlank();
+        }
+    }
+
+    @Test
+    void unknownSdkLogLevelsAreRejectedWithoutEchoingTheValue() {
+        for (String level : new String[] { "", " ", "ALL", "VERBOSE", "TRACEY", "OFFF" }) {
+            McpClientProperties properties = new McpClientProperties();
+            properties.setSdkLogLevel(level);
+
+            assertThatThrownBy(properties::validateSdkLogLevel)
+                    .as("level=[%s]", level)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("sdk-log-level")
+                    .hasMessageNotContaining("VERBOSE")
+                    .hasMessageNotContaining("OFFF");
+        }
+        McpClientProperties nullLevel = new McpClientProperties();
+        nullLevel.setSdkLogLevel(null);
+        assertThatThrownBy(nullLevel::validateSdkLogLevel).isInstanceOf(IllegalStateException.class);
+    }
 }

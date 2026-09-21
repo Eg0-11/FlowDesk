@@ -16,6 +16,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  *       monitoring:
  *         base-url: http://127.0.0.1:8092
  *       request-timeout: 5s                             # 正数，且不得超过 30 秒
+ *       sdk-log-level: OFF                              # 官方 MCP SDK 客户端日志（按包名控制）
  * </pre>
  *
  * <p><b>默认关闭</b>：主服务在没有两个 MCP 服务、没有 API Key 的环境里必须能正常启动。
@@ -41,6 +42,8 @@ public class McpClientProperties {
     private final Monitoring monitoring = new Monitoring();
 
     private Duration requestTimeout = Duration.ofSeconds(5);
+
+    private String sdkLogLevel = McpSdkLogControl.DEFAULT_LEVEL;
 
     /**
      * @return 是否启用 MCP 客户端
@@ -95,6 +98,33 @@ public class McpClientProperties {
         if (this.requestTimeout == null || this.requestTimeout.isZero() || this.requestTimeout.isNegative()
                 || this.requestTimeout.toMillis() > Duration.ofSeconds(MAX_TIMEOUT_SECONDS).toMillis()) {
             throw new IllegalStateException(TIMEOUT_MESSAGE);
+        }
+    }
+
+    /**
+     * @return 官方 MCP SDK 客户端日志的级别（{@value McpSdkLogControl#DEFAULT_LEVEL} 为默认）
+     */
+    public String getSdkLogLevel() {
+        return this.sdkLogLevel;
+    }
+
+    /**
+     * @param sdkLogLevel SDK 日志级别（只接受 {@code OFF/ERROR/WARN/INFO/DEBUG/TRACE}）
+     */
+    public void setSdkLogLevel(String sdkLogLevel) {
+        this.sdkLogLevel = sdkLogLevel;
+    }
+
+    /**
+     * 校验 SDK 日志级别取值（严格字面匹配，大小写不敏感）。
+     *
+     * <p>错误信息是固定文案，<b>不回显</b>配置原值。</p>
+     *
+     * @throws IllegalStateException 取值不在允许集合内
+     */
+    public void validateSdkLogLevel() {
+        if (McpSdkLogControl.normalizeLevel(this.sdkLogLevel) == null) {
+            throw new IllegalStateException(McpSdkLogControl.LEVEL_MESSAGE);
         }
     }
 

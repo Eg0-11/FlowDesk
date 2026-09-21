@@ -56,6 +56,9 @@ class McpClientEnabledWiringTests {
         assertThat(this.assetQueryPort).isInstanceOf(McpAssetQueryAdapter.class);
         assertThat(this.monitoringSnapshotQueryPort).isInstanceOf(McpMonitoringSnapshotQueryAdapter.class);
         assertThat(ENDPOINT.postCount()).as("启动期只校验配置：不建客户端、不初始化、不发请求").isZero();
+        assertThat(McpSdkLogControl.currentLevel())
+                .as("启用装配时按包名把 SDK 日志设成交付默认（不输出远端原文与堆栈）")
+                .isEqualTo("OFF");
     }
 
     @Test

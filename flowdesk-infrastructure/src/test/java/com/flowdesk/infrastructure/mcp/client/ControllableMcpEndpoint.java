@@ -81,6 +81,12 @@ final class ControllableMcpEndpoint implements AutoCloseable {
 
     private volatile boolean requireSession = true;
 
+    /** initialize 响应里的 serverInfo.name（可注入哨兵：SDK 的 INFO 日志会原样打印它）。 */
+    private volatile String serverName = "controllable-test-endpoint";
+
+    /** initialize 响应里的 instructions（可注入哨兵：SDK 的 INFO 日志会原样打印它）。 */
+    private volatile String instructions;
+
     private ControllableMcpEndpoint(HttpServer server, ExecutorService executor) {
         this.server = server;
         this.executor = executor;
@@ -222,6 +228,21 @@ final class ControllableMcpEndpoint implements AutoCloseable {
     }
 
     /**
+     * 在 {@code initialize} 响应里注入哨兵文本。
+     *
+     * <p>SDK 的 {@code LifecycleInitializer} 会在 INFO 级别把 {@code serverInfo} 与
+     * {@code instructions} 原样打印出来，因此这两个字段是把「远端原文会不会进日志」
+     * 变成可断言事实的最直接位置。</p>
+     *
+     * @param serverName   响应里的 {@code serverInfo.name}
+     * @param instructions 响应里的 {@code instructions}（{@code null} 表示不返回该字段）
+     */
+    void respondWithInitializeMetadata(String serverName, String instructions) {
+        this.serverName = serverName;
+        this.instructions = instructions;
+    }
+
+    /**
      * @param status DELETE 的响应状态（默认 200）
      */
     void respondToDeleteWith(int status) {
@@ -294,9 +315,12 @@ final class ControllableMcpEndpoint implements AutoCloseable {
             capabilities.set("tools", MAPPER.createObjectNode());
             result.set("capabilities", capabilities);
             ObjectNode serverInfo = MAPPER.createObjectNode();
-            serverInfo.put("name", "controllable-test-endpoint");
+            serverInfo.put("name", this.serverName);
             serverInfo.put("version", "1.0.0");
             result.set("serverInfo", serverInfo);
+            if (this.instructions != null) {
+                result.put("instructions", this.instructions);
+            }
             ObjectNode envelope = envelope(message.get("id"), "result", result);
             exchange.getResponseHeaders().add(SESSION_HEADER, issued);
             writeJson(exchange, 200, envelope.toString());

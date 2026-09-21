@@ -8,9 +8,10 @@ package com.flowdesk.application.integration;
  * {@link QueryOutcome#FAILED}（带稳定的失败分类）。</p>
  *
  * @param outcome  结果三态
- * @param snapshot 命中的快照；仅 {@code FOUND} 时非 null
+ * @param snapshot 命中的快照；仅 {@code FOUND} 时非 null（{@code FOUND} 的来源从它的 {@code source} 读）
  * @param assetId  被查询的资产标识；仅 {@code NOT_FOUND} 时非 null
- * @param source   数据来源；{@code FOUND} 与 {@code NOT_FOUND} 时非 null
+ * @param source   数据来源；<b>仅 {@code NOT_FOUND} 时非 null</b> —— {@code FOUND} 的来源在
+ *                 {@code snapshot} 里而不在结果顶层，{@code FAILED} 既不携带快照也不携带来源
  * @param failure  失败分类；仅 {@code FAILED} 时非 null
  */
 public record MonitoringSnapshotQueryResult(QueryOutcome outcome, MonitoringSnapshotView snapshot, String assetId,

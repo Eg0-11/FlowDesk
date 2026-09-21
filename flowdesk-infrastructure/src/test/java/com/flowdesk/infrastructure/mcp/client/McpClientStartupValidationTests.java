@@ -44,6 +44,11 @@ class McpClientStartupValidationTests {
     }
 
     @Test
+    void anUnknownSdkLogLevelFailsStartup() {
+        assertStartupFails("flowdesk.mcp.client.sdk-log-level=VERBOSE", "sdk-log-level");
+    }
+
+    @Test
     void aLoopbackConfigurationStartsWithoutConnectingToAnything() {
         try (ConfigurableApplicationContext context = new SpringApplicationBuilder(TestApplication.class)
                 .web(WebApplicationType.NONE)

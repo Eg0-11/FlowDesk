@@ -77,6 +77,34 @@ FD-0014 与 FD-0015 交付了两个独立进程里的 MCP 服务，各自只读�
 `request-timeout` 必须是正数且不超过 **30 秒**；配置错误在启动期以固定文案失败，
 且文案不回显端点或配置原值。
 
+### SDK 日志必须按包名收口（FD-0016-R1）
+
+「只管住自己的日志」是不够的：官方 SDK 自己会写日志，而且写的是远端原文与内部细节
+（实测 0.17.0）：
+
+| SDK 位置 | 级别 | 泄露内容 |
+| --- | --- | --- |
+| `LifecycleInitializer` | **INFO** | 远端 `serverInfo` 与 `instructions` 原文 |
+| `LifecycleInitializer` | WARN | 异常对象（消息 + 堆栈） |
+| `McpSyncClient` | WARN | 长时间未关闭的异常对象（堆栈） |
+| `McpAsyncClient` | WARN/ERROR | 工具结果校验失败详情、通知处理异常 |
+| `HttpClientStreamableHttpTransport` | DEBUG/WARN | 报文、会话标识、传输异常 |
+
+因此交付默认把 `io.modelcontextprotocol` 这一个 logger 设为 `OFF`
+（`flowdesk.mcp.client.sdk-log-level`，严格取值 `OFF/ERROR/WARN/INFO/DEBUG/TRACE`）。
+**控制范围只在这一个包名**：不动根 logger、不动应用自身与其它依赖、不改格式与 appender，
+因此本项目自己的固定元数据日志照常输出。诊断档可以显式打开，但那会把远端原文与堆栈写进日志 ——
+文档里如实写明风险（README 二十三.5），并且**不是**靠测试环境额外关日志来通过验收：
+测试用哨兵证明「SDK 在诊断档确实会写出远端原文」，再用交付默认证明它一条都不出现。
+
+### 中断语义不参与「谁先匹配谁返回」
+
+失败分类是「按链上第一个匹配到的类型归类」，但中断不能这样处理：外层若是
+`IOException` 或 `McpTransportException`，遍历会提前结束，把里层的 `InterruptedException`
+连同「恢复中断标志」一起吞掉。因此中断检查在分类之前单独扫一遍整条链
+（有界、带环路保护），一旦发现就恢复标志并归为 `UNAVAILABLE`；关闭路径同样在进入前记录中断状态，
+并在 `finally` 里补回，确保「尽力而为的关闭」不会顺手丢掉中断。
+
 ### 固定工具白名单，而不是 `tools/list` 后动态选择
 
 本阶段两个服务的工具集是**冻结的**（各一个只读工具）。动态列工具会引入「服务公布了别的工具怎么办」

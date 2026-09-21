@@ -10,9 +10,10 @@ package com.flowdesk.application.integration;
  * <p>不可变，且不允许出现自相矛盾的组合 —— 构造期就会拒绝。</p>
  *
  * @param outcome 结果三态
- * @param asset   命中的记录；仅 {@code FOUND} 时非 null
- * @param assetId 被查询的资产标识；仅 {@code NOT_FOUND} 时非 null（{@code FOUND} 时从记录读）
- * @param source  数据来源；{@code FOUND} 与 {@code NOT_FOUND} 时非 null
+ * @param asset   命中的记录；仅 {@code FOUND} 时非 null（{@code FOUND} 的来源从它的 {@code source} 读）
+ * @param assetId 被查询的资产标识；仅 {@code NOT_FOUND} 时非 null
+ * @param source  数据来源；<b>仅 {@code NOT_FOUND} 时非 null</b> —— {@code FOUND} 的来源在
+ *                {@code asset} 里而不在结果顶层，{@code FAILED} 既不携带记录也不携带来源
  * @param failure 失败分类；仅 {@code FAILED} 时非 null
  */
 public record AssetQueryResult(QueryOutcome outcome, AssetView asset, String assetId, SourceOrigin source,

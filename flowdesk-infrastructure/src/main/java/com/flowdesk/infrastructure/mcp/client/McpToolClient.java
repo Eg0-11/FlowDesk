@@ -144,23 +144,35 @@ final class McpToolClient {
      * <p>关闭失败<b>不</b>改变这次调用的结论：它只影响服务端会话的清理，客户端进程不持有
      * 任何需要回收的连接。但它是<b>有界</b>的 —— 见类注释里的超时覆盖范围。</p>
      *
+     * <p><b>中断语义不在这里丢失</b>（FD-0016-R1）：进入关闭前先记下中断状态，关闭过程中的
+     * 任何异常都再扫一遍 cause 链（链里若有 {@link InterruptedException} 就恢复标志），
+     * 并在 finally 里把进入前的状态补回去 —— 关闭是尽力而为，不能顺便把中断吞掉。</p>
+     *
      * @param client 客户端（可以是 {@code null}）
      */
     private static void close(McpSyncClient client) {
         if (client == null) {
             return;
         }
+        boolean interruptedBefore = Thread.currentThread().isInterrupted();
         try {
             if (!client.closeGracefully()) {
                 client.close();
             }
         }
         catch (RuntimeException ex) {
+            McpFailureMapper.restoreInterruptIfPresent(ex);
             try {
                 client.close();
             }
-            catch (RuntimeException ignored) {
+            catch (RuntimeException fallback) {
                 // 关闭是尽力而为：既不进响应，也不改变调用结论
+                McpFailureMapper.restoreInterruptIfPresent(fallback);
+            }
+        }
+        finally {
+            if (interruptedBefore) {
+                Thread.currentThread().interrupt();
             }
         }
     }

@@ -33,6 +33,10 @@ public class McpClientConfiguration {
     @Bean
     McpToolClient mcpToolClient(McpClientProperties properties) {
         properties.validateTimeout();
+        properties.validateSdkLogLevel();
+        // 按包名控制官方 SDK 的客户端日志（默认 OFF）：它会把远端 serverInfo/instructions 原文
+        // 与异常堆栈写进日志，而本项目自己的固定元数据日志不受影响（见 McpSdkLogControl）
+        McpSdkLogControl.apply(properties.getSdkLogLevel());
         return new McpToolClient(properties.getRequestTimeout());
     }
 
