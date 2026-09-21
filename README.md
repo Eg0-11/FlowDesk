@@ -1,6 +1,6 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0016 —— 主服务 MCP 客户端接入（已完成）**
+> **当前阶段：FD-0017-A —— 资产诊断 Agent 的确定性双 MCP 查询编排（已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
@@ -37,11 +37,14 @@
 > `monitoring_snapshot_get`、固定演示快照与「未找到 ≠ 调用失败」、与资产 MCP 服务同一条安全基线；
 > **尚未接入主 Agent**）（FD-0015）、
 > 主服务 MCP 客户端接入（按次会话调用两个独立 MCP 服务的固定工具、框架无关的查询端口与三态结果、
-> 六个稳定失败分类、默认关闭且关闭时明确回答 `DISABLED`；**尚未接入主 Agent / 模型工具**）（FD-0016）。
+> 六个稳定失败分类、默认关闭且关闭时明确回答 `DISABLED`）（FD-0016）、
+> 主服务 MCP 客户端收口（中断沿整条 cause 链传播、SDK 日志按包名收口、结果对象直连单元测试）（FD-0016-R1）、
+> 资产诊断 Agent（Agent 固定调用两个查询端口、A1/M1 证据与引用校验、完整/部分/无证据三条路径；
+> **尚未实现 HTTP 层**）（FD-0017-A）。
 > 尚未实现：全文检索与混合检索、任意切片读取接口、文档列表/下载/删除、
 > 孤立文件清理任务、`PARSING`/`INDEXING` 悬挂的恢复扫描、问答的流式输出与会话记忆、
 > 游标分页、PostgreSQL 全文检索与 pg_trgm、真实资产/监控数据源、
-> **Agent 依赖这两个查询端口**（端口与适配器已就绪，模型工具与编排尚未接入）、
+> **诊断用例的 HTTP 层**（FD-0017-B）、把远端能力注册为模型工具（需要单独的权限与审计设计）、
 > Agent Graph、鉴权与前端。
 
 ## 一、项目简介
@@ -70,7 +73,7 @@ Tool 调用、MCP 资产/监控服务以及基于 Agent Graph 的自动化编排
 | `flowdesk-shared` | 通用异常、基础类型、工具类 | 仅模块与 `package-info.java` |
 | `flowdesk-domain` | 领域实体、值对象、领域规则（**不依赖 Spring**） | 已实现工单聚合与生命周期状态机（`com.flowdesk.domain.ticket`）、知识文档聚合与解析/索引状态机、切片与向量不变量、查询向量（`com.flowdesk.domain.knowledge`） |
 | `flowdesk-application` | 用例服务、输入输出端口 | 已实现 AI 用例（`…application.ai`，含 `KnowledgeAnswerUseCase` 与 `KnowledgeAnswerResult`）、工单用例 + 乐观并发契约（`…application.ticket`）、知识文档上传/查询/解析/索引用例与端口（`…application.knowledge`，含 `KnowledgeEmbeddingPort`）、知识检索用例与端口（`…application.knowledge`，含 `KnowledgeQueryEmbeddingPort`、`KnowledgeVectorSearchPort` 与 `KnowledgeRerankPort`） |
-| `flowdesk-agent` | AI 编排：实现 application 的 AI 用例，用 ChatClient 编排提示词与本地工具 | 已实现普通聊天、工具冒烟，以及知识库问答编排（提示词构造 + 引用校验 + 无证据降级） |
+| `flowdesk-agent` | AI 编排：实现 application 的 AI 用例，用 ChatClient 编排提示词与本地工具 | 已实现普通聊天、工具冒烟、知识库问答编排（提示词构造 + 引用校验 + 无证据降级），以及资产诊断编排（固定调用两个 MCP 查询端口 + A1/M1 证据与引用校验 + 三条结果路径；`…ai.AssetDiagnosis*`） |
 | `flowdesk-infrastructure` | 持久化与模型适配器 | 已提供 JDBC 工单存储（`…ticket.persistence.jdbc`）、DeepSeek 传输适配，知识文档的 JDBC 存储、本地文件系统内容读写、Tika 解析适配器、确定性切片器、DashScope 文档/查询 Embedding 适配器、pgvector 向量写入与相似度检索适配器、DashScope 文本重排适配器（`…knowledge.*`），以及 MCP 客户端适配器（`…mcp.client`：资产查询与监控快照查询两个端口，按次会话调用两个独立 MCP 服务的固定工具） |
 | `flowdesk-bootstrap` | FlowDesk 主服务启动模块（Web + Validation + Actuator + AI 接口 + 工单 REST 接口 + 知识文档 REST 接口 + 知识检索接口 + 知识问答接口） | 可启动，端口 8080 |
 | `flowdesk-mcp-asset` | 独立资产 MCP 服务（Web + Actuator + MCP Streamable HTTP `/mcp`） | 可启动，端口 8091；已实现 `asset_get` 只读查询工具（演示/不可用两种数据源模式） |
@@ -759,11 +762,13 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0014-R3 | 闸门校验收口：提前回答前必须会话**活跃**（缺失/伪造/已删除一律交传输层回 400/404）、补 `MCP-Protocol-Version` 校验 | ✅ 已完成 |
 | FD-0014-R4 | 通知同样遵守版本规则：版本校验移到请求/通知分流之前（通知也回 400、`id:null`）、空白版本头按无效版本处理 | ✅ 已完成 |
 | FD-0015 | 独立监控 MCP 服务：Streamable HTTP `/mcp` + 只读工具 `monitoring_snapshot_get` + 固定演示快照 + 与资产服务同一条安全基线（尚未接入主 Agent） | ✅ 已完成 |
+| FD-0017-A | 资产诊断 Agent：Agent 固定调用资产与监控两个查询端口（各一次、顺序固定）、A1/M1 证据与引用校验、完整/部分/无证据三条路径（尚未实现 HTTP 层） | ✅ 已完成 |
+| 后续 | 资产诊断的 HTTP 层（FD-0017-B：Controller 与 DTO） | 未开始 |
 | 后续 | 问答流式输出与会话记忆（当前为一次性完整响应、无历史轮次） | 未开始 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm`（混合检索） | 未开始 |
 | 后续 | 孤立文件清理任务 | 未开始 |
 | 后续 | Tool 体系扩展：面向工单与知识的工具注册 | 未开始 |
-| 后续 | MCP：Agent 联合调用资产与监控工具（两个 MCP 服务均已交付：资产见第二十一章、监控见第二十二章） | 未开始 |
+| 后续 | MCP：把远端能力注册为模型可见的工具（需要单独的权限与审计设计；本阶段刻意不注册，见 ADR 0014） | 未开始 |
 | 后续 | Agent Graph：基于 Spring AI Alibaba Agent Framework 的多节点编排 | 未开始 |
 
 ## 十四、真实验证状态（重要）
@@ -787,6 +792,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | 监控来源血缘与测试确定性证据（FD-0015-R1） | ✅ 已执行 | **非法来源不再变成 `source:null`**：数据源未命中却让 `origin()` 返回 `null` 时，协议层（真实 MCP 客户端）实测得到 `isError=true` + 固定 `{"error":"MONITORING_SOURCE_UNAVAILABLE","message":"监控数据源当前不可用"}`，内容**逐字相等**且不含 `null`/`"found"`/`MONITORING_SNAPSHOT_NOT_FOUND`/`"source"`/输入回显（工具层与协议层各一条用例），**未新增错误码**；**日志测试不再空转**：替身数据源在未注入异常时**委托演示数据源**，因此 `AST-900001` 真的命中（响应里确实有 `cpuUtilizationPercent:92`/`memoryUtilizationPercent:68`/`health:DEGRADED`/`source:DEMO`）、`AST-999999` 真的未找到 —— 先证明这些值存在，再断言它们没有进日志；**不再扫描耗时数字**：断言改为「模板必须是两种固定文案之一 + 参数位逐个钉死（固定常量 / 稳定结果码 / 异常类名 / 唯一的数值参数即耗时）」，耗时只断言「是数字」而取值从不参与，因此耗时恰好是 92/68 毫秒也不会假失败，而 assetId、`health`、监控数值与告警数在任何参数位都**无处可放**；**会话测试按标识而不是按总数**：从会话 key 集合取出本用例新增的唯一会话标识，`close()` 后只等待**这一个标识**消失（5 秒有界轮询、每 25 ms 一次，超时由紧随其后的断言判失败），同上下文里其它异步关闭中的会话不再影响结论；两个用例类连续各运行 6 次（合计 12 次）**无随机失败** |
 | 主服务 MCP 客户端证据（FD-0016） | ✅ 已执行 | **真实 SDK + 真实 HTTP 端点**：用一个可控的本机 Streamable HTTP 端点（`com.sun.net.httpserver`，随机端口、只绑回环、帧格式对照两个真实服务实测结果）打**真实 MCP Java SDK 客户端**，覆盖 `initialize` → 固定工具调用 → `DELETE /mcp` 释放会话（计数端点断言 `liveSessions` 为空、`DELETE` 次数等于调用次数、每次查询都是新会话、被调用的工具名恰好是 `asset_get`/`monitoring_snapshot_get`）；**三态与分类**：命中/未找到/远端 `isError=true` 的 `*_SOURCE_UNAVAILABLE` → `UNAVAILABLE`、未知错误码与 JSON-RPC 错误 → `REMOTE_TOOL_ERROR`、5xx 与连接被拒 → `UNAVAILABLE`、挂起不响应 → `TIMEOUT`（有界结束）、非法输入（空/空白/位数不符/小写/含空格/下划线/超长/non-字符串）→ `INVALID_INPUT` 且**端点计数不变（零请求）**；**非法载荷逐条被拒**（各 21/16 条参数化用例）：缺字段、多字段、类型不符、未知枚举（`health=WARM`）、百分比越界与非整数、告警数为负、`observedAt` 非法、编号错配、`source` 缺失/`null`/未知、非法 JSON、两段 JSON 拼接、非对象、多 content、非 text content、非空 `structuredContent`；**装配证据**：`enabled=true` 时上下文启动后端点计数仍为 0（启动期不连接）、`enabled=false`（含写错的 URL 与非法超时）时上下文照常启动且零请求、结果明确为 `DISABLED` 且 `isNotFound=false`；端点规则 41 条用例（回环字面量通过；`https`/主机名/`127.1`/`2130706433`/`0127.0.0.1`/userinfo/query/fragment/自定义路径/缺端口/越界端口/前后空格一律拒绝），超时配置用例覆盖 `null/0/负/31s/600s` 拒绝与 `1ms/5s/30s` 通过；**日志**：结构化断言行模板与四个参数位（别名/工具名/结果分类/唯一数值耗时），因此 assetId、监控数值与响应正文无位置可放；**默认上下文**：真实 `FlowDeskApplication` 默认配置下两个端口是 `DISABLED` 适配器、上下文中**没有** `ToolCallback` Bean、也没有 Spring AI 的 MCP 客户端自动装配 Bean，工单与知识文档控制器仍在；**对着两个真实已验收服务的端到端**：演示模式下资产命中（`SERVER`/`IN_SERVICE`/`DEMO`）与监控命中（`observedAt`/`DEGRADED`/92/68/1/`DEMO`）都是 `FOUND`、两端未命中（`AST-999999`/`AST-900003`）都是 `NOT_FOUND` 且带来源、资产服务跑默认（无数据源）模式时映射为 `UNAVAILABLE` |
 | MCP 客户端日志与中断语义证据（FD-0016-R1） | ✅ 已执行 | **SDK 日志旁路收口**：把唯一哨兵分别注入 initialize 响应（`serverInfo.name` 与 `instructions`）与失败响应（JSON-RPC 错误消息），用挂在 **root** logger 上的捕获器验证 —— **正向对照**：显式打开诊断档（`DEBUG`）时 SDK 确实把哨兵写进日志（证明请求真的发生、哨兵真的到过客户端、这条旁路真实存在）；**交付默认**（`sdk-log-level=OFF`）下同一条链路（端点计数增长证明请求发生、异常 cause 链里确实带着远端错误原文）日志里**不出现任何哨兵**，且来自 `io.modelcontextprotocol` 的事件数为 **0**；同时断言项目自己的固定元数据日志（`McpQueryLogger` 的模板与四个参数位）仍然照常输出，证明日志控制**只作用于 SDK 的包名**；级别取值 `OFF/ERROR/WARN/INFO/DEBUG/TRACE` 通过、`VERBOSE`/空/`OFFF` 等一律启动失败且不回显原值，启用装配后 SDK logger 实测为 `OFF`；**中断传播**：直接中断、运行期包装、`IOException` 包装、`McpTransportException` 包装、五层深链与自引用环链全部在**同一线程**断言「分类为 `UNAVAILABLE` 且中断标志被恢复」（自引用环链有界终止、非中断路径不得置位），中断标志在 `finally` 清理；**应用层结果契约**：两个结果记录的三态、11 类自相矛盾组合、必需字段缺失与 `require*` 错误状态共 12 条直连单元测试 |
+| 资产诊断 Agent 证据（FD-0017-A） | ✅ 已执行 | **确定性编排（真实 ChatClient + 本地合成 OpenAI 端点）**：一次诊断**只发出一个模型请求**，且请求里只有 `system` 与 `user` 两条消息、**没有** `tools`/`tool_choice`，system 只含规则（不含 assetId/字段/数值/失败详情），user 里是确定性 JSON（字段顺序 `assetId`、`allowedEvidenceIds`、`availability`、`evidence`，边界标记各恰好出现一次），evidence 只含命中侧的白名单字段（A1 四条、M1 八条），请求里不含端点/端口/密钥/`Authorization`/异常/`jsonrpc`/会话头/`ToolCallback`；**查询契约**：两个端口各调用一次、顺序固定为资产 → 监控（替身记录调用顺序）、**第一次查询失败后第二次仍然执行**、非法输入（`null` 命令、空、空白、`AST-1`、小写、前后空格、超长、下划线）一律 `AiRequestException` 且**端口与模型零调用**；**三条路径**：两侧命中 → 模型一次 + `[A1][M1]` 必引、仅资产命中（另一侧 `NOT_FOUND`/`UNAVAILABLE`/`DISABLED`/`TIMEOUT`）→ 只允许并要求 `[A1]`、仅监控命中 → 只允许并要求 `[M1]`、两侧都 `NOT_FOUND` → **不调用模型** + 固定回答「未查询到该资产或可用的监控快照。」、无命中且至少一侧失败 → **不调用模型** + 固定降级回答「当前无法获得足够的资产与监控证据，暂时不能生成诊断结论。」，且响应完整保留两侧原始 `QueryOutcome` 与 `QueryFailure`（失败绝不被改写成未找到）；**引用校验**：空答案/无引用/`[a1]`/`[A01]`/`[A 1]`/`[A1 ]`/`[A1x]`/`[A2]`/`[A]`/`[A-1]`/`[A1,M1]`/未闭合/全角数字一律失败，引用本次不存在的证据失败，本次命中证据未被全部引用失败，重复引用按首次出现顺序去重，失败统一 `AiProviderException` 且携带 `requestId`、**不修正/不补引用/不重试**（模型调用次数仍为 1）；**结果对象**：10 条直连单元测试覆盖三态、防御性复制、只允许 A1/M1、证据与命中状态绑定的自相矛盾组合、`grounded` 与引用集合必须完全一致；**日志**：结构化断言行模板（两条固定文案）与全部参数位，assetId/资产详情/监控文本/模型回答/提示词/异常消息与端点均无位置可放，且用哨兵先证明它们进入过结果再证明没有进入日志；**装配**：`flowdesk.ai.enabled=false`（默认）时诊断用例与实现类均不存在、两个 FD-0016 端口仍在，`true` 时正确装配 |
 | PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证**；pgvector 集成测试（Testcontainers，镜像固定为带扩展版本的 `pgvector/pgvector:0.8.6-pg16`）在无 Docker 时跳过（当前跳过 26 条：15 条索引写入 + 11 条相似度检索），报告标注 POSTGRESQL_PGVECTOR_IT=NOT_RUN |
 | 真实 DashScope Embedding | ⚠️ **DASHSCOPE_LIVE=NOT_RUN** | 无 DASHSCOPE_API_KEY，**未对真实向量服务发起过任何请求**；全部自动化测试都不访问真实上游 |
 | 真实 DeepSeek | ⚠️ **LIVE_SMOKE=NOT_RUN** | 无 `DEEPSEEK_API_KEY`，**未对真实模型发起过任何请求** |

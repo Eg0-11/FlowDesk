@@ -1,5 +1,7 @@
 package com.flowdesk.agent.ai;
 
+import com.flowdesk.application.integration.port.out.AssetQueryPort;
+import com.flowdesk.application.integration.port.out.MonitoringSnapshotQueryPort;
 import com.flowdesk.application.knowledge.port.in.RetrieveKnowledgeUseCase;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -60,5 +62,29 @@ public class FlowDeskAiConfiguration {
             RetrieveKnowledgeUseCase retrieveKnowledgeUseCase,
             @Qualifier("deepSeekChatClient") ChatClient deepSeekChatClient) {
         return new GroundedKnowledgeAnswerService(retrieveKnowledgeUseCase, deepSeekChatClient);
+    }
+
+    /**
+     * 资产诊断编排（FD-0017-A）。
+     *
+     * <p>依赖两个 application 层查询端口（资产查询、监控快照查询）与命名明确的
+     * {@code deepSeekChatClient}。流程由 {@link AssetDiagnosisService} 确定性控制：
+     * 两个端口各调用一次、顺序固定、模型不能选工具也不能改编号 ——
+     * 这里<b>不</b>注册任何 {@code ToolCallback}，远端能力不会变成模型可见的工具。</p>
+     *
+     * <p>本 Bean 只在 {@code flowdesk.ai.enabled=true} 时存在，因此默认 profile 下没有诊断能力，
+     * 也没有任何出网可能。</p>
+     *
+     * @param assetQueryPort              资产查询端口
+     * @param monitoringSnapshotQueryPort 监控快照查询端口
+     * @param deepSeekChatClient          DeepSeek 对话客户端
+     * @return 资产诊断用例实现
+     */
+    @Bean
+    public AssetDiagnosisService assetDiagnosisService(
+            AssetQueryPort assetQueryPort,
+            MonitoringSnapshotQueryPort monitoringSnapshotQueryPort,
+            @Qualifier("deepSeekChatClient") ChatClient deepSeekChatClient) {
+        return new AssetDiagnosisService(assetQueryPort, monitoringSnapshotQueryPort, deepSeekChatClient);
     }
 }
