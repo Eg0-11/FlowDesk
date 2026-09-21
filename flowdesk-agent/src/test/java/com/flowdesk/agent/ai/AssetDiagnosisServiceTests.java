@@ -215,6 +215,56 @@ class AssetDiagnosisServiceTests {
         assertThat(fixture.model.calls()).as("没有证据不得调用模型").isZero();
     }
 
+    // ---------- FD-0017-B：端口违约的第二种形态 —— 返回 null ----------
+
+    @Test
+    void anAssetPortReturningNullIsAContractViolationAndTheSecondQueryStillRuns() {
+        Fixture fixture = new Fixture(GOOD_ANSWER);
+        fixture.assetPort.returns(null);
+
+        assertThatThrownBy(() -> fixture.service.diagnose(new AssetDiagnosisCommand(ASSET_ID)))
+                .as("返回 null 必须变成 502 的 AiProviderException，而不是裸 NullPointerException")
+                .isInstanceOf(AiProviderException.class)
+                .satisfies(thrown -> {
+                    assertThat(((AiProviderException) thrown).requestId()).isNotBlank();
+                    assertThat(thrown.getCause()).as("不得凭空伪造一个 cause").isNull();
+                });
+
+        assertThat(fixture.order).as("第一个端口返回 null 后第二次查询仍然执行，顺序不变")
+                .containsExactly("asset", "monitoring");
+        assertThat(fixture.monitoringPort.calls()).as("监控端口必须收到真实查询").containsExactly(ASSET_ID);
+        assertThat(fixture.model.calls()).as("没有证据不得调用模型").isZero();
+    }
+
+    @Test
+    void aMonitoringPortReturningNullIsAContractViolation() {
+        Fixture fixture = new Fixture(GOOD_ANSWER);
+        fixture.monitoringPort.returns(null);
+
+        assertThatThrownBy(() -> fixture.service.diagnose(new AssetDiagnosisCommand(ASSET_ID)))
+                .isInstanceOf(AiProviderException.class)
+                .satisfies(thrown -> assertThat(((AiProviderException) thrown).requestId()).isNotBlank());
+
+        assertThat(fixture.assetPort.calls()).containsExactly(ASSET_ID);
+        assertThat(fixture.order).containsExactly("asset", "monitoring");
+        assertThat(fixture.model.calls()).as("资产已命中也不得调用模型：整次诊断按违约失败").isZero();
+    }
+
+    @Test
+    void bothPortsReturningNullIsAContractViolation() {
+        Fixture fixture = new Fixture(GOOD_ANSWER);
+        fixture.assetPort.returns(null);
+        fixture.monitoringPort.returns(null);
+
+        assertThatThrownBy(() -> fixture.service.diagnose(new AssetDiagnosisCommand(ASSET_ID)))
+                .isInstanceOf(AiProviderException.class)
+                .satisfies(thrown -> assertThat(((AiProviderException) thrown).requestId()).isNotBlank());
+
+        assertThat(fixture.assetPort.calls()).hasSize(1);
+        assertThat(fixture.monitoringPort.calls()).hasSize(1);
+        assertThat(fixture.model.calls()).isZero();
+    }
+
     @Test
     void aFailingModelCallBecomesAProviderFailureCarryingTheRequestId() {
         Fixture fixture = new Fixture();

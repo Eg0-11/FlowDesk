@@ -104,6 +104,62 @@ class AssetDiagnosisResultTests {
                 null)).isInstanceOf(NullPointerException.class);
     }
 
+    // ---------- FD-0017-B：requestId / answer 不得只有空白 ----------
+
+    @Test
+    void blankRequestIdOrAnswerIsRejected() {
+        for (String blank : new String[] { "", " ", "   ", "\t", "\n", " \t\n " }) {
+            assertThatThrownBy(() -> new AssetDiagnosisResult(blank, "x [A1]。", false, List.of(), ASSET_NOT_FOUND,
+                    MONITORING_NOT_FOUND))
+                    .as("requestId=[%s]", blank)
+                    .isInstanceOf(IllegalArgumentException.class);
+
+            assertThatThrownBy(() -> new AssetDiagnosisResult("req-1", blank, false, List.of(), ASSET_NOT_FOUND,
+                    MONITORING_NOT_FOUND))
+                    .as("answer=[%s]", blank)
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    @Test
+    void aRequestIdWithSurroundingWhitespaceIsStillAccepted() {
+        // 只有「全是空白」才被拒绝：本类不做 trim，也不改写调用方给出的标识与答案
+        AssetDiagnosisResult result = new AssetDiagnosisResult(" req-1 ", " x [A1]。 ", true, List.of("A1"),
+                ASSET_FOUND, MONITORING_NOT_FOUND);
+
+        assertThat(result.requestId()).isEqualTo(" req-1 ");
+        assertThat(result.answer()).isEqualTo(" x [A1]。 ");
+    }
+
+    // ---------- FD-0017-B：编号必须已按首次出现顺序去重 ----------
+
+    @Test
+    void theEvidenceIdListMustAlreadyBeDeduplicated() {
+        assertThatThrownBy(() -> new AssetDiagnosisResult("req", "x [A1]。", true, List.of("A1", "A1"), ASSET_FOUND,
+                MONITORING_NOT_FOUND))
+                .as("重复的 A1")
+                .isInstanceOf(IllegalArgumentException.class);
+
+        assertThatThrownBy(() -> new AssetDiagnosisResult("req", "x [A1][M1]。", true, List.of("A1", "M1", "A1"),
+                ASSET_FOUND, MONITORING_FOUND))
+                .as("三元素里含重复")
+                .isInstanceOf(IllegalArgumentException.class);
+
+        assertThatThrownBy(() -> new AssetDiagnosisResult("req", "x。", false, List.of("M1", "M1"), ASSET_NOT_FOUND,
+                MONITORING_FOUND))
+                .as("即使 grounded=false 也先拒绝未去重的编号")
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void aDeduplicatedListKeepsItsFirstOccurrenceOrder() {
+        // 去重由产出方负责，本类只校验顺序与集合：M1 在前就应当在结果里排在前
+        AssetDiagnosisResult result = new AssetDiagnosisResult("req", "风险 [M1]，资产 [A1]。", true,
+                List.of("M1", "A1"), ASSET_FOUND, MONITORING_FOUND);
+
+        assertThat(result.usedEvidenceIds()).containsExactly("M1", "A1");
+    }
+
     @Test
     void onlyA1AndM1MayAppear() {
         for (String unknown : new String[] { "A2", "M2", "K1", "a1", "m1", "", "A1 ", " A1" }) {

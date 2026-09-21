@@ -3,8 +3,9 @@
 - 状态：已接受
 - 日期：2026-09-22
 - 决策范围：主服务 Agent 层如何把 FD-0016 交付的两个查询端口（资产、监控）组织成一次
-  「资产诊断」用例：编排归属、模型调用策略、A1/M1 证据与引用协议、三条结果路径，
-  以及本阶段与 Agent Graph 的边界
+  「资产诊断」用例：编排归属、模型调用策略、A1/M1 证据与引用协议、三条结果路径、
+  端口违约（含返回 `null`）的处理、结果对象的不变量，以及 FD-0017-B 的 HTTP 契约 ——
+  端点与开关、状态码语义、响应 DTO 的字段映射规则，以及本阶段与 Agent Graph 的边界
 
 ## 背景
 
@@ -37,6 +38,22 @@ FD-0016 已经让主服务能用真实 MCP 协议读到两个独立服务的数�
    输出侧独立校验并逐条回溯。
 6. **结果对象同时保留两个查询的真实状态**（含 `FAILED` + `QueryFailure`），
    不允许把部分证据包装成完整数据。
+7. **端口违约的两种形态都算违约**：端口抛异常，或**返回 `null`** ——
+   契约里没有「没有结果」这个取值，三态各自有专门的结果类型。两种情况都先完成第二次查询，
+   再按 `PORT_CONTRACT_VIOLATION` 整次失败（不调用模型、不裸抛 `NullPointerException`）。
+8. **结果不变量收紧为「非空白 + 已去重」**：`requestId` 与 `answer` 不得只有空白；
+   `usedEvidenceIds` 必须已按首次出现顺序去重，出现重复编号直接拒绝（不静默去重）。
+9. **HTTP 边界独立于通用 AI 控制器**（FD-0017-B）：新增
+   `POST /api/v1/ai/asset-diagnosis`，控制器唯一协作者是 `AssetDiagnosisUseCase`，
+   不注入 `ChatClient`、查询端口或 MCP 客户端，不在 HTTP 层复制 `AssetIdentifier` 的规则，
+   且只在 `flowdesk.ai.enabled=true` 时注册。
+10. **响应字段集合由 `outcome` 决定**：`FOUND` 输出命中的白名单字段与 `source`；
+    `NOT_FOUND` 只输出 `outcome`/`assetId`/`source`；`FAILED` 只输出 `outcome`/`failure`；
+    取值为 `null` 的字段直接省略。
+11. **状态码语义**：可审计的诊断结果一律 **200**（含部分命中、两侧 `NOT_FOUND`、
+    甚至两侧 `FAILED`/`DISABLED`）；非法 `assetId` → 400 `INVALID_REQUEST`；
+    坏 JSON → 400（全局 JSON 契约）；模型失败、引用校验失败、端口违约 →
+    502 `AI_PROVIDER_ERROR` + `requestId`；AI 关闭 → 端点不存在（404）。
 
 ## 理由
 
@@ -115,6 +132,64 @@ Agent Graph 关注的是「多节点、可分支、可循环、可并行」的�
 因此诊断结果里两个查询的 `QueryOutcome` 与 `QueryFailure` 都如实保留，
 提示词里的 `availability` 也只放 outcome 与稳定枚举 —— 失败是一等公民，不是噪音。
 
+### HTTP 契约：状态码与 DTO 映射（FD-0017-B）
+
+| 情形 | 状态码 | 响应 |
+| --- | --- | --- |
+| 完整命中 / 部分命中 / 两侧 `NOT_FOUND` / 两侧 `FAILED`（含 `DISABLED`） | **200** | 可审计结果：答案 + 实际引用编号 + 两侧真实状态 |
+| 非法 `assetId`（含空 body、`{}`、`null`、纯空白、位数不符、大小写不符） | 400 | `INVALID_REQUEST`，detail 由用例给出，HTTP 层不回显输入 |
+| 请求体不是合法 JSON | 400 | `INVALID_REQUEST`「请求体不是合法 JSON」（全局 JSON 契约） |
+| 模型调用失败 / 引用校验失败 / 查询端口契约违约 | 502 | `AI_PROVIDER_ERROR` + `requestId`，detail 固定、不含 cause |
+| AI 未启用 | 404 | 端点缺失契约 `ENDPOINT_NOT_FOUND`（端点不注册） |
+
+`asset` 与 `monitoring` 两个响应片段使用**同一套映射规则**：
+
+| `outcome` | 输出字段 |
+| --- | --- |
+| `FOUND` | `outcome`、该侧命中的白名单字段、`source` |
+| `NOT_FOUND` | `outcome`、`assetId`、`source` |
+| `FAILED` | `outcome`、`failure` |
+
+### 为什么保留两个查询的真实 outcome/failure
+
+**200 不代表两个依赖都成功。** 这是本接口最容易被误读的一点，因此写进 README 与包说明：
+
+- 部分命中（一侧 `FOUND`、另一侧 `FAILED`）时答案仍然是 `grounded=true` ——
+  它确实建立在**可用**证据上，但这次诊断是**不完整的**。调用方若只看状态码，
+  就会把「监控没查成」当成「监控正常」；
+- 两侧都 `DISABLED` 时编排**正常返回**固定降级结果，所以状态码仍是 200，
+  而两侧各自明确显示 `FAILED` + `DISABLED`；
+- `FAILED` 永远不出现在 `NOT_FOUND` 的位置上：一个是可以接受的事实（本来就没有这条数据），
+  一个是需要重试或升级的故障。把两者合并，调用方就再也无法区分这两种后续动作。
+
+因此数据状态只能从 `asset.outcome` / `monitoring.outcome` / `failure` 读出来，
+而不是从状态码推断。
+
+### 为什么用明确的 DTO，而不是直接序列化应用层对象
+
+1. **`null` 的语义**：`AssetQueryResult` 里「某些字段只对某些状态有意义」，
+   直接序列化会输出 `"failure":null`、`"assetType":null` 这类空值，
+   把「这个字段不适用」和「这个字段是空的」混在一起；显式 DTO 让字段集合本身表达状态；
+2. **数值不能有默认值**：监控的百分比与告警数用包装类型，未命中时**省略**而不是序列化成 `0`
+   —— 一个 `cpuUtilizationPercent: 0` 的快照看起来像「健康得不真实」，而不是「没有数据」；
+3. **泄漏面收敛**：响应对象由本层显式构造，因此 MCP 原始报文、端点、会话标识、
+   异常与堆栈、提示词与密钥**没有位置可放**（不需要靠「别忘了排除」来保证）。
+
+### 为什么把「端口返回 null」当成违约，而不是当成「未找到」
+
+`null` 在契约里是**不可表达**的：`AssetQueryResult` 与 `MonitoringSnapshotQueryResult`
+是记录类型，三态各自要求自己的字段组合。端口返回 `null` 只可能是实现违约。此时有三种处理方式，
+都不可接受：
+
+- 补成 `NOT_FOUND`：把「这次没查成」说成「没有这条数据」，正是本仓库一路在防的错误结论；
+- 补成 `FAILED`：凭空构造一个带 `QueryFailure` 的结果，等于**伪造**一条我们并不知道原因的失败；
+- 让它穿透：调用方拿到的是 500 与一段 `NullPointerException` 堆栈，而不是 502 + `requestId`，
+  而且日志里不会有稳定失败类别。
+
+因此它和「抛异常」走同一条路：**两次查询照常各执行一次**（顺序不变），然后整次诊断按
+`PORT_CONTRACT_VIOLATION` 失败。观测到的形态全部写入固定脱敏日志
+（`failure=PORT_CONTRACT_VIOLATION`、`exception=none`）。
+
 ## 影响
 
 正面：主服务第一次把两个 MCP 查询用起来；编排、模型调用次数、提示词结构与引用协议
@@ -124,15 +199,18 @@ Agent Graph 关注的是「多节点、可分支、可循环、可并行」的�
 
 ## 已知边界与未验证项
 
-1. **没有 HTTP 层**：本阶段只交付用例与装配，没有 Controller、没有新端点；
-2. **没有真实 DeepSeek**：自动化测试用本地合成的 OpenAI 端点，
+1. **HTTP 层已交付（FD-0017-B），但没有鉴权**：`POST /api/v1/ai/asset-diagnosis` 没有身份与
+   权限概念，谁能调用就谁能拿到该资产的诊断与监控数值；
+2. **200 不等于依赖成功**（见上）：调用方必须读 `outcome`/`failure`，状态码只表达
+   「编排是否正常完成」；
+3. **没有真实 DeepSeek**：自动化测试用本地合成的 OpenAI 端点，
    `LIVE_SMOKE=NOT_RUN`（未对真实模型发起过任何请求）；
-3. **没有真实企业数据源**：两个查询端口在测试里是替身，端到端只到「MCP 演示服务」为止，
+4. **没有真实企业数据源**：两个查询端口在测试里是替身，端到端只到「MCP 演示服务」为止，
    `MCP_LIVE=NOT_RUN`；
-4. **引用校验不等于事实正确**（见上）；
-5. **没有会话记忆、没有流式输出、没有工具、没有并行/重试/缓存**；
-6. **单条快照**：诊断只看最近一条监控快照，没有时间序列与趋势；
-7. `POSTGRES_LIVE`、`DASHSCOPE_LIVE` 与本任务无关但全仓仍为 `NOT_RUN`。
+5. **引用校验不等于事实正确**（见上）；
+6. **没有会话记忆、没有流式输出、没有工具、没有并行/重试/缓存**；
+7. **单条快照**：诊断只看最近一条监控快照，没有时间序列与趋势；
+8. `POSTGRES_LIVE`、`DASHSCOPE_LIVE` 与本任务无关但全仓仍为 `NOT_RUN`。
 
 ## 重新评估条件
 

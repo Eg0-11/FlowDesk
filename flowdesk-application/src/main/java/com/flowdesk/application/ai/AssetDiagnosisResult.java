@@ -29,7 +29,12 @@ import java.util.Set;
  * <ul>
  *   <li>{@code requestId}、{@code answer}、{@code usedEvidenceIds}、{@code asset}、
  *       {@code monitoring} 都不得为 {@code null}；</li>
+ *   <li>{@code requestId} 与 {@code answer} 也不得只有空白 —— 一个空白标识无法与日志、
+ *       错误响应对齐，一段空白答案不是答案；</li>
  *   <li>{@code usedEvidenceIds} 被<b>防御性复制</b>为不可变列表（外部持有原列表也改不了结果）；</li>
+ *   <li>{@code usedEvidenceIds} 必须<b>已经按首次出现顺序去重</b>：出现重复编号（例如
+ *       {@code ["A1","A1"]}、{@code ["A1","M1","A1"]}）直接拒绝，而不是在本类里静默去重 ——
+ *       去重是产出方的责任，静默修正会让「引用集合被谁改过」变得不可追查；</li>
  *   <li>{@code usedEvidenceIds} 只能出现 {@value #ASSET_EVIDENCE_ID}/
  *       {@value #MONITORING_EVIDENCE_ID}；</li>
  *   <li>{@value #ASSET_EVIDENCE_ID} 只有在资产查询<b>命中</b>时才允许出现，
@@ -67,14 +72,26 @@ public record AssetDiagnosisResult(String requestId,
      * 紧凑构造器：防御性复制编号，并强制所有不变量。
      *
      * @throws NullPointerException     任一必需字段为 {@code null}
-     * @throws IllegalArgumentException 出现本次不存在的证据编号，或 {@code grounded} 与编号不一致
+     * @throws IllegalArgumentException {@code requestId}/{@code answer} 只有空白、编号未去重、
+     *                                 出现本次不存在的证据编号，或 {@code grounded} 与编号不一致
      */
     public AssetDiagnosisResult {
         Objects.requireNonNull(requestId, "requestId 不能为 null");
         Objects.requireNonNull(answer, "answer 不能为 null");
         Objects.requireNonNull(asset, "asset 不能为 null");
         Objects.requireNonNull(monitoring, "monitoring 不能为 null");
+        if (requestId.isBlank()) {
+            throw new IllegalArgumentException("requestId 不能为空白");
+        }
+        if (answer.isBlank()) {
+            throw new IllegalArgumentException("answer 不能为空白");
+        }
         usedEvidenceIds = List.copyOf(Objects.requireNonNull(usedEvidenceIds, "usedEvidenceIds 不能为 null"));
+        if (new LinkedHashSet<>(usedEvidenceIds).size() != usedEvidenceIds.size()) {
+            // 重复编号意味着调用方没有按契约去重：与其在这里静默去重（让「谁改过引用集合」变得不可追查），
+            // 不如直接拒绝。去重是产出方的责任，校验方的职责是发现它没做。
+            throw new IllegalArgumentException("usedEvidenceIds 必须已按首次出现顺序去重：" + usedEvidenceIds);
+        }
 
         Set<String> found = foundEvidenceIds(asset, monitoring);
         for (String used : usedEvidenceIds) {

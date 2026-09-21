@@ -164,6 +164,27 @@ class AssetDiagnosisLoggingTests {
         assertNoSensitiveMaterial();
     }
 
+    @Test
+    void aPortReturningNullLogsTheStableCategoryWithoutInventingAnException() {
+        Fixture fixture = new Fixture("不会被调用。");
+        fixture.assetPort.returns(null);
+
+        assertThatThrownBy(() -> fixture.service.diagnose(new AssetDiagnosisCommand("AST-900001")))
+                .isInstanceOf(com.flowdesk.application.ai.AiProviderException.class);
+
+        assertThat(this.appender.list).hasSize(1);
+        ILoggingEvent event = this.appender.list.get(0);
+        Object[] arguments = event.getArgumentArray();
+        assertThat(event.getMessage()).isEqualTo(FAILED_TEMPLATE);
+        assertThat(arguments).hasSize(11);
+        assertThat(arguments[3]).as("返回 null 的一侧没有结果，只能记 UNKNOWN").isEqualTo("UNKNOWN");
+        assertThat(arguments[4]).isEqualTo("FOUND");
+        assertThat(arguments[5]).as("违约路径不调用模型").isEqualTo(false);
+        assertThat(arguments[8]).isEqualTo(AssetDiagnosisFailure.PORT_CONTRACT_VIOLATION.name());
+        assertThat(arguments[9]).as("null 返回没有异常可记，固定为 none").isEqualTo("none");
+        assertNoSensitiveMaterial();
+    }
+
     /**
      * 文本层只扫不可能与数字撞车的哨兵（耗时可能恰好是 92 之类的数字）；
      * 数值类信息由上面的「参数位逐个钉死」保证没有位置可放。

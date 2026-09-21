@@ -30,6 +30,6 @@ public enum AssetDiagnosisFailure {
     /** 调用模型失败（异常、超时或上游错误）。 */
     MODEL_CALL_FAILED,
 
-    /** 查询端口违约抛异常（按契约它们只返回三态结果，不抛异常）。 */
+    /** 查询端口违约：按契约它们只返回三态结果，既不该抛异常，也不该返回 {@code null}。 */
     PORT_CONTRACT_VIOLATION
 }

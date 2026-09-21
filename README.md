@@ -1,6 +1,6 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0017-A —— 资产诊断 Agent 的确定性双 MCP 查询编排（已完成）**
+> **当前阶段：FD-0017-B —— 资产诊断结果边界收口与 HTTP 接口（已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
@@ -39,12 +39,15 @@
 > 主服务 MCP 客户端接入（按次会话调用两个独立 MCP 服务的固定工具、框架无关的查询端口与三态结果、
 > 六个稳定失败分类、默认关闭且关闭时明确回答 `DISABLED`）（FD-0016）、
 > 主服务 MCP 客户端收口（中断沿整条 cause 链传播、SDK 日志按包名收口、结果对象直连单元测试）（FD-0016-R1）、
-> 资产诊断 Agent（Agent 固定调用两个查询端口、A1/M1 证据与引用校验、完整/部分/无证据三条路径；
-> **尚未实现 HTTP 层**）（FD-0017-A）。
+> 资产诊断 Agent（Agent 固定调用两个查询端口、A1/M1 证据与引用校验、完整/部分/无证据三条路径）
+> （FD-0017-A）、
+> 资产诊断结果边界收口与 HTTP 接口（端口返回 `null` 一律按 `PORT_CONTRACT_VIOLATION` 处理、
+> 结果不变量收紧为「标识与答案非空白 + 编号必须已去重」、`POST /api/v1/ai/asset-diagnosis`
+> 只依赖用例接口并按 outcome 决定字段集合）（FD-0017-B）。
 > 尚未实现：全文检索与混合检索、任意切片读取接口、文档列表/下载/删除、
 > 孤立文件清理任务、`PARSING`/`INDEXING` 悬挂的恢复扫描、问答的流式输出与会话记忆、
 > 游标分页、PostgreSQL 全文检索与 pg_trgm、真实资产/监控数据源、
-> **诊断用例的 HTTP 层**（FD-0017-B）、把远端能力注册为模型工具（需要单独的权限与审计设计）、
+> 把远端能力注册为模型工具（需要单独的权限与审计设计）、
 > Agent Graph、鉴权与前端。
 
 ## 一、项目简介
@@ -75,7 +78,7 @@ Tool 调用、MCP 资产/监控服务以及基于 Agent Graph 的自动化编排
 | `flowdesk-application` | 用例服务、输入输出端口 | 已实现 AI 用例（`…application.ai`，含 `KnowledgeAnswerUseCase` 与 `KnowledgeAnswerResult`）、工单用例 + 乐观并发契约（`…application.ticket`）、知识文档上传/查询/解析/索引用例与端口（`…application.knowledge`，含 `KnowledgeEmbeddingPort`）、知识检索用例与端口（`…application.knowledge`，含 `KnowledgeQueryEmbeddingPort`、`KnowledgeVectorSearchPort` 与 `KnowledgeRerankPort`） |
 | `flowdesk-agent` | AI 编排：实现 application 的 AI 用例，用 ChatClient 编排提示词与本地工具 | 已实现普通聊天、工具冒烟、知识库问答编排（提示词构造 + 引用校验 + 无证据降级），以及资产诊断编排（固定调用两个 MCP 查询端口 + A1/M1 证据与引用校验 + 三条结果路径；`…ai.AssetDiagnosis*`） |
 | `flowdesk-infrastructure` | 持久化与模型适配器 | 已提供 JDBC 工单存储（`…ticket.persistence.jdbc`）、DeepSeek 传输适配，知识文档的 JDBC 存储、本地文件系统内容读写、Tika 解析适配器、确定性切片器、DashScope 文档/查询 Embedding 适配器、pgvector 向量写入与相似度检索适配器、DashScope 文本重排适配器（`…knowledge.*`），以及 MCP 客户端适配器（`…mcp.client`：资产查询与监控快照查询两个端口，按次会话调用两个独立 MCP 服务的固定工具） |
-| `flowdesk-bootstrap` | FlowDesk 主服务启动模块（Web + Validation + Actuator + AI 接口 + 工单 REST 接口 + 知识文档 REST 接口 + 知识检索接口 + 知识问答接口） | 可启动，端口 8080 |
+| `flowdesk-bootstrap` | FlowDesk 主服务启动模块（Web + Validation + Actuator + AI 接口 + 工单 REST 接口 + 知识文档 REST 接口 + 知识检索接口 + 知识问答接口 + 资产诊断接口） | 可启动，端口 8080 |
 | `flowdesk-mcp-asset` | 独立资产 MCP 服务（Web + Actuator + MCP Streamable HTTP `/mcp`） | 可启动，端口 8091；已实现 `asset_get` 只读查询工具（演示/不可用两种数据源模式） |
 | `flowdesk-mcp-monitoring` | 独立监控 MCP 服务（Web + Actuator + MCP Streamable HTTP `/mcp`） | 可启动，端口 8092；已实现 `monitoring_snapshot_get` 只读查询工具（演示/不可用两种数据源模式） |
 
@@ -762,8 +765,10 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0014-R3 | 闸门校验收口：提前回答前必须会话**活跃**（缺失/伪造/已删除一律交传输层回 400/404）、补 `MCP-Protocol-Version` 校验 | ✅ 已完成 |
 | FD-0014-R4 | 通知同样遵守版本规则：版本校验移到请求/通知分流之前（通知也回 400、`id:null`）、空白版本头按无效版本处理 | ✅ 已完成 |
 | FD-0015 | 独立监控 MCP 服务：Streamable HTTP `/mcp` + 只读工具 `monitoring_snapshot_get` + 固定演示快照 + 与资产服务同一条安全基线（尚未接入主 Agent） | ✅ 已完成 |
-| FD-0017-A | 资产诊断 Agent：Agent 固定调用资产与监控两个查询端口（各一次、顺序固定）、A1/M1 证据与引用校验、完整/部分/无证据三条路径（尚未实现 HTTP 层） | ✅ 已完成 |
-| 后续 | 资产诊断的 HTTP 层（FD-0017-B：Controller 与 DTO） | 未开始 |
+| FD-0016 | 主服务 MCP 客户端接入：按次会话调用两个独立 MCP 服务的固定工具、框架无关的查询端口与三态结果、六个稳定失败分类、默认关闭且关闭时明确回答 `DISABLED` | ✅ 已完成 |
+| FD-0016-R1 | 客户端收口：中断沿整条 cause 链传播并在关闭路径不吞中断、官方 SDK 日志按包名收口（默认 `OFF`，排障可临时打开）、应用层结果对象直连单元测试 | ✅ 已完成 |
+| FD-0017-A | 资产诊断 Agent：Agent 固定调用资产与监控两个查询端口（各一次、顺序固定）、A1/M1 证据与引用校验、完整/部分/无证据三条路径 | ✅ 已完成 |
+| FD-0017-B | 资产诊断结果边界收口与 HTTP 接口：端口返回 `null` 按 `PORT_CONTRACT_VIOLATION` 处理、结果不变量收紧（非空白标识与答案、编号必须已去重）、`POST /api/v1/ai/asset-diagnosis`（Controller + 按 outcome 决定字段集合的 DTO + 状态码语义） | ✅ 已完成 |
 | 后续 | 问答流式输出与会话记忆（当前为一次性完整响应、无历史轮次） | 未开始 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm`（混合检索） | 未开始 |
 | 后续 | 孤立文件清理任务 | 未开始 |
@@ -2568,3 +2573,161 @@ mcp query completed alias=asset tool=asset_get result=FOUND durationMs=12
 6. **载荷校验在客户端另写了一份**：与两个服务各自演进，靠测试保持一致；
 7. **未验证项**：`MCP_LIVE=NOT_RUN`（未对接任何真实企业资产系统或监控系统，
    端到端只对接了本仓库两个演示服务）；`POSTGRES_LIVE`、`DASHSCOPE_LIVE`、`LIVE_SMOKE` 仍为 `NOT_RUN`。
+
+## 二十四、资产诊断 HTTP 接口（FD-0017-B）
+
+设计取舍见 [`docs/adr/0014-asset-diagnosis-agent.md`](docs/adr/0014-asset-diagnosis-agent.md)。
+本阶段把 FD-0017-A 的资产诊断编排（由 Agent **固定**调用两个 MCP 查询端口）暴露成一个 HTTP 接口，
+同时收口了 FD-0017-A 留下的两个边界：**查询端口返回 `null`** 与 **结果对象的不变量**。
+
+| 项 | 值 |
+| --- | --- |
+| 路径 | `POST /api/v1/ai/asset-diagnosis` |
+| 请求 | `application/json`，唯一字段 `assetId`（`AST-` 加六位数字） |
+| 响应 | `application/json` |
+| 开关 | `flowdesk.ai.enabled=true`；默认关闭时**端点不存在**（404） |
+| 控制器依赖 | 只有 `AssetDiagnosisUseCase` —— 不注入 `ChatClient`、查询端口、MCP 客户端或编排实现类 |
+| 输入校验位置 | 只在 application 用例（HTTP 层不复制 `AssetIdentifier` 规则） |
+
+### 24.1 请求
+
+```bash
+curl -X POST http://localhost:8080/api/v1/ai/asset-diagnosis \
+  -H 'Content-Type: application/json' \
+  -d '{"assetId":"AST-900001"}'
+```
+
+空 body、`{}`、`{"assetId":null}`、纯空白与任何非法编号都交给用例判定，得到同一条
+400「`assetId` 必须形如 AST-000001（AST- 加 6 位数字）」。
+
+### 24.2 三种结果示例
+
+**① 两侧都命中**（`200`）—— 答案、实际引用与两侧真实状态一起返回：
+
+```json
+{
+  "requestId": "8f4c1a2b-3333-4444-5555-666677778888",
+  "answer": "资产处于在用状态 [A1]，监控显示负载偏高 [M1]。",
+  "grounded": true,
+  "usedEvidenceIds": ["A1", "M1"],
+  "asset": {
+    "outcome": "FOUND",
+    "assetId": "AST-900001",
+    "assetType": "SERVER",
+    "status": "IN_SERVICE",
+    "source": "DEMO"
+  },
+  "monitoring": {
+    "outcome": "FOUND",
+    "assetId": "AST-900001",
+    "observedAt": "2026-01-01T00:00:00Z",
+    "health": "DEGRADED",
+    "cpuUtilizationPercent": 92,
+    "memoryUtilizationPercent": 68,
+    "activeAlertCount": 1,
+    "source": "DEMO"
+  }
+}
+```
+
+**② 两侧都没有**（`200`）—— 不调用模型，返回固定回答；两侧只给编号与来源，**不伪造详情**：
+
+```json
+{
+  "requestId": "1c7d…",
+  "answer": "未查询到该资产或可用的监控快照。",
+  "grounded": false,
+  "usedEvidenceIds": [],
+  "asset": {
+    "outcome": "NOT_FOUND",
+    "assetId": "AST-900001",
+    "source": "DEMO"
+  },
+  "monitoring": {
+    "outcome": "NOT_FOUND",
+    "assetId": "AST-900001",
+    "source": "DEMO"
+  }
+}
+```
+
+**③ 两侧都没查成**（`200`，例如两个 MCP 集成都关闭）—— **编排正常完成**，所以是 200；
+失败以稳定分类出现，**不会被写成 `NOT_FOUND`**：
+
+```json
+{
+  "requestId": "5a2e…",
+  "answer": "当前无法获得足够的资产与监控证据，暂时不能生成诊断结论。",
+  "grounded": false,
+  "usedEvidenceIds": [],
+  "asset": {
+    "outcome": "FAILED",
+    "failure": "DISABLED"
+  },
+  "monitoring": {
+    "outcome": "FAILED",
+    "failure": "DISABLED"
+  }
+}
+```
+
+> **部分命中**（一侧 `FOUND`、另一侧 `FAILED`/`NOT_FOUND`）走第 ① 种形状：
+> 答案是 `grounded=true` 且只引用可用证据，另一侧以它**真实的** `outcome`/`failure` 出现。
+
+### 24.3 字段映射规则
+
+`asset` 与 `monitoring` 使用同一套规则，**字段集合由 `outcome` 决定**；
+取值为 `null` 的字段**直接省略**（不会出现 `"failure":null` 这类空值）：
+
+| `outcome` | 输出字段 |
+| --- | --- |
+| `FOUND` | `outcome` + 该侧命中的白名单字段 + `source`（资产：`assetId`/`assetType`/`status`；监控：`assetId`/`observedAt`/`health`/`cpuUtilizationPercent`/`memoryUtilizationPercent`/`activeAlertCount`） |
+| `NOT_FOUND` | `outcome`、`assetId`、`source` |
+| `FAILED` | `outcome`、`failure`（`QueryFailure` 稳定枚举；**不**输出编号与来源） |
+
+监控的数值字段用包装类型：未命中时**省略**而不是序列化成 `0`
+（`cpuUtilizationPercent: 0` 看起来像「健康」，而不是「没有数据」）。
+`observedAt` 由 `Instant.toString()` 显式产出 ISO-8601 UTC，不依赖 Jackson 的日期配置。
+
+### 24.4 状态码矩阵
+
+| 情形 | 状态码 | 错误码 / 响应 |
+| --- | --- | --- |
+| 完整命中、部分命中、两侧 `NOT_FOUND`、两侧 `FAILED`/`DISABLED` | **200** | 可审计结果（见 24.2） |
+| 非法 `assetId`（空 body、`{}`、`null`、空白、位数或大小写不符、超长） | 400 | `INVALID_REQUEST`，detail 由用例给出，不回显输入 |
+| 请求体不是合法 JSON | 400 | `INVALID_REQUEST`「请求体不是合法 JSON」（全局 JSON 契约） |
+| 模型调用失败、引用校验失败、查询端口契约违约 | 502 | `AI_PROVIDER_ERROR` + `requestId`，detail 固定、不含 cause |
+| AI 未启用（默认） | 404 | `ENDPOINT_NOT_FOUND`（端点不注册） |
+
+> **`200` 不代表两个依赖都成功。** 状态码只表达「编排是否正常完成」：
+> 部分命中时答案仍是 `grounded=true`，但那次诊断是不完整的；两侧都 `DISABLED` 时
+> 编排同样正常返回固定降级结果。**数据状态只能从 `asset.outcome` / `monitoring.outcome` /
+> `failure` 读出来，不能从状态码推断。** 也正因如此，`FAILED` 永远不会出现在 `NOT_FOUND`
+> 的位置上 —— 一个是「查过了确实没有」，一个是「这次没查成」，后续动作不同。
+
+> **响应里没有**：MCP 原始报文、端点与会话标识、配置、异常类名与消息、堆栈、
+> 提示词或模型原始请求、API Key。响应对象由 HTTP 层显式构造，
+> 应用层与 agent 内部对象**不直接交给 Jackson**。
+
+### 24.5 边界收口（FD-0017-B 的两处修复）
+
+1. **查询端口返回 `null`**：端口按契约只返回三态结果，违约有两种形态 —— 抛异常，或返回 `null`。
+   两者都按 `PORT_CONTRACT_VIOLATION` 处理：**两次查询仍然各执行一次**（顺序固定为资产 → 监控），
+   然后整次诊断 502（不调用模型、不裸抛 `NullPointerException`）。
+   `null` **不会**被改写成 `NOT_FOUND`（把「没查成」说成「没有数据」）或 `FAILED`
+   （凭空构造一个我们并不知道原因的失败）；日志固定记为
+   `failure=PORT_CONTRACT_VIOLATION`、`exception=none`。
+2. **结果对象不变量**：`requestId` 与 `answer` 必须非 `null` 且**非空白**；
+   `usedEvidenceIds` 必须**已经按首次出现顺序去重** —— 出现重复编号（`["A1","A1"]`、
+   `["A1","M1","A1"]`）直接拒绝，而不是静默去重（去重是产出方的责任）。
+   `A1`/`M1` 白名单、`grounded` 与命中证据集合必须完全一致、防御性复制等既有规则不变。
+
+### 24.6 已知边界
+
+1. **没有鉴权**：接口没有身份与权限概念，能调用就能拿到该资产的诊断与监控数值；
+2. **没有真实 DeepSeek**：`LIVE_SMOKE=NOT_RUN`（自动化测试用本地合成 OpenAI 端点）；
+3. **没有真实企业数据源**：`MCP_LIVE=NOT_RUN`（端到端到本仓库两个演示 MCP 服务为止）；
+4. **引用校验不等于事实正确**：只证明引用能回到本次证据；
+5. **没有流式输出、会话记忆、重试、并行或缓存**；
+6. **单条快照**：只看最近一条监控快照，没有时间序列与趋势；
+7. `POSTGRES_LIVE`、`DASHSCOPE_LIVE` 与本阶段无关但全仓仍为 `NOT_RUN`。

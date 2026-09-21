@@ -55,6 +55,21 @@ import org.springframework.ai.chat.client.ChatClient;
  * 因此本类<b>从不</b>把失败改写成「没有数据」，也从不把 {@code DISABLED} 改写成「没有数据」：
  * 它们各自以原始 {@code QueryOutcome} + {@code QueryFailure} 出现在结果里。</p>
  *
+ * <h2>端口违约</h2>
+ * <p>两个查询端口按契约只返回三态结果、不抛异常，因此违约有两种形态，本类都当作
+ * {@link AssetDiagnosisFailure#PORT_CONTRACT_VIOLATION} 处理：</p>
+ * <ul>
+ *   <li><b>抛异常</b>；</li>
+ *   <li><b>返回 {@code null}</b> —— 契约里没有「没有结果」这个取值，
+ *       三态各自有专门的结果类型（{@code FOUND} 带记录、{@code NOT_FOUND} 带编号与来源、
+ *       {@code FAILED} 带稳定失败分类）。</li>
+ * </ul>
+ * <p>两种情况都<b>先完成第二次查询</b>（顺序与次数不变），再整次诊断失败：
+ * 不调用模型、记录固定脱敏日志、抛携带本次 {@code requestId} 的 {@link AiProviderException}。
+ * {@code null} 绝不被就地改写 —— 不补成 {@code NOT_FOUND}、不补成 {@code FAILED}、
+ * 也不允许穿透成裸 {@code NullPointerException}（那会让调用方收到 500
+ * 而不是 502，日志里也不会有稳定失败类别）。</p>
+ *
  * <h2>输入校验</h2>
  * <p>不合法输入（{@code null} 命令、{@code null}/空白/不满足 {@code AST-[0-9]{6}} 的编号）
  * 在<b>任何端口调用与模型调用之前</b>抛出 {@link AiRequestException}：
@@ -126,8 +141,9 @@ public class AssetDiagnosisService implements AssetDiagnosisUseCase {
         String requestId = UUID.randomUUID().toString();
 
         // ② 两次查询：顺序固定（资产 → 监控），各一次；第一次失败/未命中也要执行第二次
-        //    端口按契约只返回三态结果，这里仍然兜住「违约抛异常」的情况：
-        //    即使违约也会先完成第二次查询，然后整次诊断按 502 失败，绝不把违约伪装成某种查询状态
+        //    端口按契约只返回三态结果，这里仍然兜住两种违约形态（抛异常、返回 null）：
+        //    两种情况下都会先完成第二次查询，然后整次诊断按 502 失败，
+        //    绝不把违约伪装成某种查询状态
         AssetQueryResult asset = null;
         RuntimeException assetViolation = null;
         try {
@@ -146,8 +162,16 @@ public class AssetDiagnosisService implements AssetDiagnosisUseCase {
             monitoringViolation = ex;
         }
 
+        // 违约有两种形态，都属于 PORT_CONTRACT_VIOLATION：
+        //   1) 端口抛异常（契约要求只返回三态结果）；
+        //   2) 端口返回 null —— 契约里根本没有「没有结果」这个取值，三种状态各自有专门的类型。
+        // null 绝不允许被就地改写：既不能补成 NOT_FOUND（把「没查成」说成「没有数据」），
+        // 也不能补成 FAILED（凭空构造一个带 QueryFailure 的结果），更不能让它穿透成裸 NPE
+        // —— 那样调用方拿到的会是 500 而不是 502，且日志里也不会有稳定失败类别。
+        boolean assetReturnedNull = assetViolation == null && asset == null;
+        boolean monitoringReturnedNull = monitoringViolation == null && monitoring == null;
         RuntimeException violation = assetViolation != null ? assetViolation : monitoringViolation;
-        if (violation != null) {
+        if (violation != null || assetReturnedNull || monitoringReturnedNull) {
             logFailure(requestId, outcomeOf(asset), outcomeOf(monitoring), false, 0, 0,
                     AssetDiagnosisFailure.PORT_CONTRACT_VIOLATION, violation, startedAt);
             throw new AiProviderException(requestId, violation);
