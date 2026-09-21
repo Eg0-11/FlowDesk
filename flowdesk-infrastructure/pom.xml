@@ -149,5 +149,20 @@
         </exclusion>
       </exclusions>
     </dependency>
+
+    <!--
+      MCP 客户端（FD-0016）：主服务按次调用两个独立 MCP 服务的固定工具。
+      这里声明的是 Spring AI 的 MCP 集成构件（版本由 spring-ai-bom 管理，此处不写版本）：
+      它传递进来的正是官方 MCP Java SDK 的聚合构件 mcp（0.17.0，随附 mcp-core / mcp-json /
+      mcp-json-jackson2），与两个 MCP 服务用的是同一个版本 —— 因此 MCP SDK 的版本只有
+      「Spring AI 版本」这一个来源，不存在两处各写一份、互相漂移的可能。
+      它自带的 mcp-spring-webflux / mcp-spring-webmvc 是 optional，不会传递进来，
+      所以主服务不会因此多出一套 Web 运行时，也不会内嵌任何 MCP Server。
+      代码只用 SDK 的客户端与 Streamable HTTP 传输（只读查询），不加连接池、不做后台重连。
+    -->
+    <dependency>
+      <groupId>org.springframework.ai</groupId>
+      <artifactId>spring-ai-mcp</artifactId>
+    </dependency>
   </dependencies>
 </project>
