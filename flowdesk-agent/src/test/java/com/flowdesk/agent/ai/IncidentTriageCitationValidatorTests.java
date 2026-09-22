@@ -106,6 +106,37 @@ class IncidentTriageCitationValidatorTests {
     }
 
     @Test
+    void nestedBracketsAreRejectedInsteadOfBeingUnwrapped() {
+        String[] nested = {
+                "结论 [[A1]]。", "结论 [[M1]]。", "结论 [[K1]]。", "结论 [[K2]]。",
+                "结论 [ [M1] ]。", "结论 [[K1]。",
+                "正常 [K1]，嵌套 [[A1]]，监控 [M1]。",
+                "嵌套 [[A1]] 在前，正常 [K1] 与 [M1] 在后。",
+                "正常 [M1]，嵌套 [[K1]]，资产 [A1]。"
+        };
+        for (String answer : nested) {
+            assertFailure(answer, 2, ASSET_FOUND, MONITORING_FOUND,
+                    IncidentTriageFailure.INVALID_CITATION_FORMAT);
+        }
+    }
+
+    @Test
+    void nestedBracketsWithoutCitationIntentRemainPlainText() {
+        // 既有规则：完整 ASCII 字母方括号词不是引用；被再包一层也仍然不是引用意图
+        assertFailure("接口 [[API]] 与地址 [[MAC]] 都正常。", 0, ASSET_NOT_FOUND, MONITORING_FAILED,
+                IncidentTriageFailure.ANSWER_WITHOUT_CITATION);
+        assertThat(validate("接口 [[API]] 正常 [K1]，资产 [A1]，监控 [M1]。", 1, ASSET_FOUND, MONITORING_FOUND))
+                .containsExactly("K1", "A1", "M1");
+    }
+
+    @Test
+    void aStrayClosingBracketOutsideAnyGroupIsPlainText() {
+        // 记录的边界：只有「方括号组内部」参与解释，组外多余的右括号是普通文本
+        assertThat(validate("结论 [K1]，资产 [A1]，监控 [M1]]。", 1, ASSET_FOUND, MONITORING_FOUND))
+                .containsExactly("K1", "A1", "M1");
+    }
+
+    @Test
     void aKnowledgeFailureLeavesNoKnowledgeFamilyToCite() {
         KnowledgeEvidence failed = KnowledgeEvidence.failed(KnowledgeFailure.DISABLED);
 

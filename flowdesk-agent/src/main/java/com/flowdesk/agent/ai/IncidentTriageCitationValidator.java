@@ -22,6 +22,9 @@ import java.util.regex.Pattern;
  *   <li>其它一切（{@code [a1]}、{@code [K01]}、{@code [K 1]}、{@code [K1 ]}、{@code [K1x]}、
  *       {@code [K1,A1]}、{@code [A2]}、{@code [K]}、未闭合的 {@code [K1}、全角数字……）一律失败，
  *       不做任何修正、不补引用、不重新调用模型。</li>
+ *   <li><b>嵌套方括号</b>（{@code [[A1]]}、{@code [[K1]]}、{@code [ [M1] ]}）同样是畸形：
+ *       只要这种结构里出现引用意图，整条答案即失败 —— 不允许「忽略外层括号、把内层编号当成合法引用」
+ *       提取出成功编号（FD-0018-A-R1）。</li>
  * </ul>
  *
  * <h2>完整性要求</h2>
@@ -40,7 +43,10 @@ import java.util.regex.Pattern;
  * <ul>
  *   <li>只处理 ASCII 方括号：全角 {@code ［K1］} 不构成引用意图；</li>
  *   <li>不做同形字符识别、不做 Markdown/HTML 实体解码；</li>
- *   <li>纯 ASCII 字母方括号词（{@code [API]}、{@code [MAC]}、{@code [Known]}）按普通文本忽略；</li>
+ *   <li>纯 ASCII 字母方括号词（{@code [API]}、{@code [MAC]}、{@code [Known]}）按普通文本忽略；
+ *       这一条只对「不含引用意图」的方括号生效：{@code [[API]]} 也确实没有引用意图，因此同样忽略，
+ *       而 {@code [[A1]]} 里出现了 {@code A1} 的引用意图，因此整条答案判畸形；</li>
+ *   <li>括号之外多余的 {@code ]}（例如 {@code [K1]]} 的第二个右括号）不构成引用结构，按普通文本处理；</li>
  *   <li><b>只证明编号来源</b>：每个引用都能回到本次证据，<b>不</b>证明结论在事实上正确。</li>
  * </ul>
  */
@@ -55,6 +61,10 @@ final class IncidentTriageCitationValidator {
 
     private static final char MONITORING_PREFIX = 'M';
 
+    private static final char OPEN_BRACKET = '[';
+
+    private static final char CLOSE_BRACKET = ']';
+
     private IncidentTriageCitationValidator() {
     }
 
@@ -66,7 +76,7 @@ final class IncidentTriageCitationValidator {
      * @param asset      资产查询结果
      * @param monitoring 监控查询结果
      * @return 按首次出现顺序去重后的编号
-     * @throws IncidentTriageException 答案为空、无引用、畸形引用、未知编号或漏掉证据族
+     * @throws IncidentTriageException 答案为空、无引用、畸形引用（含嵌套方括号）、未知编号或漏掉证据族
      */
     static List<String> requireValidCitations(String rawAnswer, KnowledgeEvidence knowledge,
             AssetQueryResult asset, MonitoringSnapshotQueryResult monitoring) {
@@ -78,11 +88,24 @@ final class IncidentTriageCitationValidator {
         Set<String> available = IncidentTriageResult.availableEvidenceIds(knowledge, asset, monitoring);
 
         Set<String> used = new LinkedHashSet<>();
-        // 逐个左方括号检查（而不是非重叠正则），否则 [[K1]] 这类嵌套写法会让畸形引用漏检
-        for (int open = answer.indexOf('['); open >= 0; open = answer.indexOf('[', open + 1)) {
-            int close = answer.indexOf(']', open + 1);
+        // 按「成对方括号组」逐个检查（而不是非重叠正则）：先找出与当前左括号配对的右括号，
+        // 组内再出现方括号就是嵌套结构，绝不允许从里面提取编号
+        int open = answer.indexOf(OPEN_BRACKET);
+        while (open >= 0) {
+            int close = matchingClose(answer, open);
             String inner = close < 0 ? answer.substring(open + 1) : answer.substring(open + 1, close);
+
+            if (isNested(inner)) {
+                if (containsCitationIntent(inner)) {
+                    // [[A1]] / [[K1]] / [ [M1] ]：畸形，不得提取内层编号
+                    throw new IncidentTriageException(IncidentTriageFailure.INVALID_CITATION_FORMAT);
+                }
+                // [[API]] 这类不含引用意图的嵌套写法：整体按普通文本跳过
+                open = close < 0 ? answer.indexOf(OPEN_BRACKET, open + 1) : answer.indexOf(OPEN_BRACKET, close + 1);
+                continue;
+            }
             if (!hasCitationIntent(inner)) {
+                open = answer.indexOf(OPEN_BRACKET, open + 1);
                 continue;
             }
             if (close < 0) {
@@ -96,6 +119,7 @@ final class IncidentTriageCitationValidator {
                 throw new IncidentTriageException(IncidentTriageFailure.UNKNOWN_CITATION);
             }
             used.add(evidenceId);
+            open = answer.indexOf(OPEN_BRACKET, close + 1);
         }
 
         if (used.isEmpty()) {
@@ -104,6 +128,59 @@ final class IncidentTriageCitationValidator {
         requireEveryAvailableFamily(used, knowledge, asset, monitoring);
         return new ArrayList<>(used);
     }
+
+    /**
+     * 找出与指定左括号配对的右括号（按嵌套深度计数）。
+     *
+     * @param answer 整个答案
+     * @param open   左括号下标
+     * @return 配对右括号下标；未闭合时返回 {@code -1}
+     */
+    private static int matchingClose(String answer, int open) {
+        int depth = 0;
+        for (int index = open; index < answer.length(); index++) {
+            char current = answer.charAt(index);
+            if (current == OPEN_BRACKET) {
+                depth++;
+            }
+            else if (current == CLOSE_BRACKET) {
+                depth--;
+                if (depth == 0) {
+                    return index;
+                }
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * @param inner 一组方括号之间的内容
+     * @return 这一组里是否还嵌着方括号
+     */
+    private static boolean isNested(String inner) {
+        return inner.indexOf(OPEN_BRACKET) >= 0;
+    }
+
+    /**
+     * 一段文本里是否出现引用意图（含更深层的方括号）。
+     *
+     * @param text 文本
+     * @return 是否出现引用意图
+     */
+    private static boolean containsCitationIntent(String text) {
+        if (hasCitationIntent(text)) {
+            return true;
+        }
+        for (int open = text.indexOf(OPEN_BRACKET); open >= 0; open = text.indexOf(OPEN_BRACKET, open + 1)) {
+            int close = text.indexOf(CLOSE_BRACKET, open + 1);
+            String inner = close < 0 ? text.substring(open + 1) : text.substring(open + 1, close);
+            if (hasCitationIntent(inner)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
 
     /**
      * 每一族本次有证据的来源都必须被引用。

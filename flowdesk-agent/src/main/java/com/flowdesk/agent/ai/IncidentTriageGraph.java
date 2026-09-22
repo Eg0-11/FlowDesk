@@ -49,19 +49,24 @@ import org.springframework.ai.chat.client.ChatClient;
  *
  * <h2>执行语义</h2>
  * <ol>
- *   <li>{@code validate_asset}：用既有 {@link AssetIdentifier} 校验 assetId；不合法抛
+ *   <li>{@code validate_asset}：用既有 {@link AssetIdentifier} 校验 assetId；不合法时把这次
+ *       <b>输入校验失败</b>记进调用上下文（{@link IncidentTriageCall#rejectInput(String)}）并抛出
  *       {@link AiRequestException} —— 后面的证据节点与模型<b>一个都不会执行</b>；</li>
  *   <li>{@code retrieve_knowledge}：调用既有检索用例。输入不合法（{@code INVALID_RETRIEVAL_QUERY}）
- *       同样抛 {@link AiRequestException}；其余失败（向量化关闭、Embedding/重排上游故障、内部失败）
- *       收敛为知识分支的 {@code FAILED} + 稳定分类，<b>继续</b>查询资产与监控；</li>
+ *       同样记为输入校验失败并抛出；<b>已声明</b>的知识业务失败（向量化关闭、Embedding/重排上游故障、
+ *       内部失败）收敛为知识分支的 {@code FAILED} + 稳定分类，<b>继续</b>查询资产与监控；
+ *       而<b>未声明</b>的运行期异常或 {@code null} 结果属于<b>端口违约</b>，同样继续执行后续节点，
+ *       但最终在调用模型之前整次失败（不得伪装成「知识检索失败」后照常作答）；</li>
  *   <li>{@code query_asset} / {@code query_monitoring}：各调用端口一次，不重试、不缓存；
  *       {@code FAILED}/{@code NOT_FOUND} 原样保留；端口返回 {@code null} 或抛异常记为
  *       <b>端口契约违约</b>，但下一个证据节点仍然执行；</li>
  *   <li>{@code verify_contracts}：有违约 → 路由 {@code contract_violation}；否则校验本次调用上下文
- *       的形状（缺失 → {@link IncidentTriageFailure#GRAPH_FAILURE}），并按「有没有可用证据」决定路由；</li>
+ *       的形状（缺失 → {@link IncidentTriageFailure#GRAPH_FAILURE}），并按「有没有可用证据」决定路由；
+ *       路由同时写进状态与调用上下文，因此失败日志里的 {@code graphRoute} 是真实算出来的；</li>
  *   <li>{@code evidence_gate}：<b>条件边</b>，把 route 映射到目标节点；</li>
- *   <li>{@code generate_answer} → {@code validate_citations}：模型<b>只调用一次</b>，
- *       然后独立校验引用；失败抛 {@link IncidentTriageException}（不修正、不重试）；</li>
+ *   <li>{@code generate_answer} → {@code validate_citations}：模型<b>只调用一次</b>（调用之前就在
+ *       调用上下文里置位「已发起模型调用」，因此后续任何失败都能如实记录），然后独立校验引用；
+ *       失败抛 {@link IncidentTriageException}（不修正、不重试）；</li>
  *   <li>{@code fallback_answer}：完全没有可用证据时的两条固定降级文案（不调用模型）；</li>
  *   <li>{@code finish}：正常终点。</li>
  * </ol>
@@ -195,7 +200,7 @@ final class IncidentTriageGraph {
         IncidentTriageCommand command = call.getCommand();
         String assetId = command == null ? null : command.assetId();
         if (!AssetIdentifier.isValid(assetId)) {
-            throw new AiRequestException(INVALID_ASSET_ID_MESSAGE);
+            throw call.rejectInput(INVALID_ASSET_ID_MESSAGE);
         }
         return update(IncidentTriageNodes.VALIDATE_ASSET);
     }
@@ -210,6 +215,7 @@ final class IncidentTriageGraph {
             KnowledgeRetrievalView view = this.retrieveKnowledgeUseCase.retrieve(
                     new RetrieveKnowledgeQuery(command.question(), command.topK(), command.minScore()));
             if (view == null) {
+                // 契约里没有 null：这是端口违约，不是「没查到」
                 call.markContractViolation();
                 return update;
             }
@@ -220,13 +226,15 @@ final class IncidentTriageGraph {
         catch (KnowledgeApplicationException ex) {
             if (ex.errorCode() == KnowledgeApplicationErrorCode.INVALID_RETRIEVAL_QUERY) {
                 // 输入不合法 → 400；此时资产、监控与模型都还没有被调用
-                throw new AiRequestException(ex.getMessage());
+                throw call.rejectInput(ex.getMessage());
             }
+            // 已声明的知识业务失败：收敛为该分支的稳定分类，资产与监控照常查询
             call.setKnowledge(KnowledgeEvidence.failed(knowledgeFailure(ex.errorCode())));
         }
         catch (RuntimeException ex) {
-            // 检索链路的任何其它运行期异常：知识分支 FAILED，但资产与监控照常查询
-            call.setKnowledge(KnowledgeEvidence.failed(KnowledgeFailure.RETRIEVAL_FAILURE));
+            // 未声明的运行期异常说明端口违反了契约（它只允许返回视图或抛 KnowledgeApplicationException）：
+            // 按端口违约处理，绝不伪装成「知识检索失败」后继续用其它来源作答
+            call.markContractViolation();
         }
         return update;
     }
@@ -272,15 +280,30 @@ final class IncidentTriageGraph {
         Map<String, Object> update = update(IncidentTriageNodes.VERIFY_CONTRACTS);
 
         if (call.isContractViolation()) {
-            update.put(IncidentTriageStateKeys.ROUTE, IncidentTriageNodes.ROUTE_CONTRACT_VIOLATION);
-            return update;
+            return route(update, call, IncidentTriageNodes.ROUTE_CONTRACT_VIOLATION);
         }
 
         requireResults(call);
         boolean hasEvidence = !IncidentTriageResult
                 .availableEvidenceIds(call.getKnowledge(), call.getAsset(), call.getMonitoring()).isEmpty();
-        update.put(IncidentTriageStateKeys.ROUTE,
-                hasEvidence ? IncidentTriageNodes.ROUTE_EVIDENCE_AVAILABLE : IncidentTriageNodes.ROUTE_NO_EVIDENCE);
+        return route(update, call, hasEvidence ? IncidentTriageNodes.ROUTE_EVIDENCE_AVAILABLE
+                : IncidentTriageNodes.ROUTE_NO_EVIDENCE);
+    }
+
+    /**
+     * 把本次路由同时写进<b>状态</b>（条件边的输入）与<b>调用上下文</b>（失败路径的审计依据）。
+     *
+     * <p>图执行抛异常时框架不会交出最终状态，因此失败日志里的 {@code graphRoute} 只能来自调用上下文；
+     * 两个写入点放在一起，保证它们不可能不一致。</p>
+     *
+     * @param update 本节点的增量
+     * @param call   调用上下文
+     * @param route  本次路由值
+     * @return 增量（已含路由）
+     */
+    private static Map<String, Object> route(Map<String, Object> update, IncidentTriageCall call, String route) {
+        update.put(IncidentTriageStateKeys.ROUTE, route);
+        call.setRoute(route);
         return update;
     }
 
@@ -315,6 +338,8 @@ final class IncidentTriageGraph {
                 call.getAsset(), call.getMonitoring());
 
         String rawAnswer;
+        // 在真正发起调用之前置位：此后任何失败（包括空答案）都必须记为「模型已经被调用过」
+        call.markModelCallStarted();
         try {
             rawAnswer = this.deepSeekChatClient.prompt()
                     .system(prompt.systemPrompt())
@@ -323,6 +348,8 @@ final class IncidentTriageGraph {
                     .content();
         }
         catch (RuntimeException ex) {
+            // 模型阶段的任何异常（即使它直接或间接包含 AiRequestException）都是模型失败，
+            // 绝不沿着 cause 链把它降级成「输入不合法」
             throw new IncidentTriageException(IncidentTriageFailure.MODEL_CALL_FAILED, ex);
         }
         if (rawAnswer == null || rawAnswer.strip().isEmpty()) {

@@ -188,7 +188,8 @@ class IncidentTriageGraphTests {
             assertThatThrownBy(() -> fixture.service.triage(
                     new IncidentTriageCommand(assetId, QUESTION, null, null)))
                     .as("assetId=[%s]", assetId)
-                    .isInstanceOf(AiRequestException.class);
+                    .isInstanceOf(AiRequestException.class)
+                    .hasMessage(IncidentTriageGraph.INVALID_ASSET_ID_MESSAGE);
         }
         assertThatThrownBy(() -> fixture.service.triage(null)).isInstanceOf(AiRequestException.class);
 
@@ -205,7 +206,8 @@ class IncidentTriageGraphTests {
                 KnowledgeApplicationErrorCode.INVALID_RETRIEVAL_QUERY, "问题不能为空"));
 
         assertThatThrownBy(() -> fixture.service.triage(new IncidentTriageCommand(ASSET_ID, "  ", 0, -1.0)))
-                .isInstanceOf(AiRequestException.class);
+                .isInstanceOf(AiRequestException.class)
+                .hasMessage("问题不能为空");
 
         assertThat(fixture.retrieval.calls()).isEqualTo(1);
         assertThat(fixture.assetPort.calls()).as("检索输入非法：资产查询零调用").isZero();
@@ -242,17 +244,110 @@ class IncidentTriageGraphTests {
     }
 
     @Test
-    void anUnexpectedRetrievalExceptionBecomesAnInternalRetrievalFailure() {
-        Fixture fixture = new Fixture("资产在保 [A1]，监控偏高 [M1]。");
+    void anUndeclaredRetrievalFailureIsAContractViolationThatStillQueriesBothPorts() {
+        Fixture fixture = new Fixture("绝不该被调用。");
         fixture.retrieval.throwsUnexpectedly(new IllegalStateException("sentinel retrieval exploded"));
+
+        assertThatThrownBy(fixture::triage)
+                .isInstanceOf(AiProviderException.class)
+                .satisfies(thrown -> {
+                    AiProviderException failure = (AiProviderException) thrown;
+                    assertThat(failure.requestId()).isNotBlank();
+                    assertThat(failure.getMessage()).as("对外文案固定").isEqualTo("上游 AI 服务调用失败");
+                    assertThat(failure.getMessage()).doesNotContain("sentinel");
+                });
+
+        assertThat(fixture.retrieval.calls()).as("知识检索恰好一次").isEqualTo(1);
+        assertThat(fixture.assetPort.calls()).as("未声明的检索异常不是「知识失败」，后续证据照常查询").isEqualTo(1);
+        assertThat(fixture.monitoringPort.calls()).isEqualTo(1);
+        assertThat(fixture.model.calls()).as("违约在调用模型前统一失败").isZero();
+    }
+
+    @Test
+    void aNullRetrievalResultIsTheSameContractViolation() {
+        Fixture fixture = new Fixture("绝不该被调用。");
+        fixture.retrieval.returnsNull();
+
+        assertThatThrownBy(fixture::triage).isInstanceOf(AiProviderException.class);
+
+        assertThat(fixture.assetPort.calls()).isEqualTo(1);
+        assertThat(fixture.monitoringPort.calls()).isEqualTo(1);
+        assertThat(fixture.model.calls()).isZero();
+    }
+
+    @Test
+    void aModelAiRequestExceptionIsNeverClassifiedAsAnInputError() {
+        String sentinel = "review-provider-message-sentinel";
+        Fixture fixture = new Fixture(new AiRequestException(sentinel));
+
+        assertThatThrownBy(fixture::triage)
+                .as("模型阶段抛出的输入异常不得被当成 400")
+                .isInstanceOf(AiProviderException.class)
+                .isNotInstanceOf(AiRequestException.class)
+                .satisfies(thrown -> {
+                    AiProviderException failure = (AiProviderException) thrown;
+                    assertThat(failure.requestId()).isNotBlank();
+                    assertThat(failure.getMessage()).isEqualTo("上游 AI 服务调用失败");
+                    assertThat(failure.getMessage()).doesNotContain(sentinel);
+                    assertThat(triageFailureOf(thrown)).as("保持模型失败分类").isEqualTo(
+                            IncidentTriageFailure.MODEL_CALL_FAILED);
+                    assertThat(messagesOf(thrown)).as("哨兵确实存在过，只是不外泄").contains(sentinel);
+                });
+
+        assertThat(fixture.model.calls()).as("模型只调用一次").isEqualTo(1);
+    }
+
+    @Test
+    void aModelExceptionWrappingAnAiRequestExceptionStaysAModelFailure() {
+        String sentinel = "review-provider-message-sentinel";
+        Fixture fixture = new Fixture(
+                new IllegalStateException("model-wrapper-sentinel", new AiRequestException(sentinel)));
+
+        assertThatThrownBy(fixture::triage)
+                .isInstanceOf(AiProviderException.class)
+                .isNotInstanceOf(AiRequestException.class)
+                .satisfies(thrown -> {
+                    assertThat(((AiProviderException) thrown).requestId()).isNotBlank();
+                    assertThat(thrown.getMessage()).doesNotContain(sentinel).doesNotContain("model-wrapper-sentinel");
+                    assertThat(triageFailureOf(thrown)).isEqualTo(IncidentTriageFailure.MODEL_CALL_FAILED);
+                    assertThat(messagesOf(thrown)).contains(sentinel);
+                });
+
+        assertThat(fixture.model.calls()).isEqualTo(1);
+    }
+
+    @Test
+    void aNestedCitationAnswerFailsTheGraphWithoutRepairOrRetry() {
+        Fixture fixture = new Fixture("现象 [K1]，资产 [[A1]]，监控 [M1]。");
+
+        assertThatThrownBy(fixture::triage)
+                .isInstanceOf(AiProviderException.class)
+                .satisfies(thrown -> {
+                    AiProviderException failure = (AiProviderException) thrown;
+                    assertThat(failure.requestId()).isNotBlank();
+                    assertThat(failure.getMessage()).isEqualTo("上游 AI 服务调用失败");
+                    assertThat(messagesOf(thrown)).doesNotContain("[[A1]]");
+                });
+
+        assertThat(fixture.model.calls()).as("不修正、不重新调用模型").isEqualTo(1);
+        assertThat(fixture.assetPort.calls()).isEqualTo(1);
+        assertThat(fixture.monitoringPort.calls()).isEqualTo(1);
+    }
+
+    @Test
+    void aKnowledgeFailureStillAllowsPartialEvidenceGeneration() {
+        Fixture fixture = new Fixture("资产在保 [A1]，监控偏高 [M1]。");
+        fixture.retrieval.fails(new KnowledgeApplicationException(
+                KnowledgeApplicationErrorCode.EMBEDDING_PROVIDER_ERROR, "embedding 上游故障"));
 
         IncidentTriageResult result = fixture.triage();
 
+        assertThat(result.grounded()).isTrue();
+        assertThat(result.usedEvidenceIds()).containsExactly("A1", "M1");
         assertThat(result.knowledge().isFailed()).isTrue();
-        assertThat(result.knowledge().failure()).isEqualTo(KnowledgeFailure.RETRIEVAL_FAILURE);
         assertThat(fixture.assetPort.calls()).isEqualTo(1);
         assertThat(fixture.monitoringPort.calls()).isEqualTo(1);
-        assertThat(result.answer()).doesNotContain("sentinel");
+        assertThat(fixture.model.calls()).isEqualTo(1);
     }
 
     @Test
@@ -348,9 +443,44 @@ class IncidentTriageGraphTests {
         return false;
     }
 
+    /**
+     * 在<b>有界</b>的 cause 链上找服务端稳定失败分类（用于断言「分类没有被输入异常覆盖」）。
+     *
+     * @param thrown 抛出的异常
+     * @return 找到的失败分类；没有则为 {@code null}
+     */
+    private static IncidentTriageFailure triageFailureOf(Throwable thrown) {
+        Throwable current = thrown;
+        for (int depth = 0; current != null && depth < 16; depth++) {
+            if (current instanceof IncidentTriageException triage) {
+                return triage.failure();
+            }
+            current = current.getCause();
+        }
+        return null;
+    }
+
+    /**
+     * 收集整个 cause 链上的异常消息（用于「先证明哨兵存在，再证明不外泄」）。
+     *
+     * @param thrown 抛出的异常
+     * @return 消息列表
+     */
+    private static List<String> messagesOf(Throwable thrown) {
+        List<String> messages = new ArrayList<>();
+        Throwable current = thrown;
+        for (int depth = 0; current != null && depth < 16; depth++) {
+            if (current.getMessage() != null) {
+                messages.add(current.getMessage());
+            }
+            current = current.getCause();
+        }
+        return messages;
+    }
+
     @Test
     void concurrentRunsDoNotLeakStateBetweenRequests() throws Exception {
-        Fixture fixture = new Fixture(null);
+        Fixture fixture = new Fixture((String) null);
         fixture.retrieval.answersPerQuestion();
         fixture.assetPort.answersPerAssetId();
 
@@ -427,6 +557,19 @@ class IncidentTriageGraphTests {
                     ChatClient.create(this.model));
         }
 
+        /**
+         * 让模型在调用时抛出指定异常（用于模型阶段的失败语义）。
+         *
+         * @param failure 模型抛出的异常
+         */
+        Fixture(RuntimeException failure) {
+            this.model = new FakeChatModel(failure);
+            this.graph = new IncidentTriageGraph(this.retrieval, this.assetPort, this.monitoringPort,
+                    ChatClient.create(this.model));
+            this.service = new IncidentTriageService(this.retrieval, this.assetPort, this.monitoringPort,
+                    ChatClient.create(this.model));
+        }
+
         IncidentTriageResult triage() {
             return this.service.triage(new IncidentTriageCommand(ASSET_ID, QUESTION, 5, 0.3));
         }
@@ -444,6 +587,8 @@ class IncidentTriageGraphTests {
 
         private boolean perQuestion;
 
+        private boolean nullView;
+
         @Override
         public KnowledgeRetrievalView retrieve(RetrieveKnowledgeQuery query) {
             this.queries.add(query);
@@ -452,6 +597,9 @@ class IncidentTriageGraphTests {
             }
             if (this.unexpected != null) {
                 throw this.unexpected;
+            }
+            if (this.nullView) {
+                return null;
             }
             if (this.perQuestion) {
                 return retrievalWithCitations(1);
@@ -473,6 +621,10 @@ class IncidentTriageGraphTests {
 
         void answersPerQuestion() {
             this.perQuestion = true;
+        }
+
+        void returnsNull() {
+            this.nullView = true;
         }
 
         int calls() {
@@ -558,13 +710,24 @@ class IncidentTriageGraphTests {
 
         private final String fixedAnswer;
 
+        private final RuntimeException failure;
+
         FakeChatModel(String fixedAnswer) {
             this.fixedAnswer = fixedAnswer;
+            this.failure = null;
+        }
+
+        FakeChatModel(RuntimeException failure) {
+            this.fixedAnswer = null;
+            this.failure = failure;
         }
 
         @Override
         public ChatResponse call(Prompt prompt) {
             this.prompts.add(prompt);
+            if (this.failure != null) {
+                throw this.failure;
+            }
             return new ChatResponse(List.of(new Generation(new AssistantMessage(answerFor(prompt)))));
         }
 

@@ -45,22 +45,35 @@ FD-0018-A 要求把编排升级为「事件研判」，与资产诊断相比多�
    检索输入的合法性（空问题、`topK`/`minScore` 范围）仍由检索用例判定，
    本层**不复制第二套规则**。两者非法一律 `AiRequestException`（400），
    **后续节点与模型零调用**。
-7. **知识失败收敛为稳定分类**（`KnowledgeFailure`），绝不改写成「没查到」：
+7. **「输入失败 → 400」的来源边界（R1 修正）**：输入校验失败只由这两个输入节点产生，
+   并且必须**记在调用上下文里**（`IncidentTriageCall.rejectInput`）；
+   服务层只认这条记录，**不**沿异常 cause 链搜索 `AiRequestException` ——
+   模型阶段抛出的任何（直接或间接包含）`AiRequestException` 的异常都必须保持
+   `MODEL_CALL_FAILED`，对外是携带 `requestId`、固定文案的 `AiProviderException`。
+8. **知识失败分两类（R1 修正）**：**已声明**的业务失败收敛为知识分支的稳定分类，绝不改写成「没查到」：
    `KNOWLEDGE_EMBEDDING_DISABLED → DISABLED`、`EMBEDDING_PROVIDER_ERROR → EMBEDDING_PROVIDER_UNAVAILABLE`、
-   `RERANK_PROVIDER_ERROR → RERANK_PROVIDER_UNAVAILABLE`、其余（含 `KNOWLEDGE_RETRIEVAL_FAILURE`
-   与检索链路上任何未预期运行期异常）`→ RETRIEVAL_FAILURE`。
-8. **端口违约有自己的出口**：查询端口返回 `null` 或抛异常记为「端口契约违约」，
-   **其余证据节点照常执行**，但在 `verify_contracts` 之后路由到 `contract_violation` 节点，
-   在调用模型之前整次失败（502 + `requestId`），不补成 `NOT_FOUND`、不伪造 `FAILED`、不让 `NullPointerException` 穿透。
-9. **应用层契约先于编排落地**：新增 `IncidentTriageCommand`、`IncidentTriageUseCase`、
-   `IncidentTriageResult`、`KnowledgeEvidence`、`KnowledgeFailure`；不变量由记录的紧凑构造器强制。
-10. **引用协议**：知识沿用检索给出的 `K1…Kn`，资产固定 `A1`，监控固定 `M1`；
+   `RERANK_PROVIDER_ERROR → RERANK_PROVIDER_UNAVAILABLE`、`KNOWLEDGE_RETRIEVAL_FAILURE → RETRIEVAL_FAILURE`；
+   而**未声明**的运行期异常与 `null` 结果属于**端口违约**（端口只允许返回视图或抛
+   `KnowledgeApplicationException`），不与「知识检索失败」混为一谈。
+9. **端口违约有自己的出口**：知识、资产、监控任一侧返回 `null` 或抛出未声明的异常都记为
+   「端口契约违约」，**其余证据节点照常执行**（各一次），但在 `verify_contracts` 之后路由到
+   `contract_violation` 节点，在调用模型之前整次失败（502 + `requestId`），
+   不补成 `NOT_FOUND`、不伪造 `FAILED`、不让 `NullPointerException` 穿透。
+10. **应用层契约先于编排落地**：新增 `IncidentTriageCommand`、`IncidentTriageUseCase`、
+    `IncidentTriageResult`、`KnowledgeEvidence`、`KnowledgeFailure`；不变量由记录的紧凑构造器强制。
+11. **引用协议**：知识沿用检索给出的 `K1…Kn`，资产固定 `A1`，监控固定 `M1`；
     输出侧独立校验，失败即整次失败，**不修正、不补引用、不重新调用模型**。
-11. **异常边界**：图内只抛稳定分类的 `IncidentTriageException`；
+    **嵌套方括号**（`[[A1]]`、`[[K1]]`、`[ [M1] ]`）一律判畸形，**不得**忽略外层括号后
+    从内层提取成功编号（R1 修正）。
+12. **异常边界**：图内只抛稳定分类的 `IncidentTriageException`；
     服务层把它收敛成 `AiProviderException`（502 + `requestId`，固定文案、不含 cause），
-    把 `AiRequestException` 原样上抛（400）。
-12. **日志固定两条模板**，只记录元数据与异常**类名**；业务数据没有任何位置可放（见下）。
-13. **本阶段不提供 HTTP**：控制器、DTO 与状态码语义留给 FD-0018-B（可参照 ADR 0014 的 HTTP 契约）。
+    把**输入节点记录的** `AiRequestException` 原样上抛（400）。
+13. **失败路径的审计信息来自真实执行（R1 修正）**：三个来源状态、`graphRoute`、`evidenceCount`
+    取自调用上下文里已经发生的进度；`modelCalled` 在**发起模型调用之前**置位（不是调用成功后更新，
+    也不是按计划路由推测）；未执行到的部分才写成 `NOT_QUERIED`/`none`；
+    引用校验失败时 `usedEvidenceCount` 必然是 0（不伪造一个「已通过校验」的数量）。
+14. **日志固定两条模板**，只记录元数据与异常**类名**；业务数据没有任何位置可放（见下）。
+15. **本阶段不提供 HTTP**：控制器、DTO 与状态码语义留给 FD-0018-B（可参照 ADR 0014 的 HTTP 契约）。
 
 ## 拓扑
 
@@ -75,14 +88,14 @@ START → validate_asset → retrieve_knowledge → query_asset → query_monito
 
 | 节点 | 职责 | 关键约束 |
 | --- | --- | --- |
-| `validate_asset` | 用既有 `AssetIdentifier` 校验 `assetId` | 非法即抛，后续节点与模型零调用 |
-| `retrieve_knowledge` | 调用检索用例一次 | 输入非法 → 400；其它失败收敛为知识分支 `FAILED` 并**继续** |
+| `validate_asset` | 用既有 `AssetIdentifier` 校验 `assetId` | 非法即把输入失败记进调用上下文并抛出，后续节点与模型零调用 |
+| `retrieve_knowledge` | 调用检索用例一次 | 输入非法 → 记录输入失败（400）；**已声明**失败 → 知识分支 `FAILED` 并**继续**；未声明异常/`null` → 端口违约 |
 | `query_asset` | 调用资产端口一次 | 不重试、不缓存；`null`/异常记为端口违约但**继续** |
 | `query_monitoring` | 调用监控端口一次 | 同上；即使资产侧违约也照常执行 |
-| `verify_contracts` | 有违约 → 路由 `contract_violation`；否则校验本次上下文形状并算出闸门路由 | 形状缺失 → `GRAPH_FAILURE` |
+| `verify_contracts` | 有违约 → 路由 `contract_violation`；否则校验本次上下文形状并算出闸门路由 | 形状缺失 → `GRAPH_FAILURE`；路由同时写进状态与调用上下文 |
 | `evidence_gate` | **条件边**的源节点（真实的过路节点） | 三个出口全部由 `route` 决定 |
-| `generate_answer` | 构造提示词、调用 DeepSeek **一次** | 模型异常 → `MODEL_CALL_FAILED`；空答案 → `ANSWER_EMPTY` |
-| `validate_citations` | 独立校验引用 | 失败即整次失败，不重试 |
+| `generate_answer` | 构造提示词、调用 DeepSeek **一次** | 调用前置位 `modelCalled`；模型异常 → `MODEL_CALL_FAILED`；空答案 → `ANSWER_EMPTY` |
+| `validate_citations` | 独立校验引用 | 失败即整次失败，不重试、不修正 |
 | `fallback_answer` | 两条固定降级文案 | **不**调用模型 |
 | `contract_violation` | 违约终止节点 | **不**调用模型；服务统一抛稳定失败 |
 | `finish` | 正常终点 | —— |
@@ -91,7 +104,7 @@ START → validate_asset → retrieve_knowledge → query_asset → query_monito
 
 | key | 类型 | 合并策略 | 写入者 |
 | --- | --- | --- | --- |
-| `call` | `IncidentTriageCall` | **REPLACE** | 调用方创建（输入）；各节点在执行中写入自己的产物 |
+| `call` | `IncidentTriageCall` | **REPLACE** | 调用方创建（输入）；各节点在执行中写入自己的产物与执行进度 |
 | `route` | `String` | **REPLACE** | `verify_contracts` |
 | `executionPath` | `List<String>` | **APPEND** | 每个节点各自追加自己的节点名 |
 
@@ -99,6 +112,10 @@ START → validate_asset → retrieve_knowledge → query_asset → query_monito
 散落的魔法字符串会让「谁写了这个键、用什么策略合并」无法审计。
 `executionPath` 是唯一的 APPEND 键，因此 `IncidentTriageResult.executionPath` 是**真实执行**的轨迹，
 不是结束后拼出来的。
+
+`call` 里除了三个证据结果与答案，还携带**执行进度**（R1 补充）：实际路由、是否已经发起过模型调用、
+以及输入校验失败（如果有）。原因见「失败路径的审计信息」一节：图内抛异常时框架不交出最终状态，
+失败日志只能从调用上下文读真实进度。
 
 ### 为什么只有一个「富对象」键（框架的硬约束）
 
@@ -122,7 +139,7 @@ Graph 框架为每个 `NodeOutput` 生成状态快照时会对状态做**序列�
 | 至少一个来源有可用证据 | **调用一次** | `evidence_available` | `grounded=true`，引用本次存在的编号；三个来源的真实状态原样保留 |
 | 三个来源都没有可用证据且都不是失败 | 不调用 | `no_evidence` | 固定回答「未找到可用于事件研判的资产、监控或知识证据。」 |
 | 三个来源都没有可用证据，且至少一个 `FAILED`/`DISABLED` | 不调用 | `no_evidence` | 固定降级回答「当前无法获得足够证据，暂时不能完成事件研判。」 |
-| 任一端口返回 `null` 或抛异常 | 不调用 | `contract_violation` | 502 + `requestId`，`failure=PORT_CONTRACT_VIOLATION` |
+| 任一来源返回 `null` 或抛出**未声明**的运行期异常 | 不调用 | `contract_violation` | 502 + `requestId`，`failure=PORT_CONTRACT_VIOLATION` |
 
 两条「没有证据」的文案必须分开：**「都没查到」是可以接受的事实**，而
 **「有来源没查成」意味着这次研判不完整**，调用方可能需要重试或升级。
@@ -135,23 +152,41 @@ Graph 框架为每个 `NodeOutput` 生成状态快照时会对状态做**序列�
 
 | 来源 | 成功 | 未命中 | 失败 |
 | --- | --- | --- | --- |
-| 知识（检索用例） | `FOUND` + 非空检索视图（可引用 `K1…Kn`） | `NOT_FOUND` + 空检索视图（「查过了没有」也能审计） | `FAILED` + 稳定 `KnowledgeFailure`，**没有**检索视图 |
-| 资产（`AssetQueryPort`） | `FOUND`（可引用 `A1`） | `NOT_FOUND` | `FAILED` + `QueryFailure` |
-| 监控（`MonitoringSnapshotQueryPort`） | `FOUND`（可引用 `M1`） | `NOT_FOUND` | `FAILED` + `QueryFailure` |
+| 知识（检索用例） | `FOUND` + 非空检索视图（可引用 `K1…Kn`） | `NOT_FOUND` + 空检索视图（「查过了没有」也能审计） | **已声明**的 `KnowledgeApplicationException` → `FAILED` + 稳定 `KnowledgeFailure`，**没有**检索视图；**未声明**的运行期异常或 `null` → **端口违约**（不是知识失败） |
+| 资产（`AssetQueryPort`） | `FOUND`（可引用 `A1`） | `NOT_FOUND` | `FAILED` + `QueryFailure`；`null`/异常 → **端口违约** |
+| 监控（`MonitoringSnapshotQueryPort`） | `FOUND`（可引用 `M1`） | `NOT_FOUND` | `FAILED` + `QueryFailure`；`null`/异常 → **端口违约** |
 
 三态互斥且携带的数据形状固定（由记录的构造器强制）：`FAILED` 不可能携带视图或结果，
 否则「没查成」就有了看起来正常的证据。**`FAILED`/`DISABLED` 永远不会出现在 `NOT_FOUND` 的位置上。**
+
+**「已声明失败」与「端口违约」必须分开**（R1 修正）：检索用例的契约是「返回视图，或抛
+`KnowledgeApplicationException`」。因此：
+
+- 抛**已声明**异常 → 这是**业务失败**，如实收敛为该分支的 `FAILED` + 稳定分类，
+  其余来源照常用作证据（部分命中）；
+- 抛**未声明**的运行期异常、或返回 `null` → 这是**实现违约**：写成 `FAILED` 会让一次
+  **没查成的**检索看起来像「查过了、失败了」，还会让研判继续基于不完整输入给出 `grounded=true` 的结论。
+  按违约处理：后续证据节点照常执行，但在调用模型之前整次失败。
+
 
 ## 引用协议：保证什么、不保证什么
 
 - 编号固定：`A1` = 资产记录、`M1` = 监控快照；知识沿用检索最终顺序给出的 `K1…Kn`。
 - 模型答案里的引用被独立校验（`IncidentTriageCitationValidator`）：
   空答案 → `ANSWER_EMPTY`；一条引用都没有 → `ANSWER_WITHOUT_CITATION`；
-  畸形引用（`[k1]`、`[K01]`、`[K 1]`、`[K1x]`、`[K1` 未闭合、全角数字等）→ `INVALID_CITATION_FORMAT`；
+  畸形引用（`[k1]`、`[K01]`、`[K 1]`、`[K1x]`、`[K1` 未闭合、全角数字、
+  **嵌套方括号 `[[A1]]`/`[[K1]]`/`[ [M1] ]`** 等）→ `INVALID_CITATION_FORMAT`；
   引用本次并不存在的编号 → `UNKNOWN_CITATION`；本次有证据的某一类完全没有被引用 →
   `EVIDENCE_FAMILY_NOT_CITED`。重复引用按**首次出现顺序**去重（不静默重排）。
+- **嵌套方括号必须整体失败**（R1 修正）：校验器按「成对方括号组」扫描（先求配对的右括号，
+  组内再出现方括号即为嵌套）。此前逐左括号扫描的写法会**忽略外层、把内层编号当成合法引用提取**，
+  于是一条畸形答案也能通过校验；现在只要嵌套结构里出现引用意图，整条答案即
+  `INVALID_CITATION_FORMAT`，**不**从畸形结构里提取任何编号。
 - 只处理 ASCII 方括号；不做 Markdown/HTML 实体解码，也不做 Unicode 同形字符归一
   （全角 `［K1］`、西里尔字母不算引用意图）。
+- 普通英文方括号词（`[API]`、`[Known]`）按普通文本忽略；被再包一层但没有引用意图的
+  （`[[API]]`）同样忽略，而括号之外的孤立 `]`（`[K1]]` 的第二个右括号）也按普通文本处理 ——
+  只有**方括号组内部**参与解释。
 - 失败**不**修正、**不**补引用、**不**重新调用模型（模型调用次数始终 ≤ 1）。
 
 **必须说清楚的限制**：引用校验只证明**编号来源**（每个引用都能回到本次给出的证据），
@@ -176,15 +211,52 @@ Graph 框架为每个 `NodeOutput` 生成状态快照时会对状态做**序列�
 
 | 触发 | 图内表现 | 应用层结果 |
 | --- | --- | --- |
-| `assetId` 非法 | `validate_asset` 抛 `AiRequestException` | **400**（`INVALID_REQUEST`），端口与模型零调用 |
-| 检索输入非法（`INVALID_RETRIEVAL_QUERY`） | `retrieve_knowledge` 抛 `AiRequestException`（沿用检索给出文案） | **400**，此时资产、监控与模型都还没被调用 |
-| 检索的其它失败 | 知识分支 `FAILED` + 稳定分类，继续执行 | 正常路径；失败如实保留，绝不改写成未命中 |
-| 端口返回 `null` 或抛异常 | 记违约，其余证据节点照常执行 | **502**，`failure=PORT_CONTRACT_VIOLATION`，模型零调用 |
+| `assetId` 非法 | `validate_asset` 记录输入失败并抛 `AiRequestException` | **400**（`INVALID_REQUEST`），端口与模型零调用 |
+| 检索输入非法（`INVALID_RETRIEVAL_QUERY`） | `retrieve_knowledge` 记录输入失败并抛 `AiRequestException`（沿用检索给出文案） | **400**，此时资产、监控与模型都还没被调用 |
+| 检索的**已声明**业务失败 | 知识分支 `FAILED` + 稳定分类，继续执行 | 正常路径；失败如实保留，绝不改写成未命中 |
+| 检索抛出**未声明**异常或返回 `null` | 记违约，其余证据节点照常执行 | **502**，`failure=PORT_CONTRACT_VIOLATION`，模型零调用 |
+| 资产/监控端口返回 `null` 或抛异常 | 记违约，其余证据节点照常执行 | **502**，`failure=PORT_CONTRACT_VIOLATION`，模型零调用 |
 | `verify_contracts` 时上下文形状缺失 | `GRAPH_FAILURE` | **502**（服务端缺陷，不伪装成查询状态） |
-| 模型调用失败 | `MODEL_CALL_FAILED` | **502** + `requestId`，不重试 |
+| 模型调用失败（含直接/间接包含 `AiRequestException` 的异常） | `MODEL_CALL_FAILED` | **502** + `requestId`，不重试，**不**降级成 400 |
 | 模型返回空/空白 | `ANSWER_EMPTY` | **502** |
-| 引用校验失败 | 见引用协议的四类 | **502**，不修正、不重新调用模型 |
+| 引用校验失败（含嵌套方括号） | 见引用协议的五类 | **502**，不修正、不重新调用模型 |
 | 图返回空状态、路由/执行路径缺失或类型不符 | `GRAPH_FAILURE` | **502**（有界收敛，不出现 `NullPointerException`） |
+
+### 为什么输入失败不能靠异常链识别（R1 修正）
+
+第一版实现里，服务层在整条 cause 链上搜索 `AiRequestException`：只要链上任何一层是输入异常，
+就原样上抛（400）。这看起来「宽容」，实际上把**异常类型当成了来源证明**：
+
+- 模型调用阶段抛出的 `AiRequestException`（供应商、SDK 或适配层完全可能抛出这个类型），
+  会被当成「用户输入不合法」，于是**用户的合法请求**得到 400，模型故障被伪装成参数问题；
+- 更糟的是它会**覆盖**外层已经确定的分类 —— `generate_answer` 明明已经把它包装成
+  `MODEL_CALL_FAILED`，却因为链上存在一个输入异常而被降级成 400。
+
+因此「输入失败 → 400」必须由**来源**决定，而不是由**类型**决定：只有
+`validate_asset` 与 `retrieve_knowledge` 这两个输入校验节点会在调用上下文里留下输入失败记录，
+服务层只认这条记录（`IncidentTriageCall.rejectInput`）。模型阶段抛出的任何异常
+（包括直接或间接包含 `AiRequestException` 的异常）都保持 `MODEL_CALL_FAILED`，
+对外是携带 `requestId`、固定文案的 `AiProviderException`。
+
+### 失败路径的审计信息必须来自真实执行（R1 修正）
+
+第一版在失败时硬编码 `NOT_QUERIED ×3`、`graphRoute=none`、`modelCalled=false`、`evidenceCount=0`。
+后果是失败日志**与真实执行不符**：完整证据之后的模型失败被记成「什么都没查」，
+引用校验失败也看不出模型确实被调用过一次、证据确实有三条。
+
+原因是图内抛异常时框架**不会交出最终状态**，于是实现偷懒按「计划形状」写死。修正办法是把执行进度
+写进调用上下文（服务层始终持有同一个实例）：
+
+| 字段 | 何时写入 | 失败时的语义 |
+| --- | --- | --- |
+| 三个来源状态 | 各自的证据节点执行时 | 已经查过的如实记录；没有执行到的才写 `NOT_QUERIED` |
+| `route` | `verify_contracts` 算出路由时（同时写状态与上下文） | 真实路由；没走到这一步才是 `none` |
+| `modelCalled` | **发起模型调用之前**置位 | 空答案、模型异常、引用校验失败都必须是 `true`；不按路由推测 |
+| `usedEvidenceCount` | 引用校验通过后写入 | 校验失败时必然为 0 —— 不伪造一个「已通过校验」的数量 |
+| `evidenceCount` | 由已知的三个来源实时算出 | 记录本次**真实存在**的证据数量 |
+
+这**不**扩大日志面：仍然只有那两类固定模板与固定参数位，仍然不记录 assetId、问题原文、
+知识正文、资产详情、监控数值、模型答案、提示词与异常消息。
 
 ## 日志与脱敏
 
@@ -192,6 +264,9 @@ Graph 框架为每个 `NodeOutput` 生成状态快照时会对状态做**序列�
 `operation`、`requestId`、三个来源状态、`graphRoute`、`modelCalled`、`evidenceCount`、
 `usedEvidenceCount`、`success`、`durationMs`；失败时再加稳定 `failure` 与异常**类名**
 （本模块的 `IncidentTriageException` 只是分类包装层，因此上报它包住的原始异常类名）。
+
+这些字段全部取自调用上下文里**已经发生**的执行进度（见上）：失败不是「按计划形状」补出来的日志，
+而是这次调用真实走到了哪一步的记录。
 
 **没有位置可放**：`assetId`、问题原文、知识正文、资产详情、监控数值、模型答案、提示词、
 异常消息、端点、密钥、SQL 与堆栈。日志测试用哨兵先证明这些材料确实进入过结果，
@@ -232,7 +307,12 @@ Graph 框架为每个 `NodeOutput` 生成状态快照时会对状态做**序列�
    编号只在这一次调用内有意义，不能跨请求比较；
 7. **没有逐节点超时**：一次研判的总耗时由模型调用主导，节点级超时留给后续需要时再加；
 8. **`FAILED` 的知识分支会让答案不 `grounded`**：此时仍可能基于资产/监控作答（部分命中），
-   调用方必须读 `knowledge.status`，不能只看答案。
+   调用方必须读 `knowledge.status`，不能只看答案；
+9. **「已声明失败」与「端口违约」的区分依赖检索用例的契约**：本阶段以
+   `KnowledgeApplicationException` 作为唯一「已声明」的信号，未声明的异常一律按违约处理；
+   如果后续给该用例增加新的异常类型，必须同步更新这条边界（否则新的业务失败会被当成违约）；
+10. **括号之外多余的 `]` 仍按普通文本处理**：只有方括号组**内部**参与解释，
+    `[K1]]` 的第二个右括号不算引用结构（嵌套是「组内有方括号」，不是「括号数不配平」）。
 
 ## 重新评估条件
 

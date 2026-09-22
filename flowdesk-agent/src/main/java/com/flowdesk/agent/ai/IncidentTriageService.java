@@ -30,9 +30,12 @@ import org.springframework.ai.chat.client.ChatClient;
  * <ul>
  *   <li>生成 {@code requestId}，为每次调用创建<b>独立的</b>调用上下文与 {@code RunnableConfig}，
  *       执行装配期编译好的图；</li>
- *   <li>把图执行期间的异常收敛为稳定分类：{@link AiRequestException} 原样上抛（400），
- *       其余一律 {@link AiProviderException}（502，携带本次 requestId，固定文案，
- *       <b>不</b>泄漏框架类名）；</li>
+ *   <li>把图执行期间的异常收敛为稳定分类：只有<b>输入校验失败</b>（调用上下文里由
+ *       {@code validate_asset}/{@code retrieve_knowledge} 记录的 {@code AiRequestException}）
+ *       原样上抛（400），其余一律 {@link AiProviderException}（502，携带本次 requestId，固定文案，
+ *       <b>不</b>泄漏框架类名）。<b>不</b>沿异常 cause 链搜索输入异常 —— 模型调用阶段抛出的
+ *       任何（直接或间接包含）{@code AiRequestException} 的异常都必须是
+ *       {@link IncidentTriageFailure#MODEL_CALL_FAILED}；</li>
  *   <li>读取最终状态：路由或执行路径缺失/类型不符 → {@link IncidentTriageFailure#GRAPH_FAILURE}；
  *       端口契约违约 → {@link IncidentTriageFailure#PORT_CONTRACT_VIOLATION}；</li>
  *   <li>把本次调用的产物组装成 application 层的 {@link IncidentTriageResult}，并记录固定元数据日志。</li>
@@ -49,7 +52,10 @@ import org.springframework.ai.chat.client.ChatClient;
  * <p>每次研判只记录：{@code operation}、{@code requestId}、三个来源状态、{@code graphRoute}、
  * {@code modelCalled}、{@code evidenceCount}、{@code usedEvidenceCount}、{@code success}、
  * {@code durationMs}，失败时再加稳定失败类别与异常<b>类名</b>。
- * <b>不</b>记录 assetId、问题原文、知识正文、资产详情、监控数值、模型回答、提示词、
+ * 这些元数据一律来自本次调用上下文里<b>已经发生</b>的执行进度：失败发生在图内部时框架不会交出
+ * 最终状态，若按「计划形状」硬编码（例如一律 {@code NOT_QUERIED}/{@code none}/{@code false}/0），
+ * 失败日志就会与真实执行不符（FD-0018-A-R1 修正的就是这一点）。</p>
+ * <p><b>不</b>记录 assetId、问题原文、知识正文、资产详情、监控数值、模型回答、提示词、
  * 异常消息、端点、密钥、SQL 或堆栈。</p>
  */
 public class IncidentTriageService implements IncidentTriageUseCase {
@@ -93,15 +99,14 @@ public class IncidentTriageService implements IncidentTriageUseCase {
                     .orElseThrow(() -> new IncidentTriageException(IncidentTriageFailure.GRAPH_FAILURE));
         }
         catch (RuntimeException ex) {
-            AiRequestException invalidInput = findCause(ex, AiRequestException.class);
-            if (invalidInput != null) {
-                logFailure(requestId, NOT_QUERIED, NOT_QUERIED, NOT_QUERIED, ROUTE_UNKNOWN, false, 0, 0,
-                        IncidentTriageFailure.INVALID_INPUT, ex, startedAt);
-                throw invalidInput;
+            // 输入校验失败只认调用上下文里的记录（由两个输入校验节点写入），
+            // 绝不沿 cause 链搜索 AiRequestException —— 否则模型阶段抛出的同类异常会被误判成 400
+            AiRequestException rejected = call.getInputRejection();
+            if (rejected != null) {
+                logFailure(requestId, call, IncidentTriageFailure.INVALID_INPUT, ex, startedAt);
+                throw rejected;
             }
-            IncidentTriageFailure failure = failureOf(ex);
-            logFailure(requestId, NOT_QUERIED, NOT_QUERIED, NOT_QUERIED, ROUTE_UNKNOWN, false, 0, 0, failure, ex,
-                    startedAt);
+            logFailure(requestId, call, failureOf(ex), ex, startedAt);
             throw new AiProviderException(requestId, ex);
         }
 
@@ -112,16 +117,13 @@ public class IncidentTriageService implements IncidentTriageUseCase {
             executionPath = readPath(state);
         }
         catch (IncidentTriageException ex) {
-            logFailure(requestId, NOT_QUERIED, NOT_QUERIED, NOT_QUERIED, ROUTE_UNKNOWN, false, 0, 0, ex.failure(),
-                    ex, startedAt);
+            logFailure(requestId, call, ex.failure(), ex, startedAt);
             throw new AiProviderException(requestId, ex);
         }
 
         if (call.isContractViolation()) {
             // 端口违约：能执行的证据节点都已执行完，但在调用模型之前统一失败（不伪装成某种查询状态）
-            logFailure(requestId, statusOf(call.getKnowledge()), outcomeOf(call.getAsset()),
-                    outcomeOf(call.getMonitoring()), route, false, 0, 0,
-                    IncidentTriageFailure.PORT_CONTRACT_VIOLATION, null, startedAt);
+            logFailure(requestId, call, IncidentTriageFailure.PORT_CONTRACT_VIOLATION, null, startedAt);
             throw new AiProviderException(requestId, null);
         }
 
@@ -130,14 +132,9 @@ public class IncidentTriageService implements IncidentTriageUseCase {
         MonitoringSnapshotQueryResult monitoring = call.getMonitoring();
         String answer = call.getAnswer();
         if (knowledge == null || asset == null || monitoring == null || answer == null) {
-            logFailure(requestId, statusOf(knowledge), outcomeOf(asset), outcomeOf(monitoring), route, false, 0, 0,
-                    IncidentTriageFailure.GRAPH_FAILURE, null, startedAt);
+            logFailure(requestId, call, IncidentTriageFailure.GRAPH_FAILURE, null, startedAt);
             throw new AiProviderException(requestId, null);
         }
-
-        String knowledgeStatus = knowledge.status().name();
-        String assetOutcome = asset.outcome().name();
-        String monitoringOutcome = monitoring.outcome().name();
 
         IncidentTriageResult result;
         try {
@@ -146,27 +143,18 @@ public class IncidentTriageService implements IncidentTriageUseCase {
         }
         catch (RuntimeException ex) {
             // 结果不变量被破坏属于服务端缺陷：收敛为稳定失败，绝不当作成功返回
-            logFailure(requestId, knowledgeStatus, assetOutcome, monitoringOutcome, route,
-                    modelCalled(route), 0, call.getUsedEvidenceIds().size(), IncidentTriageFailure.GRAPH_FAILURE, ex,
-                    startedAt);
+            logFailure(requestId, call, IncidentTriageFailure.GRAPH_FAILURE, ex, startedAt);
             throw new AiProviderException(requestId, ex);
         }
 
         log.info("{} completed operation={} requestId={} knowledgeStatus={} assetOutcome={} monitoringOutcome={} "
                         + "graphRoute={} modelCalled={} evidenceCount={} usedEvidenceCount={} success=true "
                         + "durationMs={}",
-                OPERATION, OPERATION, requestId, knowledgeStatus, assetOutcome, monitoringOutcome, route,
-                modelCalled(route), result.evidenceCount(), result.usedEvidenceCount(), elapsedMillis(startedAt));
+                OPERATION, OPERATION, requestId, knowledge.status().name(), asset.outcome().name(),
+                monitoring.outcome().name(), route, call.isModelCallStarted(), result.evidenceCount(),
+                result.usedEvidenceCount(), elapsedMillis(startedAt));
 
         return result;
-    }
-
-    /**
-     * @param route 本次路由
-     * @return 本次是否调用过模型（只有「有证据」那条路径会调用）
-     */
-    private static boolean modelCalled(String route) {
-        return IncidentTriageNodes.ROUTE_EVIDENCE_AVAILABLE.equals(route);
     }
 
     /**
@@ -232,6 +220,23 @@ public class IncidentTriageService implements IncidentTriageUseCase {
     }
 
     /**
+     * @param call 本次调用上下文
+     * @return 条件边实际使用的路由；尚未算出来（还没执行到 {@code verify_contracts}）时为 {@link #ROUTE_UNKNOWN}
+     */
+    private static String routeOf(IncidentTriageCall call) {
+        return call.getRoute() == null ? ROUTE_UNKNOWN : call.getRoute();
+    }
+
+    /**
+     * @param call 本次调用上下文
+     * @return 本次<b>真实存在</b>的可用证据数量（三个来源里任何尚未执行的都按不存在计）
+     */
+    private static int availableEvidenceCount(IncidentTriageCall call) {
+        return IncidentTriageResult
+                .availableEvidenceIds(call.getKnowledge(), call.getAsset(), call.getMonitoring()).size();
+    }
+
+    /**
      * 把图执行期间抛出的异常映射为稳定失败类别。
      *
      * @param thrown 原始异常
@@ -263,30 +268,30 @@ public class IncidentTriageService implements IncidentTriageUseCase {
     }
 
     /**
-     * 只记录固定元数据与异常类名；不记录任何业务数据、提示词、模型回答或异常消息。
+     * 记录失败时的固定元数据：全部取自<b>本次调用上下文里已经发生的事</b>。
      *
-     * @param requestId         请求标识
-     * @param knowledgeStatus   知识分支状态
-     * @param assetOutcome      资产查询三态
-     * @param monitoringOutcome 监控查询三态
-     * @param route             闸门路由
-     * @param modelCalled       是否调用过模型
-     * @param evidenceCount     可用证据数量
-     * @param usedEvidenceCount 实际引用数量
-     * @param failure           稳定失败类别
-     * @param cause             原始异常（可为 {@code null}）；只取类名
-     * @param startedAt         起始纳秒
+     * <p>图执行抛异常时框架不会交出最终状态，因此这里的三个来源状态、路由、是否调用过模型与
+     * 证据数量都来自节点在执行时写入调用上下文的真实进度：<b>未执行</b>的部分才写成
+     * {@link #NOT_QUERIED}/{@link #ROUTE_UNKNOWN}，而 {@code modelCalled} 来自「调用模型之前
+     * 置位」的标记（不是按计划路由推测），{@code usedEvidenceCount} 来自真正通过校验的引用
+     * （校验失败时它必然为空，不伪造一个通过校验的数量）。</p>
+     *
+     * @param requestId 请求标识
+     * @param call      本次调用上下文（真实执行进度）
+     * @param failure   稳定失败类别
+     * @param cause     原始异常（可为 {@code null}）；只取类名
+     * @param startedAt 起始纳秒
      */
-    private static void logFailure(String requestId, String knowledgeStatus, String assetOutcome,
-            String monitoringOutcome, String route, boolean modelCalled, int evidenceCount, int usedEvidenceCount,
-            IncidentTriageFailure failure, RuntimeException cause, long startedAt) {
+    private static void logFailure(String requestId, IncidentTriageCall call, IncidentTriageFailure failure,
+            RuntimeException cause, long startedAt) {
 
         log.warn("{} failed operation={} requestId={} knowledgeStatus={} assetOutcome={} monitoringOutcome={} "
                         + "graphRoute={} modelCalled={} evidenceCount={} usedEvidenceCount={} failure={} exception={} "
                         + "success=false durationMs={}",
-                OPERATION, OPERATION, requestId, knowledgeStatus, assetOutcome, monitoringOutcome, route,
-                modelCalled, evidenceCount, usedEvidenceCount, failure.name(), exceptionName(cause),
-                elapsedMillis(startedAt));
+                OPERATION, OPERATION, requestId, statusOf(call.getKnowledge()), outcomeOf(call.getAsset()),
+                outcomeOf(call.getMonitoring()), routeOf(call), call.isModelCallStarted(),
+                availableEvidenceCount(call), call.getUsedEvidenceIds().size(), failure.name(),
+                exceptionName(cause), elapsedMillis(startedAt));
     }
 
     /**

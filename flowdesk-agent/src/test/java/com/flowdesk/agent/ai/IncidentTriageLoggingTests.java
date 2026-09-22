@@ -9,6 +9,7 @@ import ch.qos.logback.core.read.ListAppender;
 import com.flowdesk.application.ai.AiProviderException;
 import com.flowdesk.application.ai.AiRequestException;
 import com.flowdesk.application.ai.IncidentTriageCommand;
+import com.flowdesk.application.ai.IncidentTriageResult;
 import com.flowdesk.application.integration.AssetQueryResult;
 import com.flowdesk.application.integration.AssetView;
 import com.flowdesk.application.integration.HealthState;
@@ -40,12 +41,17 @@ import org.springframework.ai.chat.model.Generation;
 import org.springframework.ai.chat.prompt.Prompt;
 
 /**
- * 事件研判日志的结构与脱敏（FD-0018-A）。
+ * 事件研判日志的结构、脱敏与<b>真实执行进度</b>（FD-0018-A / R1）。
  *
  * <p>只记录固定元数据，因此这里用「模板固定 + 参数位逐个钉死」的方式断言：模板必须是两条固定文案
  * 之一，参数位只能是操作名、请求标识、三个来源状态、路由、布尔、计数、稳定失败类别、异常类名与
  * 唯一的数值参数（耗时）。assetId、问题原文、知识正文、资产详情、监控数值、模型回答、提示词与
  * 异常消息<b>没有任何位置可放</b>。</p>
+ *
+ * <p>R1 起还逐项断言<b>实际执行进度</b>：失败发生在图内部（框架不交出最终状态）时，
+ * 三个来源状态、{@code graphRoute}、{@code modelCalled} 与两个计数必须来自已经发生的事 ——
+ * 例如完整证据之后的模型失败必须记 {@code route=evidence_available} 且 {@code modelCalled=true}，
+ * 引用校验失败不得记一个「已通过校验」的引用数量。</p>
  */
 class IncidentTriageLoggingTests {
 
@@ -60,6 +66,10 @@ class IncidentTriageLoggingTests {
 
     private static final String OPERATION = IncidentTriageService.OPERATION;
 
+    private static final String NOT_QUERIED = IncidentTriageService.NOT_QUERIED;
+
+    private static final String ROUTE_UNKNOWN = IncidentTriageService.ROUTE_UNKNOWN;
+
     private static final String QUESTION_SENTINEL = "SENTINELQUESTION";
 
     private static final String CONTENT_SENTINEL = "SENTINELCHUNKBODY";
@@ -67,6 +77,8 @@ class IncidentTriageLoggingTests {
     private static final String ANSWER_SENTINEL = "SENTINELANSWER";
 
     private static final String UPSTREAM_SENTINEL = "sentinel-upstream-detail";
+
+    private static final String PROVIDER_SENTINEL = "review-provider-message-sentinel";
 
     private final ListAppender<ILoggingEvent> appender = new ListAppender<>();
 
@@ -86,17 +98,12 @@ class IncidentTriageLoggingTests {
     void aSuccessfulTriageLogsExactlyOneStructuredLine() {
         Fixture fixture = new Fixture(ANSWER_SENTINEL + " 现象 [K1]，资产 [A1]，监控 [M1]。");
 
-        var result = fixture.triage();
+        IncidentTriageResult result = fixture.triage();
 
         assertThat(result.answer()).contains(ANSWER_SENTINEL);
         assertThat(this.appender.list).hasSize(1);
 
-        ILoggingEvent event = this.appender.list.get(0);
-        Object[] arguments = event.getArgumentArray();
-        assertThat(event.getMessage()).isEqualTo(COMPLETED_TEMPLATE);
-        assertThat(arguments).hasSize(11);
-        assertThat(arguments[0]).isEqualTo(OPERATION);
-        assertThat(arguments[1]).isEqualTo(OPERATION);
+        Object[] arguments = completedArguments();
         assertThat(arguments[2]).isEqualTo(result.requestId());
         assertThat(arguments[3]).isEqualTo("FOUND");
         assertThat(arguments[4]).isEqualTo("FOUND");
@@ -105,7 +112,6 @@ class IncidentTriageLoggingTests {
         assertThat(arguments[7]).isEqualTo(true);
         assertThat(arguments[8]).isEqualTo(3);
         assertThat(arguments[9]).isEqualTo(3);
-        assertThat(arguments[10]).isInstanceOf(Number.class);
         assertNoSensitiveMaterial();
     }
 
@@ -118,64 +124,152 @@ class IncidentTriageLoggingTests {
 
         fixture.triage();
 
-        Object[] arguments = this.appender.list.get(0).getArgumentArray();
-        assertThat(this.appender.list.get(0).getMessage()).isEqualTo(COMPLETED_TEMPLATE);
+        Object[] arguments = completedArguments();
+        assertThat(arguments[3]).isEqualTo("NOT_FOUND");
+        assertThat(arguments[4]).isEqualTo("NOT_FOUND");
+        assertThat(arguments[5]).isEqualTo("NOT_FOUND");
         assertThat(arguments[6]).isEqualTo("no_evidence");
         assertThat(arguments[7]).isEqualTo(false);
         assertThat(arguments[8]).isEqualTo(0);
+        assertThat(arguments[9]).isEqualTo(0);
         assertNoSensitiveMaterial();
     }
 
     @Test
-    void aKnowledgeFailureIsLoggedAsItsOwnStatus() {
+    void aDeclaredKnowledgeFailureKeepsItsOwnStatusAndStillGeneratesFromTheRest() {
         Fixture fixture = new Fixture("资产 [A1]，监控 [M1]。");
         fixture.retrieval.fails(new KnowledgeApplicationException(
                 KnowledgeApplicationErrorCode.EMBEDDING_PROVIDER_ERROR, "embedding 上游故障"));
 
         fixture.triage();
 
-        Object[] arguments = this.appender.list.get(0).getArgumentArray();
+        Object[] arguments = completedArguments();
         assertThat(arguments[3]).as("知识分支状态").isEqualTo("FAILED");
+        assertThat(arguments[4]).isEqualTo("FOUND");
+        assertThat(arguments[5]).isEqualTo("FOUND");
         assertThat(arguments[6]).isEqualTo("evidence_available");
+        assertThat(arguments[7]).isEqualTo(true);
+        assertThat(arguments[8]).as("资产与监控两条证据").isEqualTo(2);
+        assertThat(arguments[9]).isEqualTo(2);
         assertNoSensitiveMaterial();
     }
 
     @Test
-    void aModelFailureLogsTheStableCategoryAndTheExceptionClassOnly() {
+    void aModelFailureAfterFullEvidenceLogsTheRealProgress() {
         Fixture fixture = new Fixture(new IllegalStateException(UPSTREAM_SENTINEL));
 
         assertThatThrownBy(fixture::triage).isInstanceOf(AiProviderException.class);
 
-        ILoggingEvent event = this.appender.list.get(0);
-        Object[] arguments = event.getArgumentArray();
-        assertThat(event.getMessage()).isEqualTo(FAILED_TEMPLATE);
-        assertThat(arguments).hasSize(13);
+        Object[] arguments = failureArguments();
+        assertThat(arguments[3]).as("知识已经查过").isEqualTo("FOUND");
+        assertThat(arguments[4]).as("资产已经查过").isEqualTo("FOUND");
+        assertThat(arguments[5]).as("监控已经查过").isEqualTo("FOUND");
+        assertThat(arguments[6]).as("真实路由").isEqualTo("evidence_available");
+        assertThat(arguments[7]).as("模型确实被调用过").isEqualTo(true);
+        assertThat(arguments[8]).as("三条可用证据").isEqualTo(3);
+        assertThat(arguments[9]).as("没有任何引用通过校验").isEqualTo(0);
         assertThat(arguments[10]).isEqualTo(IncidentTriageFailure.MODEL_CALL_FAILED.name());
         assertThat(arguments[11]).isEqualTo(IllegalStateException.class.getName());
         assertNoSensitiveMaterial();
     }
 
     @Test
-    void aCitationFailureLogsOnlyTheStableCategory() {
+    void aModelAiRequestExceptionKeepsTheModelFailureCategoryInTheLog() {
+        Fixture fixture = new Fixture(new AiRequestException(PROVIDER_SENTINEL));
+
+        assertThatThrownBy(fixture::triage).isInstanceOf(AiProviderException.class);
+
+        Object[] arguments = failureArguments();
+        assertThat(arguments[6]).isEqualTo("evidence_available");
+        assertThat(arguments[7]).isEqualTo(true);
+        assertThat(arguments[8]).isEqualTo(3);
+        assertThat(arguments[10]).as("绝不能被记成输入错误").isEqualTo(
+                IncidentTriageFailure.MODEL_CALL_FAILED.name());
+        assertThat(arguments[11]).isEqualTo(AiRequestException.class.getName());
+        assertNoSensitiveMaterial();
+    }
+
+    @Test
+    void anEmptyModelAnswerLogsTheModelAsAlreadyCalled() {
+        Fixture fixture = new Fixture("");
+
+        assertThatThrownBy(fixture::triage).isInstanceOf(AiProviderException.class);
+
+        Object[] arguments = failureArguments();
+        assertThat(arguments[3]).isEqualTo("FOUND");
+        assertThat(arguments[6]).isEqualTo("evidence_available");
+        assertThat(arguments[7]).as("模型已经被调用过").isEqualTo(true);
+        assertThat(arguments[8]).isEqualTo(3);
+        assertThat(arguments[9]).isEqualTo(0);
+        assertThat(arguments[10]).isEqualTo(IncidentTriageFailure.ANSWER_EMPTY.name());
+        assertNoSensitiveMaterial();
+    }
+
+    @Test
+    void aCitationFailureNeverFakesAPassedCitationCount() {
         Fixture fixture = new Fixture("只谈资产 " + ANSWER_SENTINEL + " [A1]。");
 
         assertThatThrownBy(fixture::triage).isInstanceOf(AiProviderException.class);
 
-        Object[] arguments = this.appender.list.get(0).getArgumentArray();
-        assertThat(this.appender.list.get(0).getMessage()).isEqualTo(FAILED_TEMPLATE);
+        Object[] arguments = failureArguments();
+        assertThat(arguments[3]).isEqualTo("FOUND");
+        assertThat(arguments[6]).isEqualTo("evidence_available");
+        assertThat(arguments[7]).isEqualTo(true);
+        assertThat(arguments[8]).as("本次真实存在三条证据").isEqualTo(3);
+        assertThat(arguments[9]).as("引用校验没有通过，因此实际引用为 0").isEqualTo(0);
         assertThat(arguments[10]).isEqualTo(IncidentTriageFailure.EVIDENCE_FAMILY_NOT_CITED.name());
         assertNoSensitiveMaterial();
     }
 
     @Test
-    void aContractViolationIsLoggedWithItsOwnCategory() {
+    void aNestedCitationAnswerLogsTheMalformedCategory() {
+        Fixture fixture = new Fixture("现象 [[K1]]，资产 [A1]，监控 [M1]。");
+
+        assertThatThrownBy(fixture::triage).isInstanceOf(AiProviderException.class);
+
+        Object[] arguments = failureArguments();
+        assertThat(arguments[6]).isEqualTo("evidence_available");
+        assertThat(arguments[7]).isEqualTo(true);
+        assertThat(arguments[8]).isEqualTo(3);
+        assertThat(arguments[9]).isEqualTo(0);
+        assertThat(arguments[10]).isEqualTo(IncidentTriageFailure.INVALID_CITATION_FORMAT.name());
+        assertNoSensitiveMaterial();
+    }
+
+    @Test
+    void aContractViolationLogsEveryKnownSourceStateAndTheRealRoute() {
         Fixture fixture = new Fixture("绝不该被调用。");
         fixture.assetPort.returnsNull();
 
         assertThatThrownBy(fixture::triage).isInstanceOf(AiProviderException.class);
 
-        Object[] arguments = this.appender.list.get(0).getArgumentArray();
+        Object[] arguments = failureArguments();
+        assertThat(arguments[3]).as("知识已经查过").isEqualTo("FOUND");
+        assertThat(arguments[4]).as("资产违约，因此没有状态").isEqualTo(NOT_QUERIED);
+        assertThat(arguments[5]).as("监控仍然被查询过").isEqualTo("FOUND");
         assertThat(arguments[6]).isEqualTo("contract_violation");
+        assertThat(arguments[7]).isEqualTo(false);
+        assertThat(arguments[8]).as("知识 1 + 监控 1").isEqualTo(2);
+        assertThat(arguments[9]).isEqualTo(0);
+        assertThat(arguments[10]).isEqualTo(IncidentTriageFailure.PORT_CONTRACT_VIOLATION.name());
+        assertThat(arguments[11]).as("违约没有底层异常").isEqualTo("none");
+        assertNoSensitiveMaterial();
+    }
+
+    @Test
+    void anUndeclaredRetrievalFailureIsLoggedAsAContractViolationNotAsKnowledgeFailure() {
+        Fixture fixture = new Fixture("绝不该被调用。");
+        fixture.retrieval.throwsUnexpectedly(new IllegalStateException(UPSTREAM_SENTINEL));
+
+        assertThatThrownBy(fixture::triage).isInstanceOf(AiProviderException.class);
+
+        Object[] arguments = failureArguments();
+        assertThat(arguments[3]).as("知识分支没有失败状态，而是违约").isEqualTo(NOT_QUERIED);
+        assertThat(arguments[4]).as("资产仍然被查询过").isEqualTo("FOUND");
+        assertThat(arguments[5]).as("监控仍然被查询过").isEqualTo("FOUND");
+        assertThat(arguments[6]).isEqualTo("contract_violation");
+        assertThat(arguments[7]).isEqualTo(false);
+        assertThat(arguments[8]).as("资产 1 + 监控 1").isEqualTo(2);
         assertThat(arguments[10]).isEqualTo(IncidentTriageFailure.PORT_CONTRACT_VIOLATION.name());
         assertNoSensitiveMaterial();
     }
@@ -188,9 +282,14 @@ class IncidentTriageLoggingTests {
                 QUESTION_SENTINEL, null, null)))
                 .isInstanceOf(AiRequestException.class);
 
-        Object[] arguments = this.appender.list.get(0).getArgumentArray();
-        assertThat(arguments[3]).isEqualTo(IncidentTriageService.NOT_QUERIED);
-        assertThat(arguments[6]).isEqualTo(IncidentTriageService.ROUTE_UNKNOWN);
+        Object[] arguments = failureArguments();
+        assertThat(arguments[3]).as("什么也没有执行").isEqualTo(NOT_QUERIED);
+        assertThat(arguments[4]).isEqualTo(NOT_QUERIED);
+        assertThat(arguments[5]).isEqualTo(NOT_QUERIED);
+        assertThat(arguments[6]).isEqualTo(ROUTE_UNKNOWN);
+        assertThat(arguments[7]).isEqualTo(false);
+        assertThat(arguments[8]).isEqualTo(0);
+        assertThat(arguments[9]).isEqualTo(0);
         assertThat(arguments[10]).isEqualTo(IncidentTriageFailure.INVALID_INPUT.name());
         assertNoSensitiveMaterial();
     }
@@ -220,11 +319,39 @@ class IncidentTriageLoggingTests {
                 .doesNotContain(CONTENT_SENTINEL)
                 .doesNotContain(ANSWER_SENTINEL)
                 .doesNotContain(UPSTREAM_SENTINEL)
+                .doesNotContain(PROVIDER_SENTINEL)
                 .doesNotContain("VPN 故障处理手册")
                 .doesNotContain("IN_SERVICE")
                 .doesNotContain("DEGRADED")
                 .doesNotContain(IncidentTriagePromptBuilder.DATA_BEGIN)
                 .doesNotContain("http://");
+    }
+
+    private Object[] completedArguments() {
+        ILoggingEvent event = onlyEvent();
+        assertThat(event.getMessage()).isEqualTo(COMPLETED_TEMPLATE);
+        assertThat(event.getArgumentArray()).hasSize(11);
+        assertThat(event.getArgumentArray()[0]).isEqualTo(OPERATION);
+        assertThat(event.getArgumentArray()[1]).isEqualTo(OPERATION);
+        assertThat((String) event.getArgumentArray()[2]).isNotBlank();
+        assertThat(event.getArgumentArray()[10]).isInstanceOf(Number.class);
+        return event.getArgumentArray();
+    }
+
+    private Object[] failureArguments() {
+        ILoggingEvent event = onlyEvent();
+        assertThat(event.getMessage()).isEqualTo(FAILED_TEMPLATE);
+        assertThat(event.getArgumentArray()).hasSize(13);
+        assertThat(event.getArgumentArray()[0]).isEqualTo(OPERATION);
+        assertThat(event.getArgumentArray()[1]).isEqualTo(OPERATION);
+        assertThat((String) event.getArgumentArray()[2]).isNotBlank();
+        assertThat(event.getArgumentArray()[12]).isInstanceOf(Number.class);
+        return event.getArgumentArray();
+    }
+
+    private ILoggingEvent onlyEvent() {
+        assertThat(this.appender.list).as("每次研判恰好一条日志").hasSize(1);
+        return this.appender.list.get(0);
     }
 
     private static Logger logger() {
@@ -256,7 +383,7 @@ class IncidentTriageLoggingTests {
                     ChatClient.create(new FakeChatModel(failure)));
         }
 
-        com.flowdesk.application.ai.IncidentTriageResult triage() {
+        IncidentTriageResult triage() {
             return this.service.triage(new IncidentTriageCommand("AST-900001", QUESTION_SENTINEL, 5, 0.3));
         }
     }
@@ -270,10 +397,15 @@ class IncidentTriageLoggingTests {
 
         private KnowledgeApplicationException failure;
 
+        private RuntimeException unexpected;
+
         @Override
         public KnowledgeRetrievalView retrieve(RetrieveKnowledgeQuery query) {
             if (this.failure != null) {
                 throw this.failure;
+            }
+            if (this.unexpected != null) {
+                throw this.unexpected;
             }
             return this.view;
         }
@@ -284,6 +416,10 @@ class IncidentTriageLoggingTests {
 
         void fails(KnowledgeApplicationException failure) {
             this.failure = failure;
+        }
+
+        void throwsUnexpectedly(RuntimeException unexpected) {
+            this.unexpected = unexpected;
         }
     }
 
