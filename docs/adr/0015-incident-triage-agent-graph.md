@@ -5,8 +5,9 @@
 - 决策范围：主服务如何用**真实的** Spring AI Alibaba `StateGraph`/`CompiledGraph` 编排一次
   「事件研判」—— 为什么这一刻才引入 Graph（与 ADR 0014「还不是 Agent Graph」的结论如何衔接）、
   完整拓扑与条件路由、状态键与合并策略、三个证据来源（知识检索 / 资产 / 监控）的成功与失败语义、
-  引用协议及其边界、图内异常到应用层失败的收敛、并发隔离，以及本阶段
-  （FD-0018-A）与 HTTP 阶段（FD-0018-B）的边界
+  引用协议及其边界、图内异常到应用层失败的收敛、并发隔离；
+  以及 FD-0018-B 的 HTTP 契约 —— 端点与开关、状态码语义、响应 DTO 的字段映射规则、
+  与既有资产诊断/检索响应体的复用关系，以及 HTTP 阶段与核心阶段的测试边界
 
 ## 背景
 
@@ -24,7 +25,7 @@ FD-0018-A 要求把编排升级为「事件研判」，与资产诊断相比多�
    **不允许**用普通 service 里的 `switch`/`if` 冒充 Graph，也不允许用 `ReactAgent`。
 
 因此本阶段第一次真正用上 Agent Graph：不是为了「有个框架」，而是因为编排形状本身变了。
-本阶段**不**实现 HTTP 接口（那是 FD-0018-B），**不**改动 FD-0016 的 MCP 客户端与两个 MCP 服务，
+本阶段**不**实现 HTTP 接口（那是 FD-0018-B，**已交付，见下**），**不**改动 FD-0016 的 MCP 客户端与两个 MCP 服务，
 **不**新增数据库迁移，**不**引入会话记忆、流式输出、工具调用、重试或缓存。
 
 ## 决策
@@ -73,7 +74,28 @@ FD-0018-A 要求把编排升级为「事件研判」，与资产诊断相比多�
     也不是按计划路由推测）；未执行到的部分才写成 `NOT_QUERIED`/`none`；
     引用校验失败时 `usedEvidenceCount` 必然是 0（不伪造一个「已通过校验」的数量）。
 14. **日志固定两条模板**，只记录元数据与异常**类名**；业务数据没有任何位置可放（见下）。
-15. **本阶段不提供 HTTP**：控制器、DTO 与状态码语义留给 FD-0018-B（可参照 ADR 0014 的 HTTP 契约）。
+15. **HTTP 只做 DTO 转换（FD-0018-B）**：`IncidentTriageController` 只依赖
+    `IncidentTriageUseCase`，不注入 Graph、`ChatClient`、三个证据来源端口、数据库与 MCP 客户端；
+    不复制任何输入校验（不 trim、不规范化、不补默认值），也不声明任何异常处理器 ——
+    `AiRequestException` → 400、`AiProviderException` → 502 由全局 `AiExceptionHandler` 统一给出。
+16. **响应按状态决定字段集合（FD-0018-B）**：`knowledge` 的 `FOUND`/`NOT_FOUND` 输出
+    `status` + `retrieval`，`FAILED` 只输出 `status` + `failure`（**不输出 `retrieval`**，
+    不伪造一次空的检索成功）；`asset`/`monitoring` 沿用资产诊断已验收的三态字段集合；
+    取值为 `null` 的字段直接省略。任何状态都**不**把 `FAILED`/`DISABLED` 写成 `NOT_FOUND`。
+17. **能复用就复用（FD-0018-B）**：`retrieval` 直接复用检索接口的响应体
+    `KnowledgeSearchResponse`（含 `citations` 的 `KnowledgeCitationResponse` 白名单映射），
+    资产/监控两侧直接复用 `AssetDiagnosisAssetResponse`/`AssetDiagnosisMonitoringResponse`。
+    字段契约因此只有一处定义，不会出现「同一份检索参数在两处各自映射」的漂移。
+18. **映射不做二次加工（FD-0018-B）**：`requestId` 与 `grounded` 直接取自用例结果
+    （不重新生成、不重新推断），`usedEvidenceIds` 与 `executionPath` 保持用例给出的顺序，
+    并在响应构造时再做一次防御性复制。
+19. **`executionPath` 是公开的审计事实（FD-0018-B）**：它是节点**真实执行**过的序列，
+    调用方据此可以区分「走了模型」与「直接降级」两条路径；它随分支变化，
+    因此**不是**稳定契约（见「已知边界」）。
+20. **状态码语义（FD-0018-B）**：所有可审计结果（完整 / 部分 / 三个来源全 `NOT_FOUND` /
+    无命中且存在 `FAILED`）都是 **200** —— 包括三个依赖都没成功的情形；
+    输入非法 400，模型/引用/图失败与端口违约 502（携带 `requestId`），AI 关闭 404。
+    **200 只表示编排正常完成，不表示依赖成功**。
 
 ## 拓扑
 
@@ -304,6 +326,75 @@ Graph 框架为每个 `NodeOutput` 生成状态快照时会对状态做**序列�
 测试用 12 个并发调用（4 线程）断言：`requestId` 互不重复、每次调用的资产证据与答案都属于自己、
 `executionPath` 完全一致、三个来源与模型各被调用 12 次。
 
+## HTTP 契约：状态码与 DTO 映射（FD-0018-B）
+
+端点 `POST /api/v1/ai/incident-triage`，`Content-Type` 与 `Accept` 均为 `application/json`，
+只在 `flowdesk.ai.enabled=true` 时注册（默认关闭 → 404）。请求体四个字段
+（`assetId`、`question`、`topK`、`minScore`）**不在 HTTP 层校验**：
+`assetId` 的规则只存在于 `AssetIdentifier`（由图的 `validate_asset` 调用），
+`question`/`topK`/`minScore` 的规则只存在于检索用例。空 body 映射为「四个字段全为 `null`」的命令，
+与 `{}` 得到同一条 400。
+
+### 状态码
+
+| 情形 | 状态码 | 说明 |
+| --- | --- | --- |
+| 完整证据 / 部分证据 / 三个来源全 `NOT_FOUND` / 无命中且存在 `FAILED` | **200** | 可审计结果；数据状态由三个来源表达 |
+| 非法 `assetId`（含空 body、`{}`、`null`、空白、位数或大小写不符） | 400 `INVALID_REQUEST` | 三个证据来源与模型**零调用** |
+| 非法 `question`/`topK`/`minScore`（由**真实检索用例**判定） | 400 `INVALID_REQUEST` | detail 原样透传检索用例的文案；Embedding / 数据库 / 两个 MCP 端口 / 模型**零调用** |
+| 请求体不是合法 JSON | 400 `INVALID_REQUEST` | 全局 JSON 契约，本接口不改动未知字段/类型转换/重复字段规则 |
+| 模型失败、空答案、引用校验失败、图执行失败、端口违约 | 502 `AI_PROVIDER_ERROR` | 携带 `requestId`，detail 固定、不含 cause，**不回显模型答案** |
+| `Content-Type` / `Accept` 不受支持 | 415 / 406 | 全局媒体类型契约 |
+| AI 未启用 | 404 | 端点不注册 |
+
+### DTO 映射
+
+| JSON 字段 | 来源 | 规则 |
+| --- | --- | --- |
+| `requestId`、`answer`、`grounded` | `IncidentTriageResult` | **原样**，不重新生成、不重新推断 |
+| `usedEvidenceIds` | `IncidentTriageResult` | 保持用例给出的**首次出现顺序**，防御性复制 |
+| `executionPath` | `IncidentTriageResult` | 保持节点**真实执行**顺序，防御性复制 |
+| `knowledge.status` | `KnowledgeEvidence.status()` | `FOUND`/`NOT_FOUND`/`FAILED` |
+| `knowledge.retrieval` | `KnowledgeRetrievalView` | **复用** `KnowledgeSearchResponse`；仅 `FOUND`/`NOT_FOUND` |
+| `knowledge.failure` | `KnowledgeFailure` | 稳定枚举名；仅 `FAILED`；此时**没有** `retrieval` |
+| `asset` / `monitoring` | 两个查询结果 | **复用**资产诊断的 `AssetDiagnosis*Response`：`FOUND` 给白名单详情 + `source`，`NOT_FOUND` 只给编号 + `source`，`FAILED` 只给 `failure` |
+
+`null` 字段由 `NON_NULL` 省略；监控数值使用包装类型，因此未命中时**省略**而不是序列化成 `0`。
+
+### 为什么保留「真实执行轨迹」与「三个来源的真实状态」
+
+- **`executionPath` 让「走了模型」与「直接降级」可区分**：`fallback_answer` 结尾说明本次没有
+  调用模型，`generate_answer → validate_citations` 说明走了模型且引用通过了校验。
+  它由节点在执行时追加（见「状态键与合并策略」），事后无法伪造；但它随分支变化，
+  因此**不是**稳定契约，调用方不该按它做逻辑分支。
+- **三个来源状态必须一起返回**：`grounded=true` 只说明「答案用了本次给出的证据」，
+  不等于三个依赖都成功。部分命中（知识 `FAILED`、资产与监控命中）时答案依然 grounded，
+  而那次研判是**不完整的** —— 调用方只能通过 `knowledge.status` 与两个 `outcome` 判断。
+- **200 不等于依赖成功**：三个来源全 `NOT_FOUND`（「都没查到」）与「无命中且至少一个失败」
+  （「有来源没查成」）是**两个不同的结论**，也是两条不同的固定文案；
+  它们的 HTTP 状态码都是 200，区别只在结果内容里。
+
+### 为什么用明确的 DTO 而不是直接序列化内部对象
+
+Graph 状态（`OverAllState`）、调用上下文（`IncidentTriageCall`）、来源查询进度与输入拒绝记录
+都是**内部审计状态**：它们不修改任何公开业务错误码，也不属于对外契约。
+直接序列化会让「内部实现细节」变成事实上的公开字段，并在下次重构时被动破坏兼容性。
+因此响应由 HTTP 层显式构造，`question` 原文、向量、SQL、异常与 cause、端点、会话标识与凭证
+都没有位置可放。
+
+### 这一层的测试边界（FD-0018-B）
+
+- **映射层**：`@WebMvcTest` + `IncidentTriageUseCase` 替身，证明响应形状、字段集合、
+  顺序保持与状态码；替身按真实规则拒绝非法输入，因此「非法输入 400」仍由应用层规则决定。
+- **关闭装配**：真实上下文证明端点 404 且上下文里没有任何模型基础设施。
+- **真实接入**：真实 Spring 上下文 + MockMvc + **真实 `IncidentTriageService`/`CompiledGraph`/
+  `KnowledgeRetrievalService`/`ChatClient`**，只替换四个**出站端口**；
+  「某分支零调用」用**计数 + 正向对照**证明（降级路径与命中路径都断言过这些替身确实被调用过），
+  而不是靠一个「永远不调用」的替身宣称。
+- **仍然是合成的**：模型端是本机合成 OpenAI 兼容端点（**不是** DeepSeek），
+  向量与切片来自替身（**不是** DashScope 与 pgvector），资产/监控不经过真实 MCP 服务。
+  这些测试**不**改变 `LIVE_SMOKE`/`MCP_LIVE`/`POSTGRES_LIVE`/`DASHSCOPE_LIVE` 的 `NOT_RUN` 状态。
+
 ## 影响
 
 正面：编排形状第一次真的是「有分叉的图」，节点/边/条件路由可审计、可断言；
@@ -316,8 +407,9 @@ Graph 框架为每个 `NodeOutput` 生成状态快照时会对状态做**序列�
 
 ## 已知边界与未验证项
 
-1. **没有 HTTP**：本阶段只交付应用层契约 + 图 + 模型生成 + 测试，
-   FD-0018-B 才提供端点与状态码语义（可参照 ADR 0014 的 HTTP 契约）；
+1. **HTTP 由 FD-0018-B 交付且没有鉴权**：FD-0018-A 只交付应用层契约 + 图 + 模型生成 + 测试；
+   FD-0018-B 提供端点与状态码语义（见「HTTP 契约：状态码与 DTO 映射（FD-0018-B）」），
+   但接口没有身份与权限概念 —— 能调用就能拿到该资产与知识库的研判结果；
 2. **没有真实 DeepSeek**：自动化测试用本地合成的 OpenAI 兼容端点，
    `LIVE_SMOKE=NOT_RUN`（未对真实模型发起过任何请求）；
 3. **没有真实企业数据源**：三个来源在测试里都是替身/合成端点，
@@ -334,7 +426,11 @@ Graph 框架为每个 `NodeOutput` 生成状态快照时会对状态做**序列�
    `KnowledgeApplicationException` 作为唯一「已声明」的信号，未声明的异常一律按违约处理；
    如果后续给该用例增加新的异常类型，必须同步更新这条边界（否则新的业务失败会被当成违约）；
 10. **括号之外多余的 `]` 仍按普通文本处理**：只有方括号组**内部**参与解释，
-    `[K1]]` 的第二个右括号不算引用结构（嵌套是「组内有方括号」，不是「括号数不配平」）。
+    `[K1]]` 的第二个右括号不算引用结构（嵌套是「组内有方括号」，不是「括号数不配平」）；
+11. **`executionPath` 不是稳定契约（FD-0018-B）**：它是本次调用的真实轨迹（随分支变化），
+    调用方可以用它做审计与排障，但不该按它做逻辑分支 —— 拓扑改变时它就会变；
+12. **`grounded=true` 不等于研判完整（FD-0018-B）**：部分命中时答案仍然 grounded，
+    调用方必须同时读 `knowledge.status` 与两个 `outcome` 才能判断这次研判是否完整。
 
 ## 重新评估条件
 
