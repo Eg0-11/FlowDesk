@@ -31,3 +31,6 @@ logs/
 application-local.yml
 application-local.yaml
 .env
+
+# ---- 本地运行信息（scripts/start-local.ps1 写入：PID、启动时间、目标 JAR、日志）----
+.local-run/
