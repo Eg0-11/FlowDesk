@@ -48,6 +48,18 @@
       <artifactId>jackson-databind</artifactId>
     </dependency>
 
+    <!--
+      事件研判 Agent Graph（FD-0018-A）：Spring AI Alibaba 的 StateGraph / CompiledGraph。
+      只依赖 graph-core（BOM 管理版本，此处不写版本），不引入任何 graph starter 或自动装配 ——
+      图的装配完全在 FlowDeskAiConfiguration 里显式完成，受 flowdesk.ai.enabled 控制。
+      它传递带入 reactor-core / spring-ai-commons / spring-ai-rag 等编译期依赖；
+      其中的数据库驱动（postgresql/ojdbc/mysql）在 graph-core 里都标了 optional，不会被传递进来。
+    -->
+    <dependency>
+      <groupId>com.alibaba.cloud.ai</groupId>
+      <artifactId>spring-ai-alibaba-graph-core</artifactId>
+    </dependency>
+
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-test</artifactId>

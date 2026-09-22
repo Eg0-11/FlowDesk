@@ -1,0 +1,149 @@
+package com.flowdesk.agent.ai;
+
+import com.flowdesk.application.ai.KnowledgeEvidence;
+import com.flowdesk.application.integration.AssetQueryResult;
+import com.flowdesk.application.integration.MonitoringSnapshotQueryResult;
+import java.util.List;
+
+/**
+ * 一次研判调用的<b>调用上下文</b>（FD-0018-A）。
+ *
+ * <p>它作为单个状态键（{@link IncidentTriageStateKeys#CALL}）在图中传递，节点在执行时把自己的
+ * 产物写进来，服务层在调用结束后读取同一个实例。这样做的原因很具体：Graph 框架在为每个
+ * {@code NodeOutput} 生成快照时会对状态做<b>序列化克隆</b>，而克隆会走 JSON 往返 ——
+ * {@code record} 类型的领域对象经过一次往返就不再是原来的类型。因此：</p>
+ * <ul>
+ *   <li>节点之间、以及服务层与节点之间的<b>富对象</b>交换放在这个持有者里（同一个实例，不走克隆）；</li>
+ *   <li>状态里另外只放<b>简单值</b>（{@code executionPath}、{@code route} 与回答文本），
+ *       它们经过 JSON 往返仍然是原本的类型，因此可以从最终状态里安全读回；</li>
+ *   <li>这<b>不</b>意味着状态不携带证据：持有者本身就是状态的一部分，证据始终在这一次调用的状态里，
+ *       只是它们以一个对象的形式集中携带。</li>
+ * </ul>
+ *
+ * <p>本类只在一次调用内使用：服务层每次调用都会新建一个实例，因此并发调用之间不可能共享它。</p>
+ */
+final class IncidentTriageCall {
+
+    private final String requestId;
+
+    private final com.flowdesk.application.ai.IncidentTriageCommand command;
+
+    private KnowledgeEvidence knowledge;
+
+    private AssetQueryResult asset;
+
+    private MonitoringSnapshotQueryResult monitoring;
+
+    private String answer;
+
+    private List<String> usedEvidenceIds = List.of();
+
+    private boolean contractViolation;
+
+    /**
+     * @param requestId 本次请求标识
+     * @param command   本次研判命令（可为 {@code null}；合法性由图中的第一个节点判定）
+     */
+    IncidentTriageCall(String requestId, com.flowdesk.application.ai.IncidentTriageCommand command) {
+        this.requestId = requestId;
+        this.command = command;
+    }
+
+    /**
+     * @return 本次请求标识
+     */
+    String getRequestId() {
+        return this.requestId;
+    }
+
+    /**
+     * @return 本次研判命令（可为 {@code null}）
+     */
+    com.flowdesk.application.ai.IncidentTriageCommand getCommand() {
+        return this.command;
+    }
+
+    /**
+     * @return 知识证据分支三态（尚未检索时为 {@code null}）
+     */
+    KnowledgeEvidence getKnowledge() {
+        return this.knowledge;
+    }
+
+    /**
+     * @param knowledge 知识证据分支三态
+     */
+    void setKnowledge(KnowledgeEvidence knowledge) {
+        this.knowledge = knowledge;
+    }
+
+    /**
+     * @return 资产查询结果（尚未查询时为 {@code null}）
+     */
+    AssetQueryResult getAsset() {
+        return this.asset;
+    }
+
+    /**
+     * @param asset 资产查询结果
+     */
+    void setAsset(AssetQueryResult asset) {
+        this.asset = asset;
+    }
+
+    /**
+     * @return 监控快照查询结果（尚未查询时为 {@code null}）
+     */
+    MonitoringSnapshotQueryResult getMonitoring() {
+        return this.monitoring;
+    }
+
+    /**
+     * @param monitoring 监控快照查询结果
+     */
+    void setMonitoring(MonitoringSnapshotQueryResult monitoring) {
+        this.monitoring = monitoring;
+    }
+
+    /**
+     * @return 最终答案（模型输出或固定降级文案）
+     */
+    String getAnswer() {
+        return this.answer;
+    }
+
+    /**
+     * @param answer 最终答案
+     */
+    void setAnswer(String answer) {
+        this.answer = answer;
+    }
+
+    /**
+     * @return 答案实际引用的证据编号
+     */
+    List<String> getUsedEvidenceIds() {
+        return this.usedEvidenceIds;
+    }
+
+    /**
+     * @param usedEvidenceIds 答案实际引用的证据编号
+     */
+    void setUsedEvidenceIds(List<String> usedEvidenceIds) {
+        this.usedEvidenceIds = List.copyOf(usedEvidenceIds);
+    }
+
+    /**
+     * @return 是否出现过端口契约违约
+     */
+    boolean isContractViolation() {
+        return this.contractViolation;
+    }
+
+    /**
+     * 记录一次端口契约违约。
+     */
+    void markContractViolation() {
+        this.contractViolation = true;
+    }
+}

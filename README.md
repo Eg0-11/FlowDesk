@@ -1,6 +1,6 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0017-B —— 资产诊断结果边界收口与 HTTP 接口（已完成）**
+> **当前阶段：FD-0018-A —— 事件研判核心编排（真实 Agent Graph，已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
@@ -43,12 +43,17 @@
 > （FD-0017-A）、
 > 资产诊断结果边界收口与 HTTP 接口（端口返回 `null` 一律按 `PORT_CONTRACT_VIOLATION` 处理、
 > 结果不变量收紧为「标识与答案非空白 + 编号必须已去重」、`POST /api/v1/ai/asset-diagnosis`
-> 只依赖用例接口并按 outcome 决定字段集合）（FD-0017-B）。
+> 只依赖用例接口并按 outcome 决定字段集合）（FD-0017-B）、
+> 事件研判核心编排（**真实的 Spring AI Alibaba `StateGraph`/`CompiledGraph`**：三类证据来源
+> ——知识检索 + 资产 + 监控——各调用一次、条件边把「有证据 / 无证据 / 端口违约」分成三条路径、
+> `K…`/`A1`/`M1` 引用校验、状态只有三个键且 `executionPath` 由节点真实追加）
+> （FD-0018-A）。
 > 尚未实现：全文检索与混合检索、任意切片读取接口、文档列表/下载/删除、
 > 孤立文件清理任务、`PARSING`/`INDEXING` 悬挂的恢复扫描、问答的流式输出与会话记忆、
 > 游标分页、PostgreSQL 全文检索与 pg_trgm、真实资产/监控数据源、
 > 把远端能力注册为模型工具（需要单独的权限与审计设计）、
-> Agent Graph、鉴权与前端。
+> 事件研判的 HTTP 接口（FD-0018-B）、图上的并行节点/循环/人工审批、
+> 鉴权与前端。
 
 ## 一、项目简介
 
@@ -75,8 +80,8 @@ Tool 调用、MCP 资产/监控服务以及基于 Agent Graph 的自动化编排
 | --- | --- | --- |
 | `flowdesk-shared` | 通用异常、基础类型、工具类 | 仅模块与 `package-info.java` |
 | `flowdesk-domain` | 领域实体、值对象、领域规则（**不依赖 Spring**） | 已实现工单聚合与生命周期状态机（`com.flowdesk.domain.ticket`）、知识文档聚合与解析/索引状态机、切片与向量不变量、查询向量（`com.flowdesk.domain.knowledge`） |
-| `flowdesk-application` | 用例服务、输入输出端口 | 已实现 AI 用例（`…application.ai`，含 `KnowledgeAnswerUseCase` 与 `KnowledgeAnswerResult`）、工单用例 + 乐观并发契约（`…application.ticket`）、知识文档上传/查询/解析/索引用例与端口（`…application.knowledge`，含 `KnowledgeEmbeddingPort`）、知识检索用例与端口（`…application.knowledge`，含 `KnowledgeQueryEmbeddingPort`、`KnowledgeVectorSearchPort` 与 `KnowledgeRerankPort`） |
-| `flowdesk-agent` | AI 编排：实现 application 的 AI 用例，用 ChatClient 编排提示词与本地工具 | 已实现普通聊天、工具冒烟、知识库问答编排（提示词构造 + 引用校验 + 无证据降级），以及资产诊断编排（固定调用两个 MCP 查询端口 + A1/M1 证据与引用校验 + 三条结果路径；`…ai.AssetDiagnosis*`） |
+| `flowdesk-application` | 用例服务、输入输出端口 | 已实现 AI 用例（`…application.ai`，含 `KnowledgeAnswerUseCase` 与 `KnowledgeAnswerResult`、`IncidentTriageUseCase`/`IncidentTriageCommand`/`IncidentTriageResult`/`KnowledgeEvidence`/`KnowledgeFailure`）、工单用例 + 乐观并发契约（`…application.ticket`）、知识文档上传/查询/解析/索引用例与端口（`…application.knowledge`，含 `KnowledgeEmbeddingPort`）、知识检索用例与端口（`…application.knowledge`，含 `KnowledgeQueryEmbeddingPort`、`KnowledgeVectorSearchPort` 与 `KnowledgeRerankPort`） |
+| `flowdesk-agent` | AI 编排：实现 application 的 AI 用例，用 ChatClient 编排提示词与本地工具，并持有真实 Agent Graph | 已实现普通聊天、工具冒烟、知识库问答编排（提示词构造 + 引用校验 + 无证据降级）、资产诊断编排（固定调用两个 MCP 查询端口 + A1/M1 证据与引用校验 + 三条结果路径；`…ai.AssetDiagnosis*`），以及事件研判编排（**真实 `StateGraph`/`CompiledGraph`** + 条件边 + `K…`/`A1`/`M1` 引用校验；`…ai.IncidentTriage*`） |
 | `flowdesk-infrastructure` | 持久化与模型适配器 | 已提供 JDBC 工单存储（`…ticket.persistence.jdbc`）、DeepSeek 传输适配，知识文档的 JDBC 存储、本地文件系统内容读写、Tika 解析适配器、确定性切片器、DashScope 文档/查询 Embedding 适配器、pgvector 向量写入与相似度检索适配器、DashScope 文本重排适配器（`…knowledge.*`），以及 MCP 客户端适配器（`…mcp.client`：资产查询与监控快照查询两个端口，按次会话调用两个独立 MCP 服务的固定工具） |
 | `flowdesk-bootstrap` | FlowDesk 主服务启动模块（Web + Validation + Actuator + AI 接口 + 工单 REST 接口 + 知识文档 REST 接口 + 知识检索接口 + 知识问答接口 + 资产诊断接口） | 可启动，端口 8080 |
 | `flowdesk-mcp-asset` | 独立资产 MCP 服务（Web + Actuator + MCP Streamable HTTP `/mcp`） | 可启动，端口 8091；已实现 `asset_get` 只读查询工具（演示/不可用两种数据源模式） |
@@ -114,7 +119,7 @@ flowdesk-mcp-monitoring     ← 只依赖 flowdesk-shared
 | Maven | 3.9+（Enforcer 校验 `[3.9,)`） |
 | Spring Boot | 3.5.8（父 POM + BOM） |
 | Spring AI | 1.1.2（BOM 管理；实际使用 `spring-ai-client-chat`、`spring-ai-starter-model-openai`、`spring-ai-starter-mcp-server-webmvc`（FD-0014 资产 MCP 服务与 FD-0015 监控 MCP 服务共用）与 `spring-ai-mcp`（FD-0016 主服务的 MCP **客户端**，它传递带入官方 MCP Java SDK 聚合构件 `io.modelcontextprotocol.sdk:mcp:0.17.0`，与两个 MCP 服务同一版本；版本全部由 BOM 管理，未手工指定版本）） |
-| Spring AI Alibaba | 1.1.2.2（BOM 管理；实际使用 `spring-ai-alibaba-starter-dashscope`，只在 `dashscope-embedding` profile 下提供 `EmbeddingModel`；Agent Framework 留待后续阶段） |
+| Spring AI Alibaba | 1.1.2.2（BOM 管理；实际使用 `spring-ai-alibaba-starter-dashscope`（只在 `dashscope-embedding` profile 下提供 `EmbeddingModel`）与 `spring-ai-alibaba-graph-core`（FD-0018-A 事件研判的真实 `StateGraph`/`CompiledGraph`；**不使用** `ReactAgent`，也未引入完整 Agent Framework）） |
 | Spring AI Alibaba Extensions | 1.1.2.2（**仅导入 BOM**） |
 | DeepSeek 传输 | OpenAI 兼容 Chat Completions（`spring-ai-starter-model-openai`，见 [ADR 0001](docs/adr/0001-deepseek-openai-compatible-transport.md)） |
 | Apache Tika | 3.3.2（`tika-core` + `tika-parsers-standard-package`，版本由根 pom 的 `tika.version` 单点锁定；**不使用 `tika-app`**；已排除 `commons-logging` 与 `jcl-over-slf4j`，只保留 Spring 自带的 `spring-jcl`，见 [ADR 0006](docs/adr/0006-document-parsing-and-deterministic-chunking.md)） |
@@ -769,12 +774,14 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0016-R1 | 客户端收口：中断沿整条 cause 链传播并在关闭路径不吞中断、官方 SDK 日志按包名收口（默认 `OFF`，排障可临时打开）、应用层结果对象直连单元测试 | ✅ 已完成 |
 | FD-0017-A | 资产诊断 Agent：Agent 固定调用资产与监控两个查询端口（各一次、顺序固定）、A1/M1 证据与引用校验、完整/部分/无证据三条路径 | ✅ 已完成 |
 | FD-0017-B | 资产诊断结果边界收口与 HTTP 接口：端口返回 `null` 按 `PORT_CONTRACT_VIOLATION` 处理、结果不变量收紧（非空白标识与答案、编号必须已去重）、`POST /api/v1/ai/asset-diagnosis`（Controller + 按 outcome 决定字段集合的 DTO + 状态码语义） | ✅ 已完成 |
+| FD-0018-A | 事件研判核心编排（真实 Agent Graph）：应用层契约（`IncidentTriageUseCase`/`IncidentTriageCommand`/`IncidentTriageResult`/`KnowledgeEvidence`/`KnowledgeFailure`）+ 真实 `StateGraph`/`CompiledGraph`（三类证据各调用一次、条件边三分支、执行路径由节点真实追加）+ DeepSeek 生成与 `K…`/`A1`/`M1` 引用校验（**本阶段不含 HTTP**） | ✅ 已完成 |
+| FD-0018-B | 事件研判 HTTP 接口（Controller + DTO + 状态码语义） | 未开始 |
 | 后续 | 问答流式输出与会话记忆（当前为一次性完整响应、无历史轮次） | 未开始 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm`（混合检索） | 未开始 |
 | 后续 | 孤立文件清理任务 | 未开始 |
 | 后续 | Tool 体系扩展：面向工单与知识的工具注册 | 未开始 |
 | 后续 | MCP：把远端能力注册为模型可见的工具（需要单独的权限与审计设计；本阶段刻意不注册，见 ADR 0014） | 未开始 |
-| 后续 | Agent Graph：基于 Spring AI Alibaba Agent Framework 的多节点编排 | 未开始 |
+| 后续 | Agent Graph 的其它形态：并行节点、循环重试、人工审批、跨请求状态持久化（事件研判已用真实 `StateGraph`，见 FD-0018-A） | 未开始 |
 
 ## 十四、真实验证状态（重要）
 
@@ -798,6 +805,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | 主服务 MCP 客户端证据（FD-0016） | ✅ 已执行 | **真实 SDK + 真实 HTTP 端点**：用一个可控的本机 Streamable HTTP 端点（`com.sun.net.httpserver`，随机端口、只绑回环、帧格式对照两个真实服务实测结果）打**真实 MCP Java SDK 客户端**，覆盖 `initialize` → 固定工具调用 → `DELETE /mcp` 释放会话（计数端点断言 `liveSessions` 为空、`DELETE` 次数等于调用次数、每次查询都是新会话、被调用的工具名恰好是 `asset_get`/`monitoring_snapshot_get`）；**三态与分类**：命中/未找到/远端 `isError=true` 的 `*_SOURCE_UNAVAILABLE` → `UNAVAILABLE`、未知错误码与 JSON-RPC 错误 → `REMOTE_TOOL_ERROR`、5xx 与连接被拒 → `UNAVAILABLE`、挂起不响应 → `TIMEOUT`（有界结束）、非法输入（空/空白/位数不符/小写/含空格/下划线/超长/non-字符串）→ `INVALID_INPUT` 且**端点计数不变（零请求）**；**非法载荷逐条被拒**（各 21/16 条参数化用例）：缺字段、多字段、类型不符、未知枚举（`health=WARM`）、百分比越界与非整数、告警数为负、`observedAt` 非法、编号错配、`source` 缺失/`null`/未知、非法 JSON、两段 JSON 拼接、非对象、多 content、非 text content、非空 `structuredContent`；**装配证据**：`enabled=true` 时上下文启动后端点计数仍为 0（启动期不连接）、`enabled=false`（含写错的 URL 与非法超时）时上下文照常启动且零请求、结果明确为 `DISABLED` 且 `isNotFound=false`；端点规则 41 条用例（回环字面量通过；`https`/主机名/`127.1`/`2130706433`/`0127.0.0.1`/userinfo/query/fragment/自定义路径/缺端口/越界端口/前后空格一律拒绝），超时配置用例覆盖 `null/0/负/31s/600s` 拒绝与 `1ms/5s/30s` 通过；**日志**：结构化断言行模板与四个参数位（别名/工具名/结果分类/唯一数值耗时），因此 assetId、监控数值与响应正文无位置可放；**默认上下文**：真实 `FlowDeskApplication` 默认配置下两个端口是 `DISABLED` 适配器、上下文中**没有** `ToolCallback` Bean、也没有 Spring AI 的 MCP 客户端自动装配 Bean，工单与知识文档控制器仍在；**对着两个真实已验收服务的端到端**：演示模式下资产命中（`SERVER`/`IN_SERVICE`/`DEMO`）与监控命中（`observedAt`/`DEGRADED`/92/68/1/`DEMO`）都是 `FOUND`、两端未命中（`AST-999999`/`AST-900003`）都是 `NOT_FOUND` 且带来源、资产服务跑默认（无数据源）模式时映射为 `UNAVAILABLE` |
 | MCP 客户端日志与中断语义证据（FD-0016-R1） | ✅ 已执行 | **SDK 日志旁路收口**：把唯一哨兵分别注入 initialize 响应（`serverInfo.name` 与 `instructions`）与失败响应（JSON-RPC 错误消息），用挂在 **root** logger 上的捕获器验证 —— **正向对照**：显式打开诊断档（`DEBUG`）时 SDK 确实把哨兵写进日志（证明请求真的发生、哨兵真的到过客户端、这条旁路真实存在）；**交付默认**（`sdk-log-level=OFF`）下同一条链路（端点计数增长证明请求发生、异常 cause 链里确实带着远端错误原文）日志里**不出现任何哨兵**，且来自 `io.modelcontextprotocol` 的事件数为 **0**；同时断言项目自己的固定元数据日志（`McpQueryLogger` 的模板与四个参数位）仍然照常输出，证明日志控制**只作用于 SDK 的包名**；级别取值 `OFF/ERROR/WARN/INFO/DEBUG/TRACE` 通过、`VERBOSE`/空/`OFFF` 等一律启动失败且不回显原值，启用装配后 SDK logger 实测为 `OFF`；**中断传播**：直接中断、运行期包装、`IOException` 包装、`McpTransportException` 包装、五层深链与自引用环链全部在**同一线程**断言「分类为 `UNAVAILABLE` 且中断标志被恢复」（自引用环链有界终止、非中断路径不得置位），中断标志在 `finally` 清理；**应用层结果契约**：两个结果记录的三态、11 类自相矛盾组合、必需字段缺失与 `require*` 错误状态共 12 条直连单元测试 |
 | 资产诊断 Agent 证据（FD-0017-A） | ✅ 已执行 | **确定性编排（真实 ChatClient + 本地合成 OpenAI 端点）**：一次诊断**只发出一个模型请求**，且请求里只有 `system` 与 `user` 两条消息、**没有** `tools`/`tool_choice`，system 只含规则（不含 assetId/字段/数值/失败详情），user 里是确定性 JSON（字段顺序 `assetId`、`allowedEvidenceIds`、`availability`、`evidence`，边界标记各恰好出现一次），evidence 只含命中侧的白名单字段（A1 四条、M1 八条），请求里不含端点/端口/密钥/`Authorization`/异常/`jsonrpc`/会话头/`ToolCallback`；**查询契约**：两个端口各调用一次、顺序固定为资产 → 监控（替身记录调用顺序）、**第一次查询失败后第二次仍然执行**、非法输入（`null` 命令、空、空白、`AST-1`、小写、前后空格、超长、下划线）一律 `AiRequestException` 且**端口与模型零调用**；**三条路径**：两侧命中 → 模型一次 + `[A1][M1]` 必引、仅资产命中（另一侧 `NOT_FOUND`/`UNAVAILABLE`/`DISABLED`/`TIMEOUT`）→ 只允许并要求 `[A1]`、仅监控命中 → 只允许并要求 `[M1]`、两侧都 `NOT_FOUND` → **不调用模型** + 固定回答「未查询到该资产或可用的监控快照。」、无命中且至少一侧失败 → **不调用模型** + 固定降级回答「当前无法获得足够的资产与监控证据，暂时不能生成诊断结论。」，且响应完整保留两侧原始 `QueryOutcome` 与 `QueryFailure`（失败绝不被改写成未找到）；**引用校验**：空答案/无引用/`[a1]`/`[A01]`/`[A 1]`/`[A1 ]`/`[A1x]`/`[A2]`/`[A]`/`[A-1]`/`[A1,M1]`/未闭合/全角数字一律失败，引用本次不存在的证据失败，本次命中证据未被全部引用失败，重复引用按首次出现顺序去重，失败统一 `AiProviderException` 且携带 `requestId`、**不修正/不补引用/不重试**（模型调用次数仍为 1）；**结果对象**：10 条直连单元测试覆盖三态、防御性复制、只允许 A1/M1、证据与命中状态绑定的自相矛盾组合、`grounded` 与引用集合必须完全一致；**日志**：结构化断言行模板（两条固定文案）与全部参数位，assetId/资产详情/监控文本/模型回答/提示词/异常消息与端点均无位置可放，且用哨兵先证明它们进入过结果再证明没有进入日志；**装配**：`flowdesk.ai.enabled=false`（默认）时诊断用例与实现类均不存在、两个 FD-0016 端口仍在，`true` 时正确装配 |
+| 事件研判 Graph 证据（FD-0018-A） | ✅ 已执行 | **真实 `CompiledGraph`（`spring-ai-alibaba-graph-core`）+ 真实 `ChatClient` + 本地合成 OpenAI 端点**：17 条图测试直接驱动编译后的图 —— 完整路径逐节点断言为 `validate_asset → retrieve_knowledge → query_asset → query_monitoring → verify_contracts → evidence_gate → generate_answer → validate_citations → finish`、无证据路径以 `fallback_answer → finish` 收尾、部分命中路径照常生成、三个证据来源**各调用一次**（替身计数）、非法 `assetId` 与非法检索输入（`INVALID_RETRIEVAL_QUERY`）一律 400 且**下游端口与模型零调用**、知识失败码逐个映射（`KNOWLEDGE_EMBEDDING_DISABLED`→`DISABLED`、`EMBEDDING_PROVIDER_ERROR`→`EMBEDDING_PROVIDER_UNAVAILABLE`、`RERANK_PROVIDER_ERROR`→`RERANK_PROVIDER_UNAVAILABLE`、其余含 `KNOWLEDGE_RETRIEVAL_FAILURE` 与未预期运行期异常→`RETRIEVAL_FAILURE`）、端口返回 `null` 或抛异常 → 路由 `contract_violation` 且**监控仍然被查询一次**、执行路径由节点真实追加、状态缺失/类型不符收敛为有界失败（cause 链里是 `IncidentTriageException`，**不出现** `NullPointerException`）、**12 个并发调用**（4 线程）互不串线（每次调用的 requestId、资产证据、答案都属于自己，三个来源与模型各 12 次）；**引用校验 9 条**（空答案/无引用/`[k1]`/`[K01]`/`[K 1]`/`[K1x]`/未闭合/未知编号/某一类证据未被引用 → 六类稳定失败，重复引用按首次出现顺序去重）；**提示词 8 条**（字段顺序 `question`/`availability`/`evidence`、白名单字段、边界标记各恰好一次且可被中和、失败只以稳定枚举出现、不含端点/密钥/异常/标识）；**日志 7 条**（两条固定模板 + 参数位逐个钉死，assetId/问题原文/知识正文/资产详情/监控数值/模型答案/提示词/异常消息与端点均无位置可放，并用哨兵先证明这些材料进入过结果）；**应用层结果 9 条**（三态互斥、防御性复制、引用必须是本次证据的子集、`grounded` 与引用集合完全一致、`FAILED` 不等同于 `NOT_FOUND`）；**真实模型请求 2 条**（真实 HTTP 报文：只有 system + user 两条消息、**没有** `tools`/`tool_choice`、system 只含规则不含 assetId/问题、user 里证据 JSON 字段集合逐项断言、请求里不含端点/端口/`Authorization`/假 Key/`documentId`/`chunkSha256`/异常/`jsonrpc`/会话头/`ToolCallback`）；**装配 3 条**：`flowdesk.ai.enabled=false`（默认）时事件研判用例与实现类都不存在、两个 FD-0016 端口仍在，`true` 时正确装配；**未验证项**：`LIVE_SMOKE=NOT_RUN`（未对真实 DeepSeek 发起请求）、`MCP_LIVE`/`POSTGRES_LIVE`/`DASHSCOPE_LIVE=NOT_RUN` |
 | PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证**；pgvector 集成测试（Testcontainers，镜像固定为带扩展版本的 `pgvector/pgvector:0.8.6-pg16`）在无 Docker 时跳过（当前跳过 26 条：15 条索引写入 + 11 条相似度检索），报告标注 POSTGRESQL_PGVECTOR_IT=NOT_RUN |
 | 真实 DashScope Embedding | ⚠️ **DASHSCOPE_LIVE=NOT_RUN** | 无 DASHSCOPE_API_KEY，**未对真实向量服务发起过任何请求**；全部自动化测试都不访问真实上游 |
 | 真实 DeepSeek | ⚠️ **LIVE_SMOKE=NOT_RUN** | 无 `DEEPSEEK_API_KEY`，**未对真实模型发起过任何请求** |
@@ -805,8 +813,9 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 > **本文档不宣称 PostgreSQL 或真实 DeepSeek 已验证。** 相关代码按标准 SQL 与 OpenAI 兼容协议编写、
 > 预期可用，但在真实环境跑通之前不应当作已验证。
 
-> Spring AI Alibaba 的 BOM 已在根 pom 中导入并锁定版本，但其 Agent Framework 制品尚未使用；
-> 后续阶段接入时直接复用现有 BOM，不需要改动版本基线。
+> Spring AI Alibaba 的 BOM 已在根 pom 中导入并锁定版本；FD-0018-A 起实际使用其中的
+> `spring-ai-alibaba-graph-core`（`StateGraph`/`CompiledGraph`），版本仍由 BOM 管理，
+> 未手工指定版本。完整 Agent Framework（`ReactAgent` 等）**未**引入。
 
 ## 十五、知识文档上传（RAG 1/6）
 
@@ -2731,3 +2740,126 @@ curl -X POST http://localhost:8080/api/v1/ai/asset-diagnosis \
 5. **没有流式输出、会话记忆、重试、并行或缓存**；
 6. **单条快照**：只看最近一条监控快照，没有时间序列与趋势；
 7. `POSTGRES_LIVE`、`DASHSCOPE_LIVE` 与本阶段无关但全仓仍为 `NOT_RUN`。
+
+## 二十五、事件研判核心编排（FD-0018-A）
+
+设计取舍见 [`docs/adr/0015-incident-triage-agent-graph.md`](docs/adr/0015-incident-triage-agent-graph.md)。
+本阶段是仓库里**第一次**用真实的 Spring AI Alibaba Agent Graph：编排形状本身变了 ——
+证据来源从一个变成三个（知识检索 + 资产 + 监控），并且「有证据 / 没有证据 / 端口违约」
+是**真正不同的三条路径**，因此用 `StateGraph` 把节点、边与条件路由**声明**出来，
+而不是把分支藏进 service 里的 `switch`/`if`。
+
+**本阶段只交付「应用层契约 + 图 + 模型生成 + 测试」，没有任何 HTTP 接口** ——
+端点是 FD-0018-B 的范围。本阶段也**不**使用 `ReactAgent`、**不**注册工具、
+**不**引入会话记忆、流式输出、重试或缓存。
+
+### 25.1 图拓扑
+
+```
+START → validate_asset → retrieve_knowledge → query_asset → query_monitoring
+      → verify_contracts → evidence_gate ─┬─ evidence_available → generate_answer
+                                         │                       → validate_citations → finish
+                                         ├─ no_evidence        → fallback_answer  → finish
+                                         └─ contract_violation → contract_violation → finish
+      finish → END
+```
+
+- **11 个节点、11 条普通边（含 `START`/`END`）、1 组条件边**；`evidence_gate` 是真实存在的过路节点，
+  它的三个出口由 `route` 决定（框架负责调度，代码里没有 if/else 分派）。
+- **三个证据来源各调用一次，顺序固定**（`validate_asset` → `retrieve_knowledge` → `query_asset`
+  → `query_monitoring`）：前一个失败或未命中都必须继续执行后面两个 ——
+  「某个来源没查成」绝不能让其它来源的证据消失。
+- **图在装配期编译一次**并只读复用；每次调用新建调用上下文与独立的 `RunnableConfig`
+  （`threadId` 就是本次 `requestId`），且**显式传入空的 `SaverConfig`**、不注册 checkpoint，
+  因此并发调用之间零共享状态（12 并发用例断言互不串线）。
+
+### 25.2 状态键与合并策略
+
+| key | 类型 | 合并策略 | 写入者 |
+| --- | --- | --- | --- |
+| `call` | `IncidentTriageCall` | **REPLACE** | 调用方创建（输入）；各节点在执行中写入自己的产物 |
+| `route` | `String` | **REPLACE** | `verify_contracts` |
+| `executionPath` | `List<String>` | **APPEND** | 每个节点各自追加自己的节点名 |
+
+**为什么状态里只有一个「富对象」键**：Graph 框架为每个 `NodeOutput` 生成状态快照时会对状态做
+**序列化克隆**（JSON 往返），经克隆的域对象会退化成 `Map`，从**最终状态**强类型读回会失败
+（第一版设计因此有 9 条图测试以 `GRAPH_FAILURE` 失败）。所以本次调用的全部产物集中放在
+一个上下文对象里，服务层读的是**自己持有的那个实例**（节点写入的就是同一个引用，天然免疫克隆），
+状态里另外两个键都是简单标量，从最终状态读回是安全的。
+`executionPath` 是唯一的 APPEND 键，因此 `IncidentTriageResult.executionPath` 是**真实执行**的轨迹。
+
+### 25.3 三条路径与三个来源的失败语义
+
+| 情形 | 是否调用模型 | 路由 | 结果 |
+| --- | --- | --- | --- |
+| 至少一个来源有可用证据 | **调用一次** | `evidence_available` | `grounded=true`，引用本次存在的编号 |
+| 三类都没有可用证据且都不是失败 | 不调用 | `no_evidence` | 固定回答「未找到可用于事件研判的资产、监控或知识证据。」 |
+| 三类都没有可用证据，且至少一个 `FAILED`/`DISABLED` | 不调用 | `no_evidence` | 固定降级回答「当前无法获得足够证据，暂时不能完成事件研判。」 |
+| 任一查询端口返回 `null` 或抛异常 | 不调用 | `contract_violation` | 502 + `requestId`（`failure=PORT_CONTRACT_VIOLATION`） |
+
+| 来源 | 成功 | 未命中 | 失败 |
+| --- | --- | --- | --- |
+| 知识（检索用例） | `FOUND` + 非空检索视图（`K1…Kn`） | `NOT_FOUND` + 空检索视图 | `FAILED` + 稳定 `KnowledgeFailure`，**没有**检索视图 |
+| 资产（`AssetQueryPort`） | `FOUND`（`A1`） | `NOT_FOUND` | `FAILED` + `QueryFailure` |
+| 监控（`MonitoringSnapshotQueryPort`） | `FOUND`（`M1`） | `NOT_FOUND` | `FAILED` + `QueryFailure` |
+
+知识失败分类的映射：`KNOWLEDGE_EMBEDDING_DISABLED → DISABLED`、
+`EMBEDDING_PROVIDER_ERROR → EMBEDDING_PROVIDER_UNAVAILABLE`、
+`RERANK_PROVIDER_ERROR → RERANK_PROVIDER_UNAVAILABLE`、
+其余（含 `KNOWLEDGE_RETRIEVAL_FAILURE` 与检索链路上任何未预期运行期异常）`→ RETRIEVAL_FAILURE`。
+**`FAILED`/`DISABLED` 永远不会被改写成 `NOT_FOUND`。**
+
+### 25.4 应用层契约与不变量
+
+| 类型 | 作用 |
+| --- | --- |
+| `IncidentTriageUseCase` | 唯一入口：`IncidentTriageResult triage(IncidentTriageCommand)` |
+| `IncidentTriageCommand` | `assetId`、`question`、`topK`、`minScore`（**不在构造器里校验**，合法性由用例/图判定） |
+| `IncidentTriageResult` | 答案 + 实际引用 + 真实执行路径 + 三个来源的真实状态 |
+| `KnowledgeEvidence` | 知识分支三态（`FOUND`/`NOT_FOUND`/`FAILED`），每种状态携带的数据形状固定 |
+| `KnowledgeFailure` | 稳定失败分类（`DISABLED`/`EMBEDDING_PROVIDER_UNAVAILABLE`/`RERANK_PROVIDER_UNAVAILABLE`/`RETRIEVAL_FAILURE`） |
+
+`IncidentTriageResult` 的构造期不变量：`requestId`/`answer` 非 `null` 且非空白；
+`usedEvidenceIds` 与 `executionPath` 防御性复制为不可变列表；`executionPath` 至少一个节点；
+引用不得重复；引用必须是**本次真实存在**证据的子集；`grounded` **当且仅当**引用集合非空。
+因此「既声称有据、又没有任何引用」在类型层面就不可能出现。
+
+### 25.5 引用协议
+
+- 知识沿用检索给出的 `K1…Kn`，资产固定 `A1`，监控固定 `M1`。
+- 空答案 → `ANSWER_EMPTY`；一条引用都没有 → `ANSWER_WITHOUT_CITATION`；
+  畸形引用（`[k1]`、`[K01]`、`[K 1]`、`[K1x]`、未闭合、全角数字等）→ `INVALID_CITATION_FORMAT`；
+  引用本次不存在的编号 → `UNKNOWN_CITATION`；本次有证据的某一类完全没有被引用 →
+  `EVIDENCE_FAMILY_NOT_CITED`。重复引用按**首次出现顺序**去重。
+- 失败**不**修正、**不**补引用、**不**重新调用模型（模型调用次数始终 ≤ 1）。
+- **引用校验只证明编号来源，不证明结论在事实上正确** —— 也没有人工复核环节。
+
+### 25.6 提示词与日志
+
+- 系统消息**只有规则**（不含问题原文、`assetId`、知识正文、证据字段与失败详情）。
+- 用户消息是确定性 JSON，字段顺序固定为 `question`、`availability`、`evidence`：
+  `availability` 只放三类的 outcome 与稳定失败枚举；`evidence` 只放**命中侧**的白名单字段
+  （知识 `citationId`/`documentTitle`/`chunkIndex`/`content`，**不发送** documentId、documentVersion、
+  `chunkSha256`、向量与分数；资产与监控沿用 FD-0017 的白名单）；未命中与失败**不产生**证据条目。
+- 送给模型的问题与送给检索链路的问题**逐字符相同**（同一个 `KnowledgeQueryNormalizer`）。
+- JSON 外包一层服务端边界标记（`<<<FLOWDESK_TRIAGE_DATA_BEGIN>>>`/`..._END>>>`），
+  数据里出现同名标记会被中和为 `[[FLOWDESK_MARKER_NEUTRALIZED]]`（两个标记各恰好出现一次）。
+  这只**降低**注入风险，真正兜底的是输出侧引用校验，而引用校验也只证明编号来源。
+- 每次研判只记录一条结构化日志：`operation`、`requestId`、三个来源状态、`graphRoute`、
+  `modelCalled`、`evidenceCount`、`usedEvidenceCount`、`success`、`durationMs`，
+  失败时再加稳定 `failure` 与异常**类名**。`assetId`、问题原文、知识正文、资产详情、监控数值、
+  模型答案、提示词、异常消息、端点、密钥、SQL 与堆栈**没有位置可放**。
+
+### 25.7 已知边界
+
+1. **没有 HTTP**：端点和状态码语义属于 FD-0018-B（可参照第二十四章的资产诊断 HTTP 契约）；
+2. **没有真实 DeepSeek**：`LIVE_SMOKE=NOT_RUN`（自动化测试用本地合成 OpenAI 端点）；
+3. **没有真实企业数据源**：`MCP_LIVE`/`POSTGRES_LIVE`/`DASHSCOPE_LIVE` 仍为 `NOT_RUN`
+   （三个来源在测试里都是替身或合成端点）；
+4. **引用校验不等于事实正确**，且没有人工复核；
+5. **没有会话记忆、流式输出、工具调用、重试、缓存、并行节点与人工审批**；
+6. **知识编号只在本次调用内有意义**：`K1…Kn` 就是本次检索返回的顺序（开重排即重排后的顺序），
+   不能跨请求比较；
+7. **没有逐节点超时**：一次研判的耗时由模型调用主导；
+8. **部分命中时答案可能是 `grounded=true` 但研判不完整**：调用方必须读
+   `knowledge.status` / `asset.outcome` / `monitoring.outcome`，不能只看答案或（将来的）状态码。
