@@ -379,6 +379,30 @@ class IncidentTriageGraphTests {
     }
 
     @Test
+    void anAssetPortExceptionIsAContractViolationAsWell() {
+        Fixture fixture = new Fixture("绝不该被调用。");
+        fixture.assetPort.throwsUnexpectedly(new IllegalStateException("sentinel-asset-broken"));
+
+        assertThatThrownBy(fixture::triage).isInstanceOf(AiProviderException.class);
+
+        assertThat(fixture.assetPort.calls()).as("资产查询执行了一次").isEqualTo(1);
+        assertThat(fixture.monitoringPort.calls()).as("违约后监控仍然执行").isEqualTo(1);
+        assertThat(fixture.model.calls()).as("违约在调用模型前统一失败").isZero();
+    }
+
+    @Test
+    void aNullMonitoringResultIsAContractViolationAsWell() {
+        Fixture fixture = new Fixture("绝不该被调用。");
+        fixture.monitoringPort.returnsNull();
+
+        assertThatThrownBy(fixture::triage).isInstanceOf(AiProviderException.class);
+
+        assertThat(fixture.monitoringPort.calls()).as("监控查询执行了一次").isEqualTo(1);
+        assertThat(fixture.assetPort.calls()).isEqualTo(1);
+        assertThat(fixture.model.calls()).isZero();
+    }
+
+    @Test
     void theThreeMcpAndKnowledgeStatesKeepTheirOriginalMeaning() {
         Fixture fixture = new Fixture("资产不可用但监控偏高 [M1]。");
         fixture.retrieval.returns(emptyRetrieval());
@@ -643,9 +667,14 @@ class IncidentTriageGraphTests {
 
         private boolean perAssetId;
 
+        private RuntimeException unexpected;
+
         @Override
         public AssetQueryResult findAsset(String assetId) {
             this.calls.incrementAndGet();
+            if (this.unexpected != null) {
+                throw this.unexpected;
+            }
             if (this.nullResult) {
                 return null;
             }
@@ -661,6 +690,10 @@ class IncidentTriageGraphTests {
 
         void returnsNull() {
             this.nullResult = true;
+        }
+
+        void throwsUnexpectedly(RuntimeException unexpected) {
+            this.unexpected = unexpected;
         }
 
         void answersPerAssetId() {
@@ -682,17 +715,23 @@ class IncidentTriageGraphTests {
 
         private RuntimeException unexpected;
 
+        private boolean nullResult;
+
         @Override
         public MonitoringSnapshotQueryResult findLatestSnapshot(String assetId) {
             this.calls.incrementAndGet();
             if (this.unexpected != null) {
                 throw this.unexpected;
             }
-            return this.result;
+            return this.nullResult ? null : this.result;
         }
 
         void returns(MonitoringSnapshotQueryResult result) {
             this.result = result;
+        }
+
+        void returnsNull() {
+            this.nullResult = true;
         }
 
         void throwsUnexpectedly(RuntimeException unexpected) {

@@ -1,6 +1,6 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0018-A-R1 —— 事件研判异常分类、审计信息与引用边界的收口（已完成）**
+> **当前阶段：FD-0018-A-R2 —— 来源查询进度的日志语义收口（已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
@@ -50,7 +50,10 @@
 > （FD-0018-A）、
 > 事件研判边界收口（异常分类只看来源不看类型（模型阶段抛出的 `AiRequestException` 保持
 > `MODEL_CALL_FAILED`）、失败日志记录真实执行进度（`modelCalled` 在调用模型之前置位）、
-> 拒绝嵌套方括号引用（`[[A1]]`）、知识分支区分已声明失败与端口违约）（FD-0018-A-R1）。
+> 拒绝嵌套方括号引用（`[[A1]]`）、知识分支区分已声明失败与端口违约）（FD-0018-A-R1）、
+> 事件研判来源查询进度的日志语义（每个来源在调用前记录「已开始查询」，日志据此区分
+> `NOT_QUERIED` / 结果自身的 `FOUND`/`NOT_FOUND`/`FAILED` / `PORT_CONTRACT_VIOLATION`，
+> 不再把「返回 `null` 或抛未声明异常」说成未查询）（FD-0018-A-R2）。
 > 尚未实现：全文检索与混合检索、任意切片读取接口、文档列表/下载/删除、
 > 孤立文件清理任务、`PARSING`/`INDEXING` 悬挂的恢复扫描、问答的流式输出与会话记忆、
 > 游标分页、PostgreSQL 全文检索与 pg_trgm、真实资产/监控数据源、
@@ -84,7 +87,7 @@ Tool 调用、MCP 资产/监控服务以及基于 Agent Graph 的自动化编排
 | `flowdesk-shared` | 通用异常、基础类型、工具类 | 仅模块与 `package-info.java` |
 | `flowdesk-domain` | 领域实体、值对象、领域规则（**不依赖 Spring**） | 已实现工单聚合与生命周期状态机（`com.flowdesk.domain.ticket`）、知识文档聚合与解析/索引状态机、切片与向量不变量、查询向量（`com.flowdesk.domain.knowledge`） |
 | `flowdesk-application` | 用例服务、输入输出端口 | 已实现 AI 用例（`…application.ai`，含 `KnowledgeAnswerUseCase` 与 `KnowledgeAnswerResult`、`IncidentTriageUseCase`/`IncidentTriageCommand`/`IncidentTriageResult`/`KnowledgeEvidence`/`KnowledgeFailure`）、工单用例 + 乐观并发契约（`…application.ticket`）、知识文档上传/查询/解析/索引用例与端口（`…application.knowledge`，含 `KnowledgeEmbeddingPort`）、知识检索用例与端口（`…application.knowledge`，含 `KnowledgeQueryEmbeddingPort`、`KnowledgeVectorSearchPort` 与 `KnowledgeRerankPort`） |
-| `flowdesk-agent` | AI 编排：实现 application 的 AI 用例，用 ChatClient 编排提示词与本地工具，并持有真实 Agent Graph | 已实现普通聊天、工具冒烟、知识库问答编排（提示词构造 + 引用校验 + 无证据降级）、资产诊断编排（固定调用两个 MCP 查询端口 + A1/M1 证据与引用校验 + 三条结果路径；`…ai.AssetDiagnosis*`），以及事件研判编排（**真实 `StateGraph`/`CompiledGraph`** + 条件边 + `K…`/`A1`/`M1` 引用校验；`…ai.IncidentTriage*`；FD-0018-A-R1 收口了异常分类的来源边界、失败路径的真实执行进度、嵌套方括号引用与知识分支的「已声明失败 vs 端口违约」） |
+| `flowdesk-agent` | AI 编排：实现 application 的 AI 用例，用 ChatClient 编排提示词与本地工具，并持有真实 Agent Graph | 已实现普通聊天、工具冒烟、知识库问答编排（提示词构造 + 引用校验 + 无证据降级）、资产诊断编排（固定调用两个 MCP 查询端口 + A1/M1 证据与引用校验 + 三条结果路径；`…ai.AssetDiagnosis*`），以及事件研判编排（**真实 `StateGraph`/`CompiledGraph`** + 条件边 + `K…`/`A1`/`M1` 引用校验；`…ai.IncidentTriage*`；FD-0018-A-R1 收口了异常分类的来源边界、失败路径的真实执行进度、嵌套方括号引用与知识分支的「已声明失败 vs 端口违约」，R2 又把来源状态改为按**查询进度**记录：调用前先置位，违约记 `PORT_CONTRACT_VIOLATION`，只有真未调用才是 `NOT_QUERIED`） |
 | `flowdesk-infrastructure` | 持久化与模型适配器 | 已提供 JDBC 工单存储（`…ticket.persistence.jdbc`）、DeepSeek 传输适配，知识文档的 JDBC 存储、本地文件系统内容读写、Tika 解析适配器、确定性切片器、DashScope 文档/查询 Embedding 适配器、pgvector 向量写入与相似度检索适配器、DashScope 文本重排适配器（`…knowledge.*`），以及 MCP 客户端适配器（`…mcp.client`：资产查询与监控快照查询两个端口，按次会话调用两个独立 MCP 服务的固定工具） |
 | `flowdesk-bootstrap` | FlowDesk 主服务启动模块（Web + Validation + Actuator + AI 接口 + 工单 REST 接口 + 知识文档 REST 接口 + 知识检索接口 + 知识问答接口 + 资产诊断接口） | 可启动，端口 8080 |
 | `flowdesk-mcp-asset` | 独立资产 MCP 服务（Web + Actuator + MCP Streamable HTTP `/mcp`） | 可启动，端口 8091；已实现 `asset_get` 只读查询工具（演示/不可用两种数据源模式） |
@@ -779,6 +782,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0017-B | 资产诊断结果边界收口与 HTTP 接口：端口返回 `null` 按 `PORT_CONTRACT_VIOLATION` 处理、结果不变量收紧（非空白标识与答案、编号必须已去重）、`POST /api/v1/ai/asset-diagnosis`（Controller + 按 outcome 决定字段集合的 DTO + 状态码语义） | ✅ 已完成 |
 | FD-0018-A | 事件研判核心编排（真实 Agent Graph）：应用层契约（`IncidentTriageUseCase`/`IncidentTriageCommand`/`IncidentTriageResult`/`KnowledgeEvidence`/`KnowledgeFailure`）+ 真实 `StateGraph`/`CompiledGraph`（三类证据各调用一次、条件边三分支、执行路径由节点真实追加）+ DeepSeek 生成与 `K…`/`A1`/`M1` 引用校验（**本阶段不含 HTTP**） | ✅ 已完成 |
 | FD-0018-A-R1 | 事件研判边界收口：①输入失败只认两个输入节点记录在调用上下文里的失败（模型阶段抛出的 `AiRequestException` 一律保持 `MODEL_CALL_FAILED`）；②失败日志记录真实执行进度（`modelCalled` 在调用模型之前置位、来源状态/路由/证据数量取自已发生的执行、引用校验失败不伪造引用数量）；③拒绝嵌套方括号引用；④知识分支区分「已声明业务失败」与「未声明运行期异常/null（端口违约）」 | ✅ 已完成 |
+| FD-0018-A-R2 | 来源查询进度的日志语义：每个来源在**真正调用之前**记录「已开始查询」，日志据此区分「尚未调用 = `NOT_QUERIED`」「已调用并取得结论 = 结果自身的 `FOUND`/`NOT_FOUND`/`FAILED`」「已调用但返回 `null` 或违反异常契约 = `PORT_CONTRACT_VIOLATION`」；不修改 `QueryOutcome`/`KnowledgeEvidence`/公开错误码，也不伪造失败结果 | ✅ 已完成 |
 | FD-0018-B | 事件研判 HTTP 接口（Controller + DTO + 状态码语义） | 未开始 |
 | 后续 | 问答流式输出与会话记忆（当前为一次性完整响应、无历史轮次） | 未开始 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm`（混合检索） | 未开始 |
@@ -811,6 +815,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | 资产诊断 Agent 证据（FD-0017-A） | ✅ 已执行 | **确定性编排（真实 ChatClient + 本地合成 OpenAI 端点）**：一次诊断**只发出一个模型请求**，且请求里只有 `system` 与 `user` 两条消息、**没有** `tools`/`tool_choice`，system 只含规则（不含 assetId/字段/数值/失败详情），user 里是确定性 JSON（字段顺序 `assetId`、`allowedEvidenceIds`、`availability`、`evidence`，边界标记各恰好出现一次），evidence 只含命中侧的白名单字段（A1 四条、M1 八条），请求里不含端点/端口/密钥/`Authorization`/异常/`jsonrpc`/会话头/`ToolCallback`；**查询契约**：两个端口各调用一次、顺序固定为资产 → 监控（替身记录调用顺序）、**第一次查询失败后第二次仍然执行**、非法输入（`null` 命令、空、空白、`AST-1`、小写、前后空格、超长、下划线）一律 `AiRequestException` 且**端口与模型零调用**；**三条路径**：两侧命中 → 模型一次 + `[A1][M1]` 必引、仅资产命中（另一侧 `NOT_FOUND`/`UNAVAILABLE`/`DISABLED`/`TIMEOUT`）→ 只允许并要求 `[A1]`、仅监控命中 → 只允许并要求 `[M1]`、两侧都 `NOT_FOUND` → **不调用模型** + 固定回答「未查询到该资产或可用的监控快照。」、无命中且至少一侧失败 → **不调用模型** + 固定降级回答「当前无法获得足够的资产与监控证据，暂时不能生成诊断结论。」，且响应完整保留两侧原始 `QueryOutcome` 与 `QueryFailure`（失败绝不被改写成未找到）；**引用校验**：空答案/无引用/`[a1]`/`[A01]`/`[A 1]`/`[A1 ]`/`[A1x]`/`[A2]`/`[A]`/`[A-1]`/`[A1,M1]`/未闭合/全角数字一律失败，引用本次不存在的证据失败，本次命中证据未被全部引用失败，重复引用按首次出现顺序去重，失败统一 `AiProviderException` 且携带 `requestId`、**不修正/不补引用/不重试**（模型调用次数仍为 1）；**结果对象**：10 条直连单元测试覆盖三态、防御性复制、只允许 A1/M1、证据与命中状态绑定的自相矛盾组合、`grounded` 与引用集合必须完全一致；**日志**：结构化断言行模板（两条固定文案）与全部参数位，assetId/资产详情/监控文本/模型回答/提示词/异常消息与端点均无位置可放，且用哨兵先证明它们进入过结果再证明没有进入日志；**装配**：`flowdesk.ai.enabled=false`（默认）时诊断用例与实现类均不存在、两个 FD-0016 端口仍在，`true` 时正确装配 |
 | 事件研判 Graph 证据（FD-0018-A） | ✅ 已执行 | **真实 `CompiledGraph`（`spring-ai-alibaba-graph-core`）+ 真实 `ChatClient` + 本地合成 OpenAI 端点**：17 条图测试直接驱动编译后的图 —— 完整路径逐节点断言为 `validate_asset → retrieve_knowledge → query_asset → query_monitoring → verify_contracts → evidence_gate → generate_answer → validate_citations → finish`、无证据路径以 `fallback_answer → finish` 收尾、部分命中路径照常生成、三个证据来源**各调用一次**（替身计数）、非法 `assetId` 与非法检索输入（`INVALID_RETRIEVAL_QUERY`）一律 400 且**下游端口与模型零调用**、知识失败码逐个映射（`KNOWLEDGE_EMBEDDING_DISABLED`→`DISABLED`、`EMBEDDING_PROVIDER_ERROR`→`EMBEDDING_PROVIDER_UNAVAILABLE`、`RERANK_PROVIDER_ERROR`→`RERANK_PROVIDER_UNAVAILABLE`、其余含 `KNOWLEDGE_RETRIEVAL_FAILURE` 与未预期运行期异常→`RETRIEVAL_FAILURE`）、端口返回 `null` 或抛异常 → 路由 `contract_violation` 且**监控仍然被查询一次**、执行路径由节点真实追加、状态缺失/类型不符收敛为有界失败（cause 链里是 `IncidentTriageException`，**不出现** `NullPointerException`）、**12 个并发调用**（4 线程）互不串线（每次调用的 requestId、资产证据、答案都属于自己，三个来源与模型各 12 次）；**引用校验 9 条**（空答案/无引用/`[k1]`/`[K01]`/`[K 1]`/`[K1x]`/未闭合/未知编号/某一类证据未被引用 → 六类稳定失败，重复引用按首次出现顺序去重）；**提示词 8 条**（字段顺序 `question`/`availability`/`evidence`、白名单字段、边界标记各恰好一次且可被中和、失败只以稳定枚举出现、不含端点/密钥/异常/标识）；**日志 7 条**（两条固定模板 + 参数位逐个钉死，assetId/问题原文/知识正文/资产详情/监控数值/模型答案/提示词/异常消息与端点均无位置可放，并用哨兵先证明这些材料进入过结果）；**应用层结果 9 条**（三态互斥、防御性复制、引用必须是本次证据的子集、`grounded` 与引用集合完全一致、`FAILED` 不等同于 `NOT_FOUND`）；**真实模型请求 2 条**（真实 HTTP 报文：只有 system + user 两条消息、**没有** `tools`/`tool_choice`、system 只含规则不含 assetId/问题、user 里证据 JSON 字段集合逐项断言、请求里不含端点/端口/`Authorization`/假 Key/`documentId`/`chunkSha256`/异常/`jsonrpc`/会话头/`ToolCallback`）；**装配 3 条**：`flowdesk.ai.enabled=false`（默认）时事件研判用例与实现类都不存在、两个 FD-0016 端口仍在，`true` 时正确装配；**未验证项**：`LIVE_SMOKE=NOT_RUN`（未对真实 DeepSeek 发起请求）、`MCP_LIVE`/`POSTGRES_LIVE`/`DASHSCOPE_LIVE=NOT_RUN` |
 | 事件研判边界收口证据（FD-0018-A-R1） | ✅ 已执行 | **先复现、再验收**（把 FD-0018-A 的四个主类临时回到基线后，新增/收紧的测试**恰好 12 条失败**，逐条对应四项缺陷）：**① 异常分类的来源边界** —— 基线实测「模型抛 `AiRequestException("review-provider-message-sentinel")`」时 triage **原样抛出该异常并带出文案**（日志还记成 `failure=INVALID_INPUT`），修复后模型**直接抛** `AiRequestException` 与**抛 `RuntimeException(cause=AiRequestException)`** 两种形态都是 `AiProviderException`（`requestId` 非空、文案固定「上游 AI 服务调用失败」、**不是** `AiRequestException`、不外泄哨兵），服务端分类仍为 `MODEL_CALL_FAILED`（在 cause 链上断言），模型只调用一次；真正的非法输入仍原样上抛 400 且断言文案透传（`assetId` 固定文案、检索 `问题不能为空`）、端口与模型零调用；**② 失败路径的审计信息** —— 基线实测完整证据后的模型失败被记成 `NOT_QUERIED×3/none/false/0`，修复后逐参数位断言真实进度：模型失败（`FOUND×3` + `evidence_available` + `modelCalled=true` + 证据 3 + 引用 0）、模型空答案（`ANSWER_EMPTY` 且 `modelCalled=true`）、引用校验失败（`modelCalled=true`、证据 3、**引用 0**、不伪造通过校验的数量）、输入失败（`NOT_QUERIED×3` + `none` + `false` + 0）、资产端口违约（`FOUND`/`NOT_QUERIED`/`FOUND` + `contract_violation` + `false` + 证据 2 + `exception=none`）、未声明的检索异常（`NOT_QUERIED`/`FOUND`/`FOUND` + `contract_violation` + 证据 2）；**③ 嵌套方括号引用** —— 基线实测只有资产证据时 `[[A1]]` 被接受并返回 `[A1]`，修复后 `[[A1]]`/`[[M1]]`/`[[K1]]`/`[[K2]]`/`[ [M1] ]`/未闭合 `[[K1]` 以及「正常引用与嵌套引用混排（两种顺序）」一律 `INVALID_CITATION_FORMAT`，而 `[[API]]` 这类**不含引用意图**的嵌套写法仍按普通文本忽略、正常引用与首次出现顺序去重不变、括号外多余的 `]`（`[M1]]`）仍按普通文本；真实 Graph 上畸形答案最终 `AiProviderException`、模型只调用一次（不修正、不重试）；**④ 已声明失败 vs 端口违约** —— 基线实测检索抛 `IllegalStateException`（资产命中、模型返回 `answer [A1]`）时最终 `grounded=true`，修复后同一场景为「知识分支违约 + 资产与监控仍各查询一次 + 模型零调用 + 携带 `requestId` 的 `AiProviderException`」，检索返回 `null` 同语义，而四类**已声明**知识失败（关闭、Embedding 上游、Rerank 上游、内部失败）仍如实映射为知识 `FAILED` 并允许基于其余来源生成（`grounded=true`，引用 `[A1][M1]`）；**跳过原因（更正）**：全仓 27 条跳过 = 26 条 Testcontainers pgvector 集成测试（无 Docker/PostgreSQL：15 条索引写入 + 11 条相似度检索）+ 1 条 `LocalFileSystemKnowledgeContentReaderTest` 符号链接用例（平台权限条件，与 PostgreSQL 无关）；**未验证项**：`LIVE_SMOKE`/`MCP_LIVE`/`POSTGRES_LIVE`/`DASHSCOPE_LIVE` 仍为 `NOT_RUN` |
+| 事件研判来源进度日志证据（FD-0018-A-R2） | ✅ 已执行 | **先复现、再验收**（把三个主类临时回到 FD-0018-A-R1 基线后，新增/改正的测试失败，逐条对应「null/未声明异常被记成未查询」）：**基线错误行为** —— 端口返回 `null` 或抛未声明异常时日志记 `knowledgeStatus/assetOutcome/monitoringOutcome=NOT_QUERIED`（查询明明已经执行），且原测试把这一行为**断言**了下来；**修复后**每个来源在真正调用之前置位「已开始查询」，日志按来源进度映射为四态：`NOT_QUERIED`（真未调用）/ 结果自身的 `FOUND`/`NOT_FOUND`/`FAILED` / `PORT_CONTRACT_VIOLATION`（已调用但返回 `null` 或抛未声明异常）/ `INVALID_INPUT`（已调用但输入在来源内部被拒）；**六个来源违约用例**（知识、资产、监控各自的 `null` 返回与未声明异常）逐参数位断言：违约来源记 `PORT_CONTRACT_VIOLATION`、另外两个来源记它们**真实的** `FOUND`、`graphRoute=contract_violation`、`modelCalled=false`、`evidenceCount=2`、`usedEvidenceCount=0`、`failure=PORT_CONTRACT_VIOLATION`、`exception=none`，并且用**替身调用计数**证明三个来源**各被调用一次**、模型零调用；**输入失败保留**「未调用」语义：非法 `assetId` → 三个来源都是 `NOT_QUERIED`（零调用），而 `INVALID_RETRIEVAL_QUERY` → 知识记 `INVALID_INPUT`（调用过一次、资产与监控零调用）；**真实 Graph 侧**新增「资产端口抛异常」与「监控返回 `null`」两个用例（后续查询仍执行、模型零调用）；**脱敏断言全部保留**（两条固定模板 + 参数位逐个钉死 + 哨兵排除）；**未验证项**：`LIVE_SMOKE`/`MCP_LIVE`/`POSTGRES_LIVE`/`DASHSCOPE_LIVE` 仍为 `NOT_RUN` |
 | PostgreSQL | ⚠️ **NOT_RUN** | 本机无 PostgreSQL 服务与 Docker，**PostgreSQL 尚未验证**；pgvector 集成测试（Testcontainers，镜像固定为带扩展版本的 `pgvector/pgvector:0.8.6-pg16`）在无 Docker 时跳过（当前跳过 26 条：15 条索引写入 + 11 条相似度检索），报告标注 POSTGRESQL_PGVECTOR_IT=NOT_RUN |
 | 真实 DashScope Embedding | ⚠️ **DASHSCOPE_LIVE=NOT_RUN** | 无 DASHSCOPE_API_KEY，**未对真实向量服务发起过任何请求**；全部自动化测试都不访问真实上游 |
 | 真实 DeepSeek | ⚠️ **LIVE_SMOKE=NOT_RUN** | 无 `DEEPSEEK_API_KEY`，**未对真实模型发起过任何请求** |
@@ -2758,7 +2763,9 @@ curl -X POST http://localhost:8080/api/v1/ai/asset-diagnosis \
 端点是 FD-0018-B 的范围。本阶段也**不**使用 `ReactAgent`、**不**注册工具、
 **不**引入会话记忆、流式输出、重试或缓存。
 FD-0018-A-R1 收口了四处边界：异常分类的来源边界（25.6）、失败路径的审计信息（25.7）、
-嵌套方括号引用（25.5）与知识分支「已声明失败 vs 端口违约」（25.3）。
+嵌套方括号引用（25.5）与知识分支「已声明失败 vs 端口违约」（25.3）；
+FD-0018-A-R2 又把 25.7 的来源状态改为按**查询进度**记录（调用前先置位，违约记
+`PORT_CONTRACT_VIOLATION`，只有真未调用才是 `NOT_QUERIED`）。
 
 ### 25.1 图拓扑
 
@@ -2870,17 +2877,31 @@ START → validate_asset → retrieve_knowledge → query_asset → query_monito
 原因是异常类型不能证明来源：供应商/SDK/适配层完全可能抛出 `AiRequestException`；
 按类型识别会把用户的合法请求判成 400，并**覆盖**外层已经确定的生成失败分类。
 
-### 25.7 失败路径的审计信息（FD-0018-A-R1）
+### 25.7 失败路径的审计信息（FD-0018-A-R1）与来源查询进度（R2）
 
 图内抛异常时框架**不交出最终状态**，因此失败日志只能从调用上下文里读**已经发生**的执行进度：
 
 | 字段 | 写入时机 | 失败时的语义 |
 | --- | --- | --- |
-| 三个来源状态 | 各证据节点执行时 | 查过的如实记录；没执行到的才写 `NOT_QUERIED` |
+| 三个来源状态 | 各证据节点执行时（**调用之前**先记「已开始查询」） | 查过的如实记录；只有**真的没调用**才是 `NOT_QUERIED` |
 | `graphRoute` | `verify_contracts` 算出路由时（同时写状态与上下文） | 真实路由；没走到这一步才是 `none` |
 | `modelCalled` | **发起模型调用之前**置位 | 模型失败、空答案、引用校验失败都必须是 `true`；不按计划路由推测 |
 | `evidenceCount` | 由已知来源实时算出 | 本次**真实存在**的可用证据数量 |
 | `usedEvidenceCount` | 引用校验通过后写入 | 校验失败时必然是 0 —— **不伪造**一个「已通过校验」的数量 |
+
+**来源状态由「查询进度」决定，而不是由「结果是不是 `null`」决定（R2）**：
+`结果 == null → NOT_QUERIED` 会在端口**返回 `null`** 或**抛出未声明异常**时说谎（查询明明已经执行）。
+现在每个来源在真正调用之前先置位，日志按四态映射：
+
+| 查询进度 | 日志取值 | 含义 |
+| --- | --- | --- |
+| 尚未调用 | `NOT_QUERIED` | 这个来源**从来没有被调用**（例如输入校验在前面就失败了） |
+| 已调用并取得结论 | 结果自身的 `FOUND` / `NOT_FOUND` / `FAILED` | 合法结论照原样保留 |
+| 已调用但返回 `null` 或违反异常契约 | `PORT_CONTRACT_VIOLATION` | 查询执行了，但没有合法结论 |
+| 已调用但输入在来源内部被拒 | `INVALID_INPUT` | 例如 `INVALID_RETRIEVAL_QUERY`：检索被调用过，输入被它拒绝 |
+
+这四种进度是**内部审计状态**：不修改 `QueryOutcome`、`KnowledgeEvidence` 或任何公开业务错误码，
+也**不伪造失败结果**（违约来源在结果对象里仍然没有结果，只是日志不再谎称它「没查过」）。
 
 日志模板、参数位与脱敏要求完全不变：仍然不记录 `assetId`、问题原文、知识正文、资产详情、
 监控数值、模型答案、提示词、异常消息、端点、密钥、SQL 与堆栈。
@@ -2917,4 +2938,7 @@ START → validate_asset → retrieve_knowledge → query_asset → query_monito
 9. **「已声明失败」的判定依赖检索用例的契约**：本阶段以 `KnowledgeApplicationException` 作为唯一
    「已声明」信号，未声明的异常一律按端口违约处理；该用例若新增异常类型，必须同步更新这条边界；
 10. **括号之外多余的 `]` 仍按普通文本处理**：只有方括号组**内部**参与解释，
-    `[K1]]` 的第二个右括号不构成嵌套（嵌套是「组内有方括号」，不是「括号数不配平」）。
+    `[K1]]` 的第二个右括号不构成嵌套（嵌套是「组内有方括号」，不是「括号数不配平」）；
+11. **来源查询进度只是内部审计状态**：日志里的 `PORT_CONTRACT_VIOLATION`/`INVALID_INPUT` 是
+    该来源在本次调用里的进度，不是公开业务错误码，也不写进任何结果对象
+    （`QueryOutcome` 与 `KnowledgeEvidence` 的取值集合完全不变）。

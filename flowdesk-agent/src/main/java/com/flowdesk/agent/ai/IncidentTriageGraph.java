@@ -77,6 +77,9 @@ import org.springframework.ai.chat.client.ChatClient;
  *       路由与执行路径；合并策略集中声明；</li>
  *   <li>{@code executionPath} 用 APPEND 策略，由每个节点在<b>自己执行时</b>追加节点名 ——
  *       路径来自真实执行，不是结束后拼出来的；</li>
+ *   <li>每个来源在<b>真正被调用之前</b>先把「该来源已开始查询」写进调用上下文（R2）：
+ *       因此端口返回 {@code null} 或抛未声明异常时，日志记的是
+ *       {@code PORT_CONTRACT_VIOLATION}（调用了、但没有合法结论），而不是「未查询」；</li>
  *   <li>图在装配期<b>编译一次</b>并复用；每次调用都用全新的调用上下文与独立的 {@code RunnableConfig}
  *       （{@code threadId} 即本次 requestId），因此并发调用之间不共享任何状态；</li>
  *   <li><b>不</b>启用 checkpoint 持久化（显式传入空的 {@link SaverConfig}）、
@@ -210,13 +213,15 @@ final class IncidentTriageGraph {
         IncidentTriageCommand command = call.getCommand();
         Map<String, Object> update = update(IncidentTriageNodes.RETRIEVE_KNOWLEDGE);
 
+        // 先记「这个来源已经开始查询」：之后无论是 null、未声明异常还是输入被拒，都不会再被记成「未查询」
+        call.markQueryStarted(IncidentTriageCall.Source.KNOWLEDGE);
         try {
             // 输入的合法性（空问题、topK/minScore 范围）只由检索用例判定，这里不复制第二套规则
             KnowledgeRetrievalView view = this.retrieveKnowledgeUseCase.retrieve(
                     new RetrieveKnowledgeQuery(command.question(), command.topK(), command.minScore()));
             if (view == null) {
-                // 契约里没有 null：这是端口违约，不是「没查到」
-                call.markContractViolation();
+                // 契约里没有 null：查询已经执行，但没有合法结论
+                call.markQueryContractViolation(IncidentTriageCall.Source.KNOWLEDGE);
                 return update;
             }
             call.setKnowledge(view.citations().isEmpty()
@@ -226,7 +231,7 @@ final class IncidentTriageGraph {
         catch (KnowledgeApplicationException ex) {
             if (ex.errorCode() == KnowledgeApplicationErrorCode.INVALID_RETRIEVAL_QUERY) {
                 // 输入不合法 → 400；此时资产、监控与模型都还没有被调用
-                throw call.rejectInput(ex.getMessage());
+                throw call.rejectQueryInput(IncidentTriageCall.Source.KNOWLEDGE, ex.getMessage());
             }
             // 已声明的知识业务失败：收敛为该分支的稳定分类，资产与监控照常查询
             call.setKnowledge(KnowledgeEvidence.failed(knowledgeFailure(ex.errorCode())));
@@ -234,7 +239,7 @@ final class IncidentTriageGraph {
         catch (RuntimeException ex) {
             // 未声明的运行期异常说明端口违反了契约（它只允许返回视图或抛 KnowledgeApplicationException）：
             // 按端口违约处理，绝不伪装成「知识检索失败」后继续用其它来源作答
-            call.markContractViolation();
+            call.markQueryContractViolation(IncidentTriageCall.Source.KNOWLEDGE);
         }
         return update;
     }
@@ -242,17 +247,18 @@ final class IncidentTriageGraph {
     private Map<String, Object> queryAsset(OverAllState state) {
         IncidentTriageCall call = requireCall(state);
         Map<String, Object> update = update(IncidentTriageNodes.QUERY_ASSET);
+        call.markQueryStarted(IncidentTriageCall.Source.ASSET);
         try {
             AssetQueryResult result = this.assetQueryPort.findAsset(call.getCommand().assetId());
             if (result == null) {
-                call.markContractViolation();
+                call.markQueryContractViolation(IncidentTriageCall.Source.ASSET);
                 return update;
             }
             call.setAsset(result);
         }
         catch (RuntimeException ex) {
             // 端口违反契约（本应只返回三态结果）：记录违约，但监控查询仍然要执行
-            call.markContractViolation();
+            call.markQueryContractViolation(IncidentTriageCall.Source.ASSET);
         }
         return update;
     }
@@ -260,17 +266,18 @@ final class IncidentTriageGraph {
     private Map<String, Object> queryMonitoring(OverAllState state) {
         IncidentTriageCall call = requireCall(state);
         Map<String, Object> update = update(IncidentTriageNodes.QUERY_MONITORING);
+        call.markQueryStarted(IncidentTriageCall.Source.MONITORING);
         try {
             MonitoringSnapshotQueryResult result = this.monitoringSnapshotQueryPort
                     .findLatestSnapshot(call.getCommand().assetId());
             if (result == null) {
-                call.markContractViolation();
+                call.markQueryContractViolation(IncidentTriageCall.Source.MONITORING);
                 return update;
             }
             call.setMonitoring(result);
         }
         catch (RuntimeException ex) {
-            call.markContractViolation();
+            call.markQueryContractViolation(IncidentTriageCall.Source.MONITORING);
         }
         return update;
     }

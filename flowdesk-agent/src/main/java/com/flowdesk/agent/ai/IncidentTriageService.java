@@ -55,6 +55,10 @@ import org.springframework.ai.chat.client.ChatClient;
  * 这些元数据一律来自本次调用上下文里<b>已经发生</b>的执行进度：失败发生在图内部时框架不会交出
  * 最终状态，若按「计划形状」硬编码（例如一律 {@code NOT_QUERIED}/{@code none}/{@code false}/0），
  * 失败日志就会与真实执行不符（FD-0018-A-R1 修正的就是这一点）。</p>
+ * <p>三个来源状态由该来源的<b>查询进度</b>决定（FD-0018-A-R2）：{@code NOT_QUERIED} 只表示
+ * 「这个来源从来没有被调用」；调用过但返回 {@code null} 或抛未声明异常记
+ * {@code PORT_CONTRACT_VIOLATION}；调用过并取得结论时记结果自身的
+ * {@code FOUND}/{@code NOT_FOUND}/{@code FAILED}。</p>
  * <p><b>不</b>记录 assetId、问题原文、知识正文、资产详情、监控数值、模型回答、提示词、
  * 异常消息、端点、密钥、SQL 或堆栈。</p>
  */
@@ -150,8 +154,8 @@ public class IncidentTriageService implements IncidentTriageUseCase {
         log.info("{} completed operation={} requestId={} knowledgeStatus={} assetOutcome={} monitoringOutcome={} "
                         + "graphRoute={} modelCalled={} evidenceCount={} usedEvidenceCount={} success=true "
                         + "durationMs={}",
-                OPERATION, OPERATION, requestId, knowledge.status().name(), asset.outcome().name(),
-                monitoring.outcome().name(), route, call.isModelCallStarted(), result.evidenceCount(),
+                OPERATION, OPERATION, requestId, knowledgeStatusOf(call), assetOutcomeOf(call),
+                monitoringOutcomeOf(call), route, call.isModelCallStarted(), result.evidenceCount(),
                 result.usedEvidenceCount(), elapsedMillis(startedAt));
 
         return result;
@@ -207,16 +211,55 @@ public class IncidentTriageService implements IncidentTriageUseCase {
         return List.copyOf((List<String>) list);
     }
 
-    private static String statusOf(KnowledgeEvidence knowledge) {
-        return knowledge == null ? NOT_QUERIED : knowledge.status().name();
+    /**
+     * 日志里单个来源的状态：由该来源的<b>查询进度</b>决定，而不是由「结果是不是 {@code null}」决定（R2）。
+     *
+     * <table border="1">
+     *   <caption>进度到日志取值的映射</caption>
+     *   <tr><th>查询进度</th><th>日志取值</th><th>含义</th></tr>
+     *   <tr><td>{@code NOT_QUERIED}</td><td>{@link #NOT_QUERIED}</td><td>这个来源<b>从来没有被调用</b></td></tr>
+     *   <tr><td>{@code QUERIED}</td><td>结果自身的 {@code FOUND}/{@code NOT_FOUND}/{@code FAILED}</td>
+     *       <td>已调用并取得合法结论</td></tr>
+     *   <tr><td>{@code CONTRACT_VIOLATION}</td>
+     *       <td>{@link IncidentTriageFailure#PORT_CONTRACT_VIOLATION}</td>
+     *       <td>已调用，但返回 {@code null} 或抛出未声明的异常</td></tr>
+     *   <tr><td>{@code INPUT_REJECTED}</td><td>{@link IncidentTriageFailure#INVALID_INPUT}</td>
+     *       <td>已调用，但输入在它内部被拒绝</td></tr>
+     * </table>
+     *
+     * @param call         本次调用上下文
+     * @param source       来源
+     * @param reportedState 该来源结果自身的状态名（没有结果时为 {@code null}）
+     * @return 日志取值
+     */
+    private static String sourceStateOf(IncidentTriageCall call, IncidentTriageCall.Source source,
+            String reportedState) {
+
+        return switch (call.progressOf(source)) {
+            case NOT_QUERIED -> NOT_QUERIED;
+            case CONTRACT_VIOLATION -> IncidentTriageFailure.PORT_CONTRACT_VIOLATION.name();
+            case INPUT_REJECTED -> IncidentTriageFailure.INVALID_INPUT.name();
+            // 已调用就必须有结论：没有结论只可能是契约问题，绝不谎报「未查询」
+            case QUERIED -> reportedState == null ? IncidentTriageFailure.PORT_CONTRACT_VIOLATION.name()
+                    : reportedState;
+        };
     }
 
-    private static String outcomeOf(AssetQueryResult asset) {
-        return asset == null ? NOT_QUERIED : asset.outcome().name();
+    private static String knowledgeStatusOf(IncidentTriageCall call) {
+        KnowledgeEvidence knowledge = call.getKnowledge();
+        return sourceStateOf(call, IncidentTriageCall.Source.KNOWLEDGE,
+                knowledge == null ? null : knowledge.status().name());
     }
 
-    private static String outcomeOf(MonitoringSnapshotQueryResult monitoring) {
-        return monitoring == null ? NOT_QUERIED : monitoring.outcome().name();
+    private static String assetOutcomeOf(IncidentTriageCall call) {
+        AssetQueryResult asset = call.getAsset();
+        return sourceStateOf(call, IncidentTriageCall.Source.ASSET, asset == null ? null : asset.outcome().name());
+    }
+
+    private static String monitoringOutcomeOf(IncidentTriageCall call) {
+        MonitoringSnapshotQueryResult monitoring = call.getMonitoring();
+        return sourceStateOf(call, IncidentTriageCall.Source.MONITORING,
+                monitoring == null ? null : monitoring.outcome().name());
     }
 
     /**
@@ -276,6 +319,10 @@ public class IncidentTriageService implements IncidentTriageUseCase {
      * 置位」的标记（不是按计划路由推测），{@code usedEvidenceCount} 来自真正通过校验的引用
      * （校验失败时它必然为空，不伪造一个通过校验的数量）。</p>
      *
+     * <p>三个来源状态走 {@link #sourceStateOf}：<b>调用过但没有合法结论</b>（返回 {@code null}
+     * 或抛未声明异常）记 {@link IncidentTriageFailure#PORT_CONTRACT_VIOLATION}，
+     * 只有<b>真的没调用</b>才是 {@link #NOT_QUERIED}（R2）。</p>
+     *
      * @param requestId 请求标识
      * @param call      本次调用上下文（真实执行进度）
      * @param failure   稳定失败类别
@@ -288,8 +335,8 @@ public class IncidentTriageService implements IncidentTriageUseCase {
         log.warn("{} failed operation={} requestId={} knowledgeStatus={} assetOutcome={} monitoringOutcome={} "
                         + "graphRoute={} modelCalled={} evidenceCount={} usedEvidenceCount={} failure={} exception={} "
                         + "success=false durationMs={}",
-                OPERATION, OPERATION, requestId, statusOf(call.getKnowledge()), outcomeOf(call.getAsset()),
-                outcomeOf(call.getMonitoring()), routeOf(call), call.isModelCallStarted(),
+                OPERATION, OPERATION, requestId, knowledgeStatusOf(call), assetOutcomeOf(call),
+                monitoringOutcomeOf(call), routeOf(call), call.isModelCallStarted(),
                 availableEvidenceCount(call), call.getUsedEvidenceIds().size(), failure.name(),
                 exceptionName(cause), elapsedMillis(startedAt));
     }

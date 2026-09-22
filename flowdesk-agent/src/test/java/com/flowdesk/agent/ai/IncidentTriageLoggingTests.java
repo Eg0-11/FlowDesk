@@ -70,6 +70,11 @@ class IncidentTriageLoggingTests {
 
     private static final String ROUTE_UNKNOWN = IncidentTriageService.ROUTE_UNKNOWN;
 
+    private static final String PORT_CONTRACT_VIOLATION =
+            IncidentTriageFailure.PORT_CONTRACT_VIOLATION.name();
+
+    private static final String INVALID_INPUT = IncidentTriageFailure.INVALID_INPUT.name();
+
     private static final String QUESTION_SENTINEL = "SENTINELQUESTION";
 
     private static final String CONTENT_SENTINEL = "SENTINELCHUNKBODY";
@@ -244,15 +249,11 @@ class IncidentTriageLoggingTests {
         assertThatThrownBy(fixture::triage).isInstanceOf(AiProviderException.class);
 
         Object[] arguments = failureArguments();
-        assertThat(arguments[3]).as("知识已经查过").isEqualTo("FOUND");
-        assertThat(arguments[4]).as("资产违约，因此没有状态").isEqualTo(NOT_QUERIED);
-        assertThat(arguments[5]).as("监控仍然被查询过").isEqualTo("FOUND");
-        assertThat(arguments[6]).isEqualTo("contract_violation");
-        assertThat(arguments[7]).isEqualTo(false);
-        assertThat(arguments[8]).as("知识 1 + 监控 1").isEqualTo(2);
-        assertThat(arguments[9]).isEqualTo(0);
-        assertThat(arguments[10]).isEqualTo(IncidentTriageFailure.PORT_CONTRACT_VIOLATION.name());
-        assertThat(arguments[11]).as("违约没有底层异常").isEqualTo("none");
+        assertContractViolationLine(arguments, "FOUND", PORT_CONTRACT_VIOLATION, "FOUND");
+        assertThat(fixture.retrievalCalls()).isEqualTo(1);
+        assertThat(fixture.assetCalls()).isEqualTo(1);
+        assertThat(fixture.monitoringCalls()).isEqualTo(1);
+        assertThat(fixture.modelCalls()).isZero();
         assertNoSensitiveMaterial();
     }
 
@@ -264,13 +265,108 @@ class IncidentTriageLoggingTests {
         assertThatThrownBy(fixture::triage).isInstanceOf(AiProviderException.class);
 
         Object[] arguments = failureArguments();
-        assertThat(arguments[3]).as("知识分支没有失败状态，而是违约").isEqualTo(NOT_QUERIED);
-        assertThat(arguments[4]).as("资产仍然被查询过").isEqualTo("FOUND");
-        assertThat(arguments[5]).as("监控仍然被查询过").isEqualTo("FOUND");
-        assertThat(arguments[6]).isEqualTo("contract_violation");
+        assertContractViolationLine(arguments, PORT_CONTRACT_VIOLATION, "FOUND", "FOUND");
+        assertThat(fixture.retrievalCalls()).isEqualTo(1);
+        assertThat(fixture.assetCalls()).isEqualTo(1);
+        assertThat(fixture.monitoringCalls()).isEqualTo(1);
+        assertThat(fixture.modelCalls()).isZero();
+        assertNoSensitiveMaterial();
+    }
+
+    @Test
+    void aNullKnowledgeResultIsLoggedAsAPortContractViolation() {
+        Fixture fixture = new Fixture("绝不该被调用。");
+        fixture.retrieval.returnsNull();
+
+        assertThatThrownBy(fixture::triage).isInstanceOf(AiProviderException.class);
+
+        assertContractViolationLine(failureArguments(), PORT_CONTRACT_VIOLATION, "FOUND", "FOUND");
+        assertEverySourceQueriedExactlyOnce(fixture);
+        assertNoSensitiveMaterial();
+    }
+
+    @Test
+    void anUndeclaredKnowledgeExceptionIsLoggedAsAPortContractViolation() {
+        Fixture fixture = new Fixture("绝不该被调用。");
+        fixture.retrieval.throwsUnexpectedly(new IllegalStateException(UPSTREAM_SENTINEL));
+
+        assertThatThrownBy(fixture::triage).isInstanceOf(AiProviderException.class);
+
+        assertContractViolationLine(failureArguments(), PORT_CONTRACT_VIOLATION, "FOUND", "FOUND");
+        assertEverySourceQueriedExactlyOnce(fixture);
+        assertNoSensitiveMaterial();
+    }
+
+    @Test
+    void aNullAssetResultIsLoggedAsAPortContractViolation() {
+        Fixture fixture = new Fixture("绝不该被调用。");
+        fixture.assetPort.returnsNull();
+
+        assertThatThrownBy(fixture::triage).isInstanceOf(AiProviderException.class);
+
+        assertContractViolationLine(failureArguments(), "FOUND", PORT_CONTRACT_VIOLATION, "FOUND");
+        assertEverySourceQueriedExactlyOnce(fixture);
+        assertNoSensitiveMaterial();
+    }
+
+    @Test
+    void anUndeclaredAssetExceptionIsLoggedAsAPortContractViolation() {
+        Fixture fixture = new Fixture("绝不该被调用。");
+        fixture.assetPort.throwsUnexpectedly(new IllegalStateException(UPSTREAM_SENTINEL));
+
+        assertThatThrownBy(fixture::triage).isInstanceOf(AiProviderException.class);
+
+        assertContractViolationLine(failureArguments(), "FOUND", PORT_CONTRACT_VIOLATION, "FOUND");
+        assertEverySourceQueriedExactlyOnce(fixture);
+        assertNoSensitiveMaterial();
+    }
+
+    @Test
+    void aNullMonitoringResultIsLoggedAsAPortContractViolation() {
+        Fixture fixture = new Fixture("绝不该被调用。");
+        fixture.monitoringPort.returnsNull();
+
+        assertThatThrownBy(fixture::triage).isInstanceOf(AiProviderException.class);
+
+        assertContractViolationLine(failureArguments(), "FOUND", "FOUND", PORT_CONTRACT_VIOLATION);
+        assertEverySourceQueriedExactlyOnce(fixture);
+        assertNoSensitiveMaterial();
+    }
+
+    @Test
+    void anUndeclaredMonitoringExceptionIsLoggedAsAPortContractViolation() {
+        Fixture fixture = new Fixture("绝不该被调用。");
+        fixture.monitoringPort.throwsUnexpectedly(new IllegalStateException(UPSTREAM_SENTINEL));
+
+        assertThatThrownBy(fixture::triage).isInstanceOf(AiProviderException.class);
+
+        assertContractViolationLine(failureArguments(), "FOUND", "FOUND", PORT_CONTRACT_VIOLATION);
+        assertEverySourceQueriedExactlyOnce(fixture);
+        assertNoSensitiveMaterial();
+    }
+
+    @Test
+    void aRetrievalInputRejectionMarksThatSourceAsCalledNotAsUnqueried() {
+        Fixture fixture = new Fixture("绝不该被调用。");
+        fixture.retrieval.fails(new KnowledgeApplicationException(
+                KnowledgeApplicationErrorCode.INVALID_RETRIEVAL_QUERY, "问题不能为空"));
+
+        assertThatThrownBy(() -> fixture.service.triage(new IncidentTriageCommand("AST-900001", "  ", 0, -1.0)))
+                .isInstanceOf(AiRequestException.class);
+
+        Object[] arguments = failureArguments();
+        assertThat(arguments[3]).as("知识检索被调用过，输入在它内部被拒").isEqualTo(INVALID_INPUT);
+        assertThat(arguments[4]).as("资产确实没有被调用").isEqualTo(NOT_QUERIED);
+        assertThat(arguments[5]).as("监控确实没有被调用").isEqualTo(NOT_QUERIED);
+        assertThat(arguments[6]).isEqualTo(ROUTE_UNKNOWN);
         assertThat(arguments[7]).isEqualTo(false);
-        assertThat(arguments[8]).as("资产 1 + 监控 1").isEqualTo(2);
-        assertThat(arguments[10]).isEqualTo(IncidentTriageFailure.PORT_CONTRACT_VIOLATION.name());
+        assertThat(arguments[8]).isEqualTo(0);
+        assertThat(arguments[9]).isEqualTo(0);
+        assertThat(arguments[10]).isEqualTo(INVALID_INPUT);
+        assertThat(fixture.retrievalCalls()).isEqualTo(1);
+        assertThat(fixture.assetCalls()).isZero();
+        assertThat(fixture.monitoringCalls()).isZero();
+        assertThat(fixture.modelCalls()).isZero();
         assertNoSensitiveMaterial();
     }
 
@@ -338,6 +434,40 @@ class IncidentTriageLoggingTests {
         return event.getArgumentArray();
     }
 
+    /**
+     * 断言一条「端口违约」失败日志：三个来源状态由调用方给出，其余字段固定。
+     *
+     * @param arguments        参数位
+     * @param knowledgeState   知识来源的日志状态
+     * @param assetState       资产来源的日志状态
+     * @param monitoringState  监控来源的日志状态
+     */
+    private void assertContractViolationLine(Object[] arguments, String knowledgeState, String assetState,
+            String monitoringState) {
+
+        assertThat(arguments[3]).isEqualTo(knowledgeState);
+        assertThat(arguments[4]).isEqualTo(assetState);
+        assertThat(arguments[5]).isEqualTo(monitoringState);
+        assertThat(arguments[6]).as("真实路由").isEqualTo("contract_violation");
+        assertThat(arguments[7]).as("违约在调用模型前统一失败").isEqualTo(false);
+        assertThat(arguments[8]).as("另外两个来源各贡献一条证据").isEqualTo(2);
+        assertThat(arguments[9]).isEqualTo(0);
+        assertThat(arguments[10]).isEqualTo(PORT_CONTRACT_VIOLATION);
+        assertThat(arguments[11]).as("违约没有底层异常").isEqualTo("none");
+    }
+
+    /**
+     * 断言三个来源各被调用一次、模型零调用 —— 「已调用」必须与日志状态一致。
+     *
+     * @param fixture 夹具
+     */
+    private static void assertEverySourceQueriedExactlyOnce(Fixture fixture) {
+        assertThat(fixture.retrievalCalls()).isEqualTo(1);
+        assertThat(fixture.assetCalls()).isEqualTo(1);
+        assertThat(fixture.monitoringCalls()).isEqualTo(1);
+        assertThat(fixture.modelCalls()).isZero();
+    }
+
     private Object[] failureArguments() {
         ILoggingEvent event = onlyEvent();
         assertThat(event.getMessage()).isEqualTo(FAILED_TEMPLATE);
@@ -371,20 +501,40 @@ class IncidentTriageLoggingTests {
 
         private final FakeMonitoringPort monitoringPort = new FakeMonitoringPort();
 
+        private final FakeChatModel model;
+
         private final IncidentTriageService service;
 
         Fixture(String answer) {
+            this.model = new FakeChatModel(answer);
             this.service = new IncidentTriageService(this.retrieval, this.assetPort, this.monitoringPort,
-                    ChatClient.create(new FakeChatModel(answer)));
+                    ChatClient.create(this.model));
         }
 
         Fixture(RuntimeException failure) {
+            this.model = new FakeChatModel(failure);
             this.service = new IncidentTriageService(this.retrieval, this.assetPort, this.monitoringPort,
-                    ChatClient.create(new FakeChatModel(failure)));
+                    ChatClient.create(this.model));
         }
 
         IncidentTriageResult triage() {
             return this.service.triage(new IncidentTriageCommand("AST-900001", QUESTION_SENTINEL, 5, 0.3));
+        }
+
+        int retrievalCalls() {
+            return this.retrieval.calls();
+        }
+
+        int assetCalls() {
+            return this.assetPort.calls();
+        }
+
+        int monitoringCalls() {
+            return this.monitoringPort.calls();
+        }
+
+        int modelCalls() {
+            return this.model.calls();
         }
     }
 
@@ -399,19 +549,28 @@ class IncidentTriageLoggingTests {
 
         private RuntimeException unexpected;
 
+        private boolean nullView;
+
+        private int calls;
+
         @Override
         public KnowledgeRetrievalView retrieve(RetrieveKnowledgeQuery query) {
+            this.calls++;
             if (this.failure != null) {
                 throw this.failure;
             }
             if (this.unexpected != null) {
                 throw this.unexpected;
             }
-            return this.view;
+            return this.nullView ? null : this.view;
         }
 
         void returns(KnowledgeRetrievalView view) {
             this.view = view;
+        }
+
+        void returnsNull() {
+            this.nullView = true;
         }
 
         void fails(KnowledgeApplicationException failure) {
@@ -420,6 +579,10 @@ class IncidentTriageLoggingTests {
 
         void throwsUnexpectedly(RuntimeException unexpected) {
             this.unexpected = unexpected;
+        }
+
+        int calls() {
+            return this.calls;
         }
     }
 
@@ -430,8 +593,16 @@ class IncidentTriageLoggingTests {
 
         private boolean nullResult;
 
+        private RuntimeException unexpected;
+
+        private int calls;
+
         @Override
         public AssetQueryResult findAsset(String assetId) {
+            this.calls++;
+            if (this.unexpected != null) {
+                throw this.unexpected;
+            }
             return this.nullResult ? null : this.result;
         }
 
@@ -442,6 +613,14 @@ class IncidentTriageLoggingTests {
         void returnsNull() {
             this.nullResult = true;
         }
+
+        void throwsUnexpectedly(RuntimeException unexpected) {
+            this.unexpected = unexpected;
+        }
+
+        int calls() {
+            return this.calls;
+        }
     }
 
     private static final class FakeMonitoringPort implements MonitoringSnapshotQueryPort {
@@ -450,13 +629,35 @@ class IncidentTriageLoggingTests {
                 new MonitoringSnapshotView("AST-900001", Instant.parse("2026-01-01T00:00:00Z"), HealthState.DEGRADED,
                         92, 68, 1, SourceOrigin.DEMO));
 
+        private boolean nullResult;
+
+        private RuntimeException unexpected;
+
+        private int calls;
+
         @Override
         public MonitoringSnapshotQueryResult findLatestSnapshot(String assetId) {
-            return this.result;
+            this.calls++;
+            if (this.unexpected != null) {
+                throw this.unexpected;
+            }
+            return this.nullResult ? null : this.result;
         }
 
         void returns(MonitoringSnapshotQueryResult result) {
             this.result = result;
+        }
+
+        void returnsNull() {
+            this.nullResult = true;
+        }
+
+        void throwsUnexpectedly(RuntimeException unexpected) {
+            this.unexpected = unexpected;
+        }
+
+        int calls() {
+            return this.calls;
         }
     }
 
@@ -485,6 +686,10 @@ class IncidentTriageLoggingTests {
                 throw this.failure;
             }
             return new ChatResponse(List.of(new Generation(new AssistantMessage(this.answer))));
+        }
+
+        int calls() {
+            return this.prompts.size();
         }
     }
 }
