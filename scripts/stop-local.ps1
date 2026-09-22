@@ -13,7 +13,8 @@
     日志全部保留；不删除数据库、上传内容或任何用户文件。
 
 .PARAMETER GracefulWaitSec
-    单个进程等待正常关闭的秒数（默认 8 秒）；超时后再强制终止，并明确记录用了哪种方式。
+    单个进程等待正常关闭的秒数，允许 1..120（默认 8 秒）；
+    超时后再强制终止，并明确记录用了哪种方式。
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\stop-local.ps1
@@ -27,6 +28,15 @@ $ErrorActionPreference = 'Stop'
 
 $scriptsDir = Split-Path -Parent $PSCommandPath
 . (Join-Path $scriptsDir 'flowdesk-local-common.ps1')
+
+# ---------- 参数范围校验（不合法就什么都不做）----------
+$rangeError = Test-FlowDeskTimeRange -Name '-GracefulWaitSec' -Value $GracefulWaitSec -Min 1 -Max 120
+if ($rangeError) {
+    Write-FlowDeskTitle 'FlowDesk 本地停止（FD-0019-A）'
+    Write-FlowDeskFail "参数不合法：$rangeError"
+    Write-FlowDeskInfo '未做任何事（没有终止任何进程、没有改运行记录）。'
+    exit 7
+}
 
 Write-FlowDeskTitle 'FlowDesk 本地停止（FD-0019-A）'
 
@@ -57,22 +67,23 @@ Write-FlowDeskInfo "记录中的模式：$($state.mode)；服务数：$($records
 Write-FlowDeskStep '核对身份并停止'
 
 $stopped = @()
-$skipped = @()
-$failed = @()
+$gone = @()
+$unresolved = @()
 
 foreach ($record in $records) {
     $verdict = Test-FlowDeskRecordedProcess -Record $record
 
-    if (-not $verdict.Alive) {
+    if (-not $verdict.Exists) {
         Write-FlowDeskInfo "$($record.name)（PID=$($record.pid)）：$($verdict.Reason)，跳过。"
-        $skipped += "PID=$($record.pid)"
+        $gone += $record
         continue
     }
 
-    if (-not $verdict.Ok) {
+    if (-not $verdict.Killable) {
         Write-FlowDeskWarn "$($record.name)（PID=$($record.pid)）：$($verdict.Reason) —— 跳过，不终止。"
-        Write-FlowDeskWarn '  （记录里的目标 JAR：' + $record.jar + '）'
-        $skipped += "PID=$($record.pid)"
+        Write-FlowDeskWarn ('  （记录里的目标 JAR：' + $record.jar + '）')
+        Write-FlowDeskWarn '  该进程仍然存在，因此这条记录会被保留以便人工确认后重试。'
+        $unresolved += $record
         continue
     }
 
@@ -91,7 +102,7 @@ foreach ($record in $records) {
     }
     else {
         Write-FlowDeskFail "$($record.name)（PID=$($record.pid)）停止失败：$($result.Note)"
-        $failed += $record
+        $unresolved += $record
     }
 }
 
@@ -99,11 +110,14 @@ foreach ($record in $records) {
 Write-FlowDeskStep '确认端口释放'
 
 $stillBusy = @()
-foreach ($record in $records) {
+# 按**去重后的端口**核对一次即可：多条记录可能指向同一个端口（例如记录被人工改坏）
+$portsToCheck = @($records | ForEach-Object { [int]$_.port } | Where-Object { $_ -ge 1 -and $_ -le 65535 } |
+    Sort-Object -Unique)
+foreach ($port in $portsToCheck) {
     $released = $false
     $deadline = (Get-Date).AddSeconds(15)
     while ((Get-Date) -lt $deadline) {
-        if ((Get-FlowDeskPortListenerPid -Port $record.port).Count -eq 0) {
+        if ((Get-FlowDeskPortListenerPid -Port $port).Count -eq 0) {
             $released = $true
             break
         }
@@ -111,24 +125,37 @@ foreach ($record in $records) {
     }
 
     if ($released) {
-        Write-FlowDeskOk "端口 $($record.port) 已释放（$($record.name)）"
+        Write-FlowDeskOk "端口 $port 已释放"
     }
     else {
-        $occupant = Format-FlowDeskPortOccupant -Port $record.port
-        Write-FlowDeskWarn "端口 $($record.port) 仍被占用：$occupant"
-        $stillBusy += $record.port
+        $occupant = Format-FlowDeskPortOccupant -Port $port
+        Write-FlowDeskWarn "端口 $port 仍被占用：$occupant"
+        $stillBusy += $port
     }
 }
 
 # ---------- 收尾 ----------
 Write-FlowDeskStep '收尾'
 
-if ($failed.Count -eq 0) {
+if ($unresolved.Count -eq 0) {
     Remove-FlowDeskState
-    Write-FlowDeskOk "已删除运行记录（$global:FlowDeskStatePath）"
+    Write-FlowDeskOk "本次运行记录已全部处理完，记录文件已删除（$global:FlowDeskStatePath）"
 }
 else {
-    Write-FlowDeskWarn "有 $($failed.Count) 个进程未能停止，保留运行记录以便下次重试。"
+    # 有进程没能停止、或身份无法证明但进程仍在：保留这些记录以便重试（而不是悄悄丢掉线索）
+    $remaining = @($unresolved)
+    try {
+        Save-FlowDeskRunState -Mode "$($state.mode)" -McpClient ([bool]$state.mcpClient) `
+            -JavaExe "$($state.javaExe)" -Services $remaining
+        Write-FlowDeskWarn "有 $($remaining.Count) 个进程未被处理，运行记录已保留这 $($remaining.Count) 条以便重试。"
+    }
+    catch {
+        Write-FlowDeskFail "保留运行记录失败：$($_.Exception.Message)"
+        Write-FlowDeskWarn '未处理的进程：'
+        foreach ($record in $remaining) {
+            Write-FlowDeskWarn "  $($record.name) PID=$($record.pid) JAR=$($record.jar)"
+        }
+    }
 }
 
 Write-Host ''
@@ -136,9 +163,9 @@ Write-FlowDeskInfo "日志保留在：$global:FlowDeskLogDir（不会被删除�
 Write-FlowDeskInfo '没有删除数据库、上传内容或任何用户文件。'
 
 Write-Host ''
-Write-FlowDeskInfo ("停止 {0} 个，跳过 {1} 个，失败 {2} 个。" -f $stopped.Count, $skipped.Count, $failed.Count)
+Write-FlowDeskInfo ("停止 {0} 个，已自行退出 {1} 个，未处理 {2} 个。" -f $stopped.Count, $gone.Count, $unresolved.Count)
 
-if ($failed.Count -gt 0 -or $stillBusy.Count -gt 0) {
+if ($unresolved.Count -gt 0 -or $stillBusy.Count -gt 0) {
     exit 1
 }
 exit 0

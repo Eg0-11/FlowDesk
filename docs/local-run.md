@@ -133,15 +133,35 @@ powershell -ExecutionPolicy Bypass -File scripts\test-local.ps1
 powershell -ExecutionPolicy Bypass -File scripts\stop-local.ps1
 ```
 
-- 只操作**本脚本记录在案并且身份核实通过**的进程。身份核对同时校验
-  **PID + 进程名（java）+ 进程启动时间 + 命令行里的目标 JAR** ——
-  旧 PID 被系统复用给别的程序时不会被误杀。
+- 只操作**本脚本记录在案并且身份核实通过**的进程。身份核对依次校验：
+  记录本身是否自洽（必要字段齐全、服务名已知、**目标 JAR 属于该服务**、端口在 1..65535）、
+  PID 是否存在、进程名是否为 `java`、进程启动时间是否与记录一致（2 秒容差），
+  以及命令行里那个真正的 **`-jar` 参数的规范化完整路径**是否与记录**完全相同** ——
+  这里不做子串匹配，因此「别的参数里恰好含同一个路径」不会造成误判。
+- 目标 JAR 必须是**该服务模块自己 `target` 目录下**、且文件名匹配该模块打包产物模式的绝对路径：
+  空路径、通配符（`*`、`?`、`[]`）、裸文件名（如 `java.exe`）、仓库外路径、
+  另一个服务的 JAR、`.jar.original` 都会被拒绝。
 - 记录缺失 / 损坏 / 身份不符时**报告并跳过**，绝不扩大终止范围；
   脚本**不会**「按所有 `java.exe`」或「按端口占用者」杀进程。
+  这类记录只要进程还在就会被**保留**在运行记录里，方便人工确认后重试。
 - 先尝试**正常关闭**（`taskkill` 不带 `/F`）；控制台型 Java 进程通常拿不到正常关闭路径，
   此时才**强制终止**，并在输出里**明确记录**用了哪种方式。
-- 结束后确认三个端口已释放；**重复停止是安全的**（第二次会报告「没有记录在案的运行实例」）。
+- 结束后按**去重后的端口**确认已释放；**重复停止是安全的**
+  （第二次会报告「没有记录在案的运行实例」，或继续报告那条未处理的记录）。
 - **保留全部日志**，不删除数据库、上传内容或任何用户文件。
+
+### 自测（只读，不终止任何进程）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\self-test-local.ps1
+```
+
+对脚本库的判定函数做正反例测试：目标 JAR 路径校验（空/通配符/仓库外/跨服务）、
+`-jar` 参数提取（含「路径只作为别的参数的一部分出现」的反例）、记录形状校验、
+以及「身份无法证明时拒绝终止」。它**不会**启动服务、也**不会**终止任何进程 ——
+其中一条反例刻意用「PID 指向脚本自己的 PowerShell 进程」来验证「拒绝终止」，
+并在检查之后断言那个进程仍然活着。有 java 服务在运行时，它还会用真实进程做
+正反对照（同一个进程、启动时间错位 1 小时 → 必须因为**启动时间**而不是别的检查被拒绝）。
 
 ---
 
@@ -149,7 +169,7 @@ powershell -ExecutionPolicy Bypass -File scripts\stop-local.ps1
 
 ```powershell
 $env:DEEPSEEK_API_KEY = '<你的 Key>'
-powershell -ExecutionPolicy Bypass -File scripts\start-local.ps1 -JdkHome 'C:\...\jdk-17' -Mode deepseek
+powershell -ExecutionPolicy Bypass -File scripts\start-local.ps1 -JdkHome 'C:\...\jdk-17' -Mode deepseek -McpClient
 ```
 
 - Key **只从进程环境变量** `DEEPSEEK_API_KEY` 读取；脚本**不接受**命令行明文 Key 参数，
@@ -159,9 +179,41 @@ powershell -ExecutionPolicy Bypass -File scripts\start-local.ps1 -JdkHome 'C:\..
   （见 `flowdesk-bootstrap/src/main/resources/application-deepseek.yml`）。
 - **Embedding 仍然关闭**：知识检索分支不可用（接口会明确回答 `DISABLED`，而不是假装没有数据），
   因此事件研判只能使用资产与监控的演示证据。
+- **`-McpClient` 建议加上**：它把主服务的 MCP 客户端显式打开并指向本机 8091/8092，
+  这样资产与监控的演示证据才真的可用。
+  **不加 `-McpClient` 时主服务没有资产与监控证据** —— 诊断/研判里的两个查询会明确回答
+  `DISABLED`（不是「数据不存在」），研判通常只能走降级路径。脚本在两种情况下都会说明这一点。
+  未指定时脚本会**显式**传入 `--flowdesk.mcp.client.enabled=false`，
+  因此「关着」是这次启动确定的事实，而不是继承来的某个开关。
 - **本次启动本身不会调用任何付费模型**；是否产生费用取决于你之后如何去调用这些接口。
 - 冒烟脚本在 DeepSeek 模式下会跳过「AI 接口应为 404」这一项（它只适用于 Basic 模式），
   并且**不会**为了检查而调用 AI 接口生成答案。
+
+---
+
+## 6.1 环境注入的 `SERVER__*` 变量（实测记录）
+
+某些宿主环境（例如把终端会话托管起来的编辑器/IDE 宿主）会往每个子进程注入
+`SERVER__HOST` 与 `SERVER__PORT`。Spring Boot 对**环境变量**做宽松绑定，会把这些名字
+映射成 `server.host` / `server.port`，**优先级高于打包里的 `application.yml`** ——
+实测行为：清掉 `SERVER__PORT` 后监控服务回到配置的 8092，把它设成 8083 则真的监听 8083。
+
+对本脚本**没有影响**：三个服务的端口与绑定地址都是通过**命令行参数**传入的，
+而命令行参数的优先级高于环境变量。脚本检测到这两个变量时会打印一条提示，
+方便排障时对号入座。
+
+**但如果要手动跑 Maven 测试**（例如 `mvnw.cmd clean package`），这个注入会真的生效：
+`flowdesk-mcp-monitoring` 里那条「随包交付的启动契约」用例断言 `server.port == 8092`，
+被注入覆盖时会如实地失败 —— 那是**环境**在覆盖配置，不是代码或断言有问题。
+处理办法是在同一个 shell 里先移除宿主注入的变量，让测试看到**真正的交付配置**：
+
+```powershell
+Remove-Item Env:SERVER__PORT -ErrorAction SilentlyContinue
+Remove-Item Env:SERVER__HOST -ErrorAction SilentlyContinue
+mvnw.cmd clean package
+```
+
+不要用 `-DskipTests`、`-Dmaven.test.failure.ignore` 或改断言来绕过它。
 
 ---
 
@@ -184,20 +236,49 @@ powershell -ExecutionPolicy Bypass -File scripts\start-local.ps1 -JdkHome 'C:\..
 
 | 文件 | 作用 |
 | --- | --- |
-| `scripts/flowdesk-local-common.ps1` | 共享函数：路径解析、JDK 校验、端口检查、HTTP/JSON-RPC 调用、进程身份校验、状态文件读写 |
-| `scripts/start-local.ps1` | 启动三个服务（含可选 `-Build`） |
-| `scripts/stop-local.ps1` | 按记录与身份核对停止 |
-| `scripts/test-local.ps1` | 只检查现有实例（卫生检查 + 真实 MCP 协议 + 编码 + AI 端点装配） |
+| `scripts/flowdesk-local-common.ps1` | 共享函数：路径解析、JDK 校验、端口检查、HTTP/JSON-RPC 调用、记录形状与进程身份核验、失败清理、状态文件读写 |
+| `scripts/start-local.ps1` | 启动三个服务（含可选 `-Build`、`-McpClient`） |
+| `scripts/stop-local.ps1` | 按记录与身份核对停止；未处理的记录会保留 |
+| `scripts/test-local.ps1` | 只检查现有实例（健康 + 监听地址 + 真实 MCP 协议 + 编码 + AI 端点装配） |
+| `scripts/self-test-local.ps1` | 脚本库自测（只读反例测试，**不终止任何进程**） |
 
 | 退出码 | 含义 | 出现在 |
 | --- | --- | --- |
-| 0 | 成功（含「已在运行，未启动第二套」与「没有记录可停」） | start / stop / test |
-| 1 | 冒烟检查有 FAIL 项；或停止时有进程未能停止/端口未释放 | test / stop |
+| 0 | 成功（含「已在运行，未启动第二套」与「没有记录可处理」） | start / stop / test / self-test |
+| 1 | 冒烟检查有 FAIL 项；或停止/自测有未处理项 | test / stop / self-test |
 | 2 | 端口被占用（已提示占用者 PID，不杀未知进程） | start |
 | 3 | 缺少打包产物（已提示构建命令） | start |
 | 4 | JDK 目录无效或不是 JDK 17 | start |
 | 5 | `-Build` 构建失败（保留准确退出码与构建日志） | start |
-| 6 | 启动失败（已清理本次起来的所有进程）；或 DeepSeek 模式缺 Key（零服务启动） | start |
+| 6 | 启动失败（已清理本次创建的进程；清理未完成时保留可重试的运行记录） | start |
+| 7 | 时间参数超出允许范围（什么都没做） | start / stop / test |
+
+时间参数的允许范围（越界一律退出码 7，且不做任何事）：
+
+| 参数 | 脚本 | 范围 | 默认 |
+| --- | --- | --- | --- |
+| `-HealthTimeoutSec` | start | 1..600 | 90 |
+| `-GracefulWaitSec` | stop | 1..120 | 8 |
+| `-RequestTimeoutSec` | test | 1..600 | 20 |
+
+### 启动事务与可重试的运行记录
+
+`start-local.ps1` 的顺序是**先登记、再等健康**：每创建一个 JVM 就立刻把
+「PID + 进程启动时间 + 目标 JAR + 端口 + 日志路径」写进 `.local-run/state.json`，
+**不等健康检查通过**。因此下面这些情况都不会留下没人认领的进程：
+
+- 健康检查超时（即使那个 JVM 还活着、只是还没起来）；
+- 后续服务启动失败；
+- 写运行记录本身失败（内存里的清单仍然能驱动清理）。
+
+失败时脚本只终止**本次创建、且身份核实通过**的进程。如果有一个进程没能清理掉
+（身份无法证明，或终止失败），脚本会：**保留这些记录**以便用 `stop-local.ps1` 重试，
+并明确输出「清理**未完成**」—— **不会**在此时输出「全部清理」。
+只有真的全部清理成功，才会删除运行记录。
+
+`stop-local.ps1` 同理：身份无法证明但进程仍存在的记录会被**保留**，
+下次运行还会再次报告它，而不是悄悄丢掉线索。运行记录文件本身损坏（非法 JSON）时，
+脚本拒绝执行任何终止动作并给出人工处理指引。
 
 ### 编码约定（维护者）
 

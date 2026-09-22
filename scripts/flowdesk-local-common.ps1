@@ -498,56 +498,310 @@ function Start-FlowDeskServiceProcess {
 }
 
 <#
-    校验一个记录在案的进程是否还是「我们启动的那一个」：PID + 进程名 java + 启动时间 + 命令行里的目标 JAR。
+    按名字取服务契约（$global:FlowDeskServices 里的那一项）。
 
-    任一项不符就返回 Ok=$false 与原因：宁可不杀，也不误杀一个被系统复用了 PID 的无关进程。
+    @param Name 服务名（asset-mcp / monitoring-mcp / main-service）
+    @return 服务描述对象；名字未知时返回 $null
 #>
-function Test-FlowDeskRecordedProcess {
-    param([Parameter(Mandatory = $true)][psobject]$Record)
+function Get-FlowDeskServiceByName([string]$Name) {
+    if (-not $Name) { return $null }
+    foreach ($service in $global:FlowDeskServices) {
+        if ($service.Name -eq $Name) { return $service }
+    }
+    return $null
+}
 
-    $process = Get-Process -Id $Record.pid -ErrorAction SilentlyContinue
-    if (-not $process) {
-        return [pscustomobject]@{ Ok = $false; Alive = $false; Reason = '进程已不存在' }
+<#
+    校验一个「秒」级时间参数的合法范围。
+
+    时间参数必须有界：无限等待会让脚本在故障时永远不返回，而 0 或负数会让等待循环
+    立刻退出、把「还没起来」当成「起不来」。
+
+    @param Name  参数名（用于文案）
+    @param Value 取值
+    @param Min   允许的最小值（含）
+    @param Max   允许的最大值（含）
+    @return 合法时返回 $null，否则返回错误说明
+#>
+function Test-FlowDeskTimeRange([string]$Name, $Value, [int]$Min, [int]$Max) {
+    $parsed = 0
+    if (-not [int]::TryParse("$Value", [ref]$parsed)) {
+        return "$Name 必须是整数秒（当前值：$Value）"
+    }
+    if ($parsed -lt $Min -or $parsed -gt $Max) {
+        return "$Name 必须在 $Min 到 $Max 秒之间（当前值：$parsed）"
+    }
+    return $null
+}
+
+<#
+    校验「这条记录里的目标 JAR 路径是否真的属于这个服务」。
+
+    规则（任务单要求逐条覆盖）：不能为空、不能含通配符、必须是绝对路径、
+    规范化后必须落在**该服务模块自己的 target 目录**内、文件名必须匹配该模块的打包产物模式。
+    空路径、通配符（`*`、`?`、`[`、`]`）、仓库外路径、`java.exe` 这种裸文件名、
+    以及「资产服务的记录指向监控服务的 JAR」都会被拒绝。
+
+    刻意**不**要求文件当前存在：重新构建会让 target 下的旧 JAR 消失，
+    而那个进程可能仍在运行 —— 身份核验只判断「这条记录是否自洽且属于该服务」。
+
+    @param Service 服务描述对象
+    @param JarPath 记录里的 JAR 路径
+    @return [pscustomobject] @{ Ok; Reason }
+#>
+function Test-FlowDeskServiceJarPath([psobject]$Service, [string]$JarPath) {
+    if (-not $JarPath -or -not $JarPath.Trim()) {
+        return [pscustomobject]@{ Ok = $false; Reason = '目标 JAR 路径为空' }
+    }
+    if ($JarPath -match '[\*\?\[\]]') {
+        return [pscustomobject]@{ Ok = $false; Reason = "目标 JAR 路径含通配符：$JarPath" }
+    }
+    if (-not [System.IO.Path]::IsPathRooted($JarPath)) {
+        return [pscustomobject]@{ Ok = $false; Reason = "目标 JAR 不是绝对路径：$JarPath" }
     }
 
+    $normalized = $null
+    try { $normalized = [System.IO.Path]::GetFullPath($JarPath) }
+    catch { return [pscustomobject]@{ Ok = $false; Reason = "目标 JAR 路径无法规范化：$JarPath" } }
+
+    $expectedDir = [System.IO.Path]::GetFullPath((Join-Path $global:FlowDeskRepoRoot "$($Service.Module)\target"))
+    $actualDir = [System.IO.Path]::GetDirectoryName($normalized)
+    if (-not $actualDir -or $actualDir.TrimEnd('\') -ine $expectedDir.TrimEnd('\')) {
+        return [pscustomobject]@{ Ok = $false; Reason = "目标 JAR 不在该服务的 target 目录内（期望 $expectedDir）：$normalized" }
+    }
+
+    # 由打包产物模式推出文件名正则：flowdesk-x-*.jar -> ^flowdesk\-x\-[^\\/]*\.jar$
+    $fileName = [System.IO.Path]::GetFileName($normalized)
+    $pattern = '^' + [regex]::Escape($Service.JarPattern).Replace('\*', '[^\\/]*') + '$'
+    if ($fileName -notmatch $pattern) {
+        return [pscustomobject]@{ Ok = $false; Reason = "目标 JAR 文件名不匹配该服务的打包产物模式（$($Service.JarPattern)）：$fileName" }
+    }
+
+    return [pscustomobject]@{ Ok = $true; Reason = '目标 JAR 属于该服务' }
+}
+
+<#
+    从命令行里取出真正的 {@code -jar} 参数。
+
+    <p>刻意不做子串匹配：只有「以独立 token 出现的 {@code -jar}」后面跟的那个参数才算数。
+    这样「别的参数里恰好含有同一个路径」不会被误判成身份一致，而
+    {@code --foo=-jar ...} 这类写法也不会被当成 {@code -jar}。</p>
+
+    @param CommandLine 进程命令行
+    @return JAR 路径；命令行里没有 -jar 参数时返回 $null
+#>
+function Get-FlowDeskJarArgument([string]$CommandLine) {
+    if (-not $CommandLine) { return $null }
+    if ($CommandLine -match '(?:^|\s)-jar\s+(?:"(?<p>[^"]+)"|(?<p>[^"\s]+))') {
+        return $Matches['p']
+    }
+    return $null
+}
+
+<#
+    校验一条运行记录的**形状**（不涉及进程本身）：必要字段齐全且合法、
+    服务名是本脚本已知的服务、目标 JAR 属于该服务。
+
+    单独抽出来有两个用途：一是被身份核验复用，二是让只做只读检查的场景
+    （例如冒烟脚本）能在不碰任何进程的前提下判断「这条记录是否可信」。
+
+    @param Record 运行记录
+    @return [pscustomobject] @{ Ok; Reason; Service; Pid; StartTime }
+#>
+function Test-FlowDeskRecordShape {
+    param([Parameter(Mandatory = $true)]$Record)
+
+    if (-not $Record) {
+        return [pscustomobject]@{ Ok = $false; Reason = '运行记录为空'; Service = $null; Pid = 0; StartTime = $null }
+    }
+
+    $missing = @()
+    foreach ($field in @('name', 'pid', 'processStartTime', 'jar', 'port')) {
+        $value = $Record.$field
+        if ($null -eq $value -or "$value".Trim() -eq '') { $missing += $field }
+    }
+    if ($missing.Count -gt 0) {
+        return [pscustomobject]@{
+            Ok = $false; Reason = "运行记录缺少必要字段：" + ($missing -join ', ')
+            Service = $null; Pid = 0; StartTime = $null
+        }
+    }
+
+    $processId = 0
+    if (-not [int]::TryParse("$($Record.pid)", [ref]$processId) -or $processId -le 0) {
+        return [pscustomobject]@{
+            Ok = $false; Reason = "运行记录里的 PID 不合法：$($Record.pid)"
+            Service = $null; Pid = 0; StartTime = $null
+        }
+    }
+
+    $port = 0
+    if (-not [int]::TryParse("$($Record.port)", [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
+        return [pscustomobject]@{
+            Ok = $false; Reason = "运行记录里的端口不合法：$($Record.port)"
+            Service = $null; Pid = 0; StartTime = $null
+        }
+    }
+
+    $recordedStart = $null
+    try {
+        $recordedStart = [datetime]::Parse("$($Record.processStartTime)",
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::RoundtripKind)
+    }
+    catch { $recordedStart = $null }
+    if (-not $recordedStart) {
+        return [pscustomobject]@{
+            Ok = $false; Reason = "运行记录里的启动时间无法解析：$($Record.processStartTime)"
+            Service = $null; Pid = 0; StartTime = $null
+        }
+    }
+
+    $service = Get-FlowDeskServiceByName "$($Record.name)"
+    if (-not $service) {
+        return [pscustomobject]@{
+            Ok = $false; Reason = "运行记录里的服务名不是本脚本已知的服务：$($Record.name)"
+            Service = $null; Pid = 0; StartTime = $null
+        }
+    }
+
+    $jarVerdict = Test-FlowDeskServiceJarPath -Service $service -JarPath "$($Record.jar)"
+    if (-not $jarVerdict.Ok) {
+        return [pscustomobject]@{ Ok = $false; Reason = $jarVerdict.Reason; Service = $service; Pid = 0; StartTime = $null }
+    }
+
+    return [pscustomobject]@{ Ok = $true; Reason = '记录形状合法'; Service = $service; Pid = $processId; StartTime = $recordedStart }
+}
+
+<#
+    校验一条运行记录现在还是不是「我们启动的那一个进程」。
+
+    核验顺序（任何一步失败都返回 Killable=$false，且**禁止终止**）：
+      1. 记录的形状合法（必要字段、服务名、目标 JAR 属于该服务，见 Test-FlowDeskRecordShape）；
+      2. PID 存在、进程名是 java、启动时间与记录一致（2 秒容差）；
+      3. 命令行里真的有一个 {@code -jar} 参数，且它的**规范化完整路径**与记录的目标 JAR 完全相同
+         （不是子串包含）。
+
+    @param Record 运行记录
+    @return [pscustomobject] @{ Killable; Exists; Reason }
+#>
+function Test-FlowDeskRecordedProcess {
+    param([Parameter(Mandatory = $true)]$Record)
+
+    # ---- 1. 记录形状 ----
+    $shape = Test-FlowDeskRecordShape -Record $Record
+    if (-not $shape.Ok) {
+        return [pscustomobject]@{ Killable = $false; Exists = $false; Reason = $shape.Reason }
+    }
+    $service = $shape.Service
+    $processId = $shape.Pid
+    $recordedStart = $shape.StartTime
+
+    # ---- 2. 进程本身 ----
+    $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+    if (-not $process) {
+        return [pscustomobject]@{ Killable = $false; Exists = $false; Reason = '进程已不存在' }
+    }
     if ($process.ProcessName -ne 'java') {
-        return [pscustomobject]@{ Ok = $false; Alive = $true; Reason = "PID 现在的进程名是 $($process.ProcessName)，不是 java" }
+        return [pscustomobject]@{ Killable = $false; Exists = $true; Reason = "PID 现在的进程名是 $($process.ProcessName)，不是 java" }
     }
 
     $startTime = $null
     try { $startTime = $process.StartTime } catch { $startTime = $null }
     if (-not $startTime) {
-        return [pscustomobject]@{ Ok = $false; Alive = $true; Reason = '读不到进程启动时间，无法核对身份' }
+        return [pscustomobject]@{ Killable = $false; Exists = $true; Reason = '读不到进程启动时间，无法核对身份' }
     }
-
-    $recordedStart = $null
-    try { $recordedStart = [datetime]::Parse($Record.processStartTime, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind) }
-    catch { $recordedStart = $null }
-    if (-not $recordedStart) {
-        return [pscustomobject]@{ Ok = $false; Alive = $true; Reason = "记录里的启动时间无法解析：$($Record.processStartTime)" }
-    }
-
     $delta = [math]::Abs(($startTime.ToUniversalTime() - $recordedStart.ToUniversalTime()).TotalSeconds)
     if ($delta -gt 2) {
-        return [pscustomobject]@{ Ok = $false; Alive = $true; Reason = "启动时间不符（差 $([math]::Round($delta,1)) 秒），PID 可能已被系统复用" }
+        return [pscustomobject]@{ Killable = $false; Exists = $true; Reason = "启动时间不符（差 $([math]::Round($delta,1)) 秒），PID 可能已被系统复用" }
     }
 
+    # ---- 3. 命令行里的 -jar 参数（完整路径，不做子串匹配）----
     $commandLine = $null
     try {
-        $cim = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$($Record.pid)" -ErrorAction Stop
+        $cim = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$processId" -ErrorAction Stop
         if ($cim) { $commandLine = $cim.CommandLine }
     }
     catch { $commandLine = $null }
-
     if (-not $commandLine) {
-        return [pscustomobject]@{ Ok = $false; Alive = $true; Reason = '读不到进程命令行，无法确认目标 JAR' }
-    }
-    if ($commandLine -notlike "*$($Record.jar)*") {
-        return [pscustomobject]@{ Ok = $false; Alive = $true; Reason = '进程命令行里没有记录的目标 JAR，身份不符' }
+        return [pscustomobject]@{ Killable = $false; Exists = $true; Reason = '读不到进程命令行，无法确认目标 JAR' }
     }
 
-    return [pscustomobject]@{ Ok = $true; Alive = $true; Reason = '身份已核实' }
+    $jarArgument = Get-FlowDeskJarArgument -CommandLine $commandLine
+    if (-not $jarArgument) {
+        return [pscustomobject]@{ Killable = $false; Exists = $true; Reason = '进程命令行里没有 -jar 参数，无法确认目标 JAR' }
+    }
+
+    $argumentNormalized = $null
+    try { $argumentNormalized = [System.IO.Path]::GetFullPath($jarArgument) }
+    catch { return [pscustomobject]@{ Killable = $false; Exists = $true; Reason = "命令行里的 -jar 路径无法规范化：$jarArgument" } }
+
+    $argumentVerdict = Test-FlowDeskServiceJarPath -Service $service -JarPath $argumentNormalized
+    if (-not $argumentVerdict.Ok) {
+        return [pscustomobject]@{ Killable = $false; Exists = $true; Reason = "命令行里的 -jar 不属于该服务：$($argumentVerdict.Reason)" }
+    }
+
+    $recordedNormalized = [System.IO.Path]::GetFullPath("$($Record.jar)")
+    if ($argumentNormalized -ine $recordedNormalized) {
+        return [pscustomobject]@{
+            Killable = $false
+            Exists   = $true
+            Reason   = "命令行里的 -jar 与记录的目标 JAR 不一致（实际 $argumentNormalized，记录 $recordedNormalized）"
+        }
+    }
+
+    return [pscustomobject]@{ Killable = $true; Exists = $true; Reason = '身份已核实（PID + 进程名 + 启动时间 + -jar 完整路径）' }
 }
+
+<#
+    清理一批「本次启动、已经登记身份」的进程。
+
+    只终止身份核实通过的进程；身份无法证明、或终止失败的记录会原样回传，
+    由调用方决定是否保留运行记录以便重试。**不会**报告「全部清理」除非真的全部清理掉了。
+
+    @param Records         运行记录数组
+    @param GracefulWaitSec 单个进程等待正常关闭的秒数
+    @return [pscustomobject] @{ AllCleared; Cleared; AlreadyGone; Unresolved }
+#>
+function Clear-FlowDeskStartedProcesses {
+    param(
+        [psobject[]]$Records,
+        [int]$GracefulWaitSec = 8
+    )
+
+    $cleared = @()
+    $alreadyGone = @()
+    $unresolved = @()
+
+    foreach ($record in @($Records)) {
+        $verdict = Test-FlowDeskRecordedProcess -Record $record
+
+        if (-not $verdict.Killable -and -not $verdict.Exists) {
+            $alreadyGone += [pscustomobject]@{ Record = $record; Reason = $verdict.Reason }
+            continue
+        }
+        if (-not $verdict.Killable) {
+            $unresolved += [pscustomobject]@{ Record = $record; Reason = $verdict.Reason }
+            continue
+        }
+
+        $result = Stop-FlowDeskVerifiedProcess -Record $record -GracefulWaitSec $GracefulWaitSec
+        if ($result.Stopped) {
+            $cleared += [pscustomobject]@{ Record = $record; Method = $result.Method }
+        }
+        else {
+            $unresolved += [pscustomobject]@{ Record = $record; Reason = $result.Note }
+        }
+    }
+
+    return [pscustomobject]@{
+        AllCleared  = ($unresolved.Count -eq 0)
+        Cleared     = $cleared
+        AlreadyGone = $alreadyGone
+        Unresolved  = $unresolved
+    }
+}
+
 
 <#
     停止一个已核实身份的进程：先尝试正常关闭，超时后再强制终止，并如实报告用了哪种方式。
@@ -637,7 +891,36 @@ function Initialize-FlowDeskLogDir {
 }
 
 <#
-    只返回仍然存活（或身份不符但进程仍在）的记录，用于「重复启动」检测。
+    落盘运行记录。start-local 每创建一个 JVM 就立刻调用一次：这样任何后续失败
+    （健康超时、后续服务启动异常、甚至写记录本身失败）都能按记录找到本次已创建的进程。
+
+    @param Mode      运行模式
+    @param McpClient 是否显式开启了主服务 MCP 客户端
+    @param JavaExe   本脚本使用的 java.exe 绝对路径
+    @param Services  已登记的服务记录数组
+#>
+function Save-FlowDeskRunState {
+    param(
+        [string]$Mode,
+        [bool]$McpClient,
+        [string]$JavaExe,
+        $Services
+    )
+
+    $state = [pscustomobject]@{
+        version   = 1
+        mode      = $Mode
+        startedAt = (Get-Date).ToUniversalTime().ToString('o')
+        repoRoot  = $global:FlowDeskRepoRoot
+        javaExe   = $JavaExe
+        mcpClient = $McpClient
+        services  = @($Services)
+    }
+    Write-FlowDeskState -State $state
+}
+
+<#
+    只返回仍然存活（或记录不自洽但进程仍在）的记录，用于「重复启动」检测。
 #>
 function Get-FlowDeskLiveRecords($State) {
     $live = @()
@@ -645,7 +928,7 @@ function Get-FlowDeskLiveRecords($State) {
 
     foreach ($record in @($State.services)) {
         $verdict = Test-FlowDeskRecordedProcess -Record $record
-        if ($verdict.Ok -or $verdict.Alive) {
+        if ($verdict.Exists) {
             $live += [pscustomobject]@{ Record = $record; Verdict = $verdict }
         }
     }

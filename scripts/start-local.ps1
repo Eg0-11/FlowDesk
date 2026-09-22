@@ -52,9 +52,33 @@ $ErrorActionPreference = 'Stop'
 $scriptsDir = Split-Path -Parent $PSCommandPath
 . (Join-Path $scriptsDir 'flowdesk-local-common.ps1')
 
+# ---------- 参数范围校验（不合法就什么都不做）----------
+# 时间参数必须有界：0/负数会让等待立刻放弃，过大的值会让脚本在故障时长时间不返回。
+$rangeError = Test-FlowDeskTimeRange -Name '-HealthTimeoutSec' -Value $HealthTimeoutSec -Min 1 -Max 600
+if ($rangeError) {
+    Write-FlowDeskTitle 'FlowDesk 本地启动（FD-0019-A）'
+    Write-FlowDeskFail "参数不合法：$rangeError"
+    Write-FlowDeskInfo '未做任何事（没有启动服务、没有写运行记录、没有改环境）。'
+    exit 7
+}
+
 Write-FlowDeskTitle 'FlowDesk 本地启动（FD-0019-A）'
 Write-FlowDeskInfo "仓库根目录：$global:FlowDeskRepoRoot"
 Write-FlowDeskInfo "启动模式  ：$Mode"
+Write-FlowDeskInfo "健康检查超时：$HealthTimeoutSec 秒（允许 1..600）"
+
+# 宿主注入的 SERVER__* 变量会被 Spring 的宽松绑定映射成 server.*（例如 SERVER__PORT -> server.port），
+# 从而覆盖打包里的 application.yml。本脚本对端口/绑定地址传的是**命令行参数**，优先级更高，
+# 所以不受影响；这里只如实提示，方便排障时对上号。
+$hostInjected = @()
+foreach ($candidate in @('SERVER__PORT', 'SERVER__HOST')) {
+    $value = [System.Environment]::GetEnvironmentVariable($candidate)
+    if ($value) { $hostInjected += $candidate }
+}
+if ($hostInjected.Count -gt 0) {
+    Write-FlowDeskWarn "当前进程环境里有宿主注入的 $($hostInjected -join '、')；它们会被 Spring 映射成 server.* 并覆盖 application.yml。"
+    Write-FlowDeskInfo '  本脚本用命令行参数显式指定端口与绑定地址（优先级更高），因此不受影响。'
+}
 
 # ---------- 0. 环境规整（只作用于本脚本进程）----------
 # PowerShell 5.1 的 Start-Process 遇到「仅大小写不同」的重复环境变量会直接失败（见共享函数注释）。
@@ -230,7 +254,12 @@ if ($McpClient) {
     Write-FlowDeskInfo '主服务 MCP 客户端：显式开启，指向本机 8091/8092'
 }
 else {
-    Write-FlowDeskInfo '主服务 MCP 客户端：关闭（未指定 -McpClient）'
+    # 未指定也要**显式**传 false：这样「关着」是本次启动确定的事实，
+    # 而不是继承环境里的某个开关（默认值或外部注入都可能改变它）。
+    $mainServiceArgs += @('--flowdesk.mcp.client.enabled=false')
+    Write-FlowDeskInfo '主服务 MCP 客户端：显式关闭（--flowdesk.mcp.client.enabled=false）'
+    Write-FlowDeskInfo '  因此主服务拿不到资产与监控证据：诊断/研判里的两个查询会明确回答 DISABLED，'
+    Write-FlowDeskInfo '  而不会伪装成「数据不存在」。需要证据就用 -McpClient 重新启动。'
 }
 
 Initialize-FlowDeskLogDir
@@ -239,7 +268,33 @@ $client = New-FlowDeskHttpClient
 $records = @()
 
 <#
-    启动一个服务并等它健康；失败返回 $null（调用方负责清理本次已经起来的进程）。
+    组装一条运行记录（身份 = PID + 进程启动时间 + 目标 JAR + 端口）。
+#>
+function New-FlowDeskServiceRecord([psobject]$Service, $Process, [string]$JarPath, [string]$OutLog,
+        [string]$ErrLog) {
+
+    return [pscustomobject]@{
+        name             = $Service.Name
+        displayName      = $Service.DisplayName
+        pid              = $Process.Id
+        processStartTime = $Process.StartTime.ToUniversalTime().ToString('o')
+        jar              = $JarPath
+        port             = $Service.Port
+        address          = '127.0.0.1'
+        url              = "http://127.0.0.1:$($Service.Port)"
+        stdoutLog        = $OutLog
+        stderrLog        = $ErrLog
+    }
+}
+
+<#
+    启动一个服务：**创建 JVM 成功后立刻登记身份并落盘**，然后才做健康检查。
+
+    顺序刻意如此 —— 健康检查可能超时、后续服务可能起不来、写记录本身也可能失败，
+    而这些情况下当前这个 JVM 都已经真实存在了。只有「先登记、再等健康」才能保证
+    失败清理找得到它，而不是留下一个没人认领的进程。
+
+    失败返回 $null（调用方负责清理本次已创建的全部进程）。
 #>
 function Start-FlowDeskOne {
     param(
@@ -257,59 +312,82 @@ function Start-FlowDeskOne {
     $process = Start-FlowDeskServiceProcess -JavaExe $javaExe -JarPath $jarPaths[$Service.Name] `
         -Arguments $Arguments -StdOutLog $stdOutLog -StdErrLog $stdErrLog
 
+    # ---- 立即登记（不等健康检查）----
+    # 先放进本次清单，再落盘：即使落盘自己失败，内存清单也能让失败清理找到这个进程。
+    $record = New-FlowDeskServiceRecord -Service $Service -Process $process `
+        -JarPath $jarPaths[$Service.Name] -OutLog $stdOutLog -ErrLog $stdErrLog
+    $script:records += $record
+    Save-FlowDeskRunState -Mode $Mode -McpClient ([bool]$McpClient) -JavaExe $javaExe -Services $script:records
+    Write-FlowDeskInfo "  已登记身份并写入运行记录：PID=$($process.Id)（不等健康检查通过）"
+
     $health = Wait-FlowDeskHealth -Client $client -BaseUrl "http://127.0.0.1:$($Service.Port)" `
         -TimeoutSec $HealthTimeoutSec
 
     if (-not $health.Ok) {
         Write-FlowDeskFail "$($Service.DisplayName) 未在 $HealthTimeoutSec 秒内健康（最后状态：$($health.Note)）"
         Write-FlowDeskInfo "请查看日志：$stdOutLog"
-        if (-not (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) {
-            Write-FlowDeskInfo '该进程已经退出（启动失败），日志里有具体原因。'
+        if (Get-Process -Id $process.Id -ErrorAction SilentlyContinue) {
+            Write-FlowDeskInfo "  该进程**仍在运行**（PID=$($process.Id)）：它已登记，会在失败清理里被终止。"
+        }
+        else {
+            Write-FlowDeskInfo '  该进程已经退出（启动失败），日志里有具体原因。'
         }
         return $null
     }
 
     Write-FlowDeskOk "$($Service.DisplayName) 健康（$($health.Note)）PID=$($process.Id)"
-    return [pscustomobject]@{
-        name             = $Service.Name
-        displayName      = $Service.DisplayName
-        pid              = $process.Id
-        processStartTime = $process.StartTime.ToUniversalTime().ToString('o')
-        jar              = $jarPaths[$Service.Name]
-        port             = $Service.Port
-        address          = '127.0.0.1'
-        url              = "http://127.0.0.1:$($Service.Port)"
-        stdoutLog        = $stdOutLog
-        stderrLog        = $stdErrLog
-    }
+    return $record
 }
 
 <#
-    本次启动中途失败时的清理：只停止本次已经起来的进程（身份由 PID + 启动时间 + JAR 核对）。
+    启动失败后的收尾：清理本次已创建的全部进程，并按结果决定是否保留运行记录。
+
+    只有**全部**清理成功才删除运行记录；只要有一个进程没能清理掉（身份无法证明或终止失败），
+    就保留它以便重试，并且**不会**输出「全部清理」。
 #>
-function Clear-FlowDeskStarted {
-    param([psobject[]]$Started)
+function Complete-FlowDeskStartupFailure([string]$Reason) {
+    $started = @($script:records)
 
-    if (-not $Started -or @($Started).Count -eq 0) {
-        Write-FlowDeskInfo '本次没有需要清理的进程。'
-        return
+    if ($started.Count -eq 0) {
+        Write-FlowDeskInfo '本次没有创建任何进程，无需清理。'
+        Remove-FlowDeskState
+        return $true
     }
 
-    Write-FlowDeskWarn "清理本次已启动的 $(@($Started).Count) 个进程…"
-    foreach ($record in @($Started)) {
-        $verdict = Test-FlowDeskRecordedProcess -Record $record
-        if (-not $verdict.Ok) {
-            Write-FlowDeskWarn "  $($record.name)（PID=$($record.pid)）跳过：$($verdict.Reason)"
-            continue
-        }
-        $result = Stop-FlowDeskVerifiedProcess -Record $record
-        if ($result.Stopped) {
-            Write-FlowDeskOk "  $($record.name)（PID=$($record.pid)）已停止[$($result.Method)]"
-        }
-        else {
-            Write-FlowDeskFail "  $($record.name)（PID=$($record.pid)）未能停止：$($result.Note)"
+    Write-FlowDeskWarn "清理本次已创建的 $($started.Count) 个进程（原因：$Reason）…"
+    $result = Clear-FlowDeskStartedProcesses -Records $started
+
+    foreach ($item in $result.Cleared) {
+        Write-FlowDeskOk "  $($item.Record.name)（PID=$($item.Record.pid)）已停止[$($item.Method)]"
+    }
+    foreach ($item in $result.AlreadyGone) {
+        Write-FlowDeskInfo "  $($item.Record.name)（PID=$($item.Record.pid)）已自行退出，无需清理"
+    }
+    foreach ($item in $result.Unresolved) {
+        Write-FlowDeskFail "  $($item.Record.name)（PID=$($item.Record.pid)）未能清理：$($item.Reason)"
+    }
+
+    if ($result.AllCleared) {
+        Remove-FlowDeskState
+        Write-FlowDeskOk "本次启动的 $($started.Count) 个进程已全部清理，运行记录已删除。"
+        return $true
+    }
+
+    $remaining = @($result.Unresolved | ForEach-Object { $_.Record })
+    try {
+        Save-FlowDeskRunState -Mode $Mode -McpClient ([bool]$McpClient) -JavaExe $javaExe -Services $remaining
+        Write-FlowDeskInfo "  运行记录已保留 $($remaining.Count) 条未清理的记录，可直接重试。"
+    }
+    catch {
+        Write-FlowDeskFail "  保留运行记录也失败了：$($_.Exception.Message)"
+        Write-FlowDeskInfo "  未清理的进程（请人工确认）："
+        foreach ($record in $remaining) {
+            Write-FlowDeskInfo "    $($record.name) PID=$($record.pid) JAR=$($record.jar)"
         }
     }
+    Write-FlowDeskFail "清理**未完成**：$($result.Unresolved.Count) 个进程仍然存在（未输出「全部清理」）。"
+    Write-FlowDeskInfo "  重试：powershell -ExecutionPolicy Bypass -File `"$($global:FlowDeskScriptsDir)\stop-local.ps1`""
+    return $false
 }
 
 # 先起两个 MCP 服务（各带显式的 demo 数据源与回环绑定）
@@ -318,36 +396,36 @@ $mcpArguments = @{
     'asset-mcp'      = @('--server.port=8091', '--server.address=127.0.0.1', '--flowdesk.asset.directory.mode=demo')
     'monitoring-mcp' = @('--server.port=8092', '--server.address=127.0.0.1', '--flowdesk.monitoring.source.mode=demo')
 }
-
-foreach ($service in $mcpServices) {
-    $record = Start-FlowDeskOne -Service $service -Arguments $mcpArguments[$service.Name]
-    if (-not $record) {
-        Clear-FlowDeskStarted -Started $records
-        exit 6
-    }
-    $records += $record
-}
-
 # 两个 MCP 服务都健康之后才启动主服务
 $mainService = $global:FlowDeskServices | Where-Object { $_.Name -eq 'main-service' }
-$mainRecord = Start-FlowDeskOne -Service $mainService -Arguments $mainServiceArgs
-if (-not $mainRecord) {
-    Clear-FlowDeskStarted -Started $records
+
+# 整个启动序列包在 try/catch 里：任何未预料的异常（含写运行记录失败）都要走同一条清理路径
+$startupFailure = $null
+try {
+    foreach ($service in $mcpServices) {
+        if (-not (Start-FlowDeskOne -Service $service -Arguments $mcpArguments[$service.Name])) {
+            $startupFailure = "$($service.DisplayName) 启动失败或健康检查超时"
+            break
+        }
+    }
+    if (-not $startupFailure) {
+        if (-not (Start-FlowDeskOne -Service $mainService -Arguments $mainServiceArgs)) {
+            $startupFailure = 'FlowDesk 主服务启动失败或健康检查超时'
+        }
+    }
+}
+catch {
+    $startupFailure = "启动过程中出现异常：$($_.Exception.Message)"
+}
+
+if ($startupFailure) {
+    Write-Host ''
+    Write-FlowDeskFail "启动失败：$startupFailure"
+    $null = Complete-FlowDeskStartupFailure -Reason $startupFailure
     exit 6
 }
-$records += $mainRecord
 
-# ---------- 记录运行信息 ----------
-$state = [pscustomobject]@{
-    version   = 1
-    mode      = $Mode
-    startedAt = (Get-Date).ToUniversalTime().ToString('o')
-    repoRoot  = $global:FlowDeskRepoRoot
-    javaExe   = $javaExe
-    mcpClient = [bool]$McpClient
-    services  = $records
-}
-Write-FlowDeskState -State $state
+Write-FlowDeskOk "三个服务已启动并写入运行记录（$($script:records.Count) 条）。"
 
 # ---------- 汇总 ----------
 Write-FlowDeskTitle '启动完成'
@@ -382,6 +460,14 @@ if ($Mode -eq 'deepseek') {
     Write-FlowDeskInfo '本次启动**没有**调用任何付费模型：是否产生费用取决于你之后如何去调用它。'
     Write-FlowDeskWarn 'Embedding 仍关闭：知识检索分支不可用（明确回答 DISABLED，而不是假装没有数据），'
     Write-FlowDeskWarn '因此事件研判只能使用资产与监控的演示证据。'
+    if ($McpClient) {
+        Write-FlowDeskInfo 'MCP 客户端已开启：资产与监控证据可用（指向本机 8091/8092 的演示数据源）。'
+    }
+    else {
+        Write-FlowDeskWarn 'MCP 客户端未开启（未指定 -McpClient）：主服务**没有资产与监控证据** ——'
+        Write-FlowDeskWarn '  诊断/研判里的两个查询会明确回答 DISABLED（不是「数据不存在」），'
+        Write-FlowDeskWarn '  研判通常只能走降级路径。要演示真实证据链路，请加 -McpClient 重新启动。'
+    }
     Write-FlowDeskInfo '演示数据是虚构的（source=DEMO），不是真实企业数据源。'
 }
 else {

@@ -42,6 +42,15 @@ $ErrorActionPreference = 'Stop'
 $scriptsDir = Split-Path -Parent $PSCommandPath
 . (Join-Path $scriptsDir 'flowdesk-local-common.ps1')
 
+# ---------- 参数范围校验 ----------
+$rangeError = Test-FlowDeskTimeRange -Name '-RequestTimeoutSec' -Value $RequestTimeoutSec -Min 1 -Max 600
+if ($rangeError) {
+    Write-FlowDeskTitle 'FlowDesk 本地冒烟检查（FD-0019-A）'
+    Write-FlowDeskFail "参数不合法：$rangeError"
+    Write-FlowDeskInfo '未做任何检查（没有发出任何请求）。'
+    exit 7
+}
+
 Write-FlowDeskTitle 'FlowDesk 本地冒烟检查（FD-0019-A）'
 
 # =====================================================================================
@@ -123,13 +132,21 @@ $urls = @{
 $ports = @{ 'main-service' = 8080; 'asset-mcp' = 8091; 'monitoring-mcp' = 8092 }
 
 if ($state -and $state.services) {
+    Write-FlowDeskInfo "使用运行记录里的地址与端口：$global:FlowDeskStatePath"
+
     foreach ($record in @($state.services)) {
+        # 先看这条记录本身是否可信：字段齐全、服务名已知、目标 JAR 属于该服务、端口合法。
+        # 不可信的记录不会被拿来构造请求地址（否则会拿着一个编出来的端口去"检查"）。
+        $shape = Test-FlowDeskRecordShape -Record $record
+        if (-not $shape.Ok) {
+            Add-FlowDeskResult "运行记录可信（$($record.name)）" 'FAIL' $shape.Reason
+            continue
+        }
         if ($urls.ContainsKey($record.name)) {
             $urls[$record.name] = $record.url
             $ports[$record.name] = [int]$record.port
         }
     }
-    Write-FlowDeskInfo "使用运行记录里的地址与端口：$global:FlowDeskStatePath"
 }
 else {
     Write-FlowDeskWarn "没有找到运行记录（$global:FlowDeskStatePath），按默认端口 8080/8091/8092 检查。"
