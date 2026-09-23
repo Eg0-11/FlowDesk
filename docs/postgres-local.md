@@ -160,10 +160,16 @@ $id = ([string]$r.Headers['Location']).Split('/')[-1]
 
 ### 5.1 重启主服务后复读（可执行步骤）
 
-**安全前提**：这一步会终止一个进程，因此**只终止能核实的那个进程**。四条判据必须**同时**成立：
-① PID 与 §4 写下的身份记录一致；② 进程名是 `java.exe`/`javaw.exe`；③ 命令行指向本仓库的
-`flowdesk-bootstrap-*.jar`；④ 命令行带 `spring.profiles.active=…postgres`。
-任一条不满足就**打印证据并失败退出（exit 1）**，绝不终止无法核实的进程；身份记录缺失同样直接停止。
+**安全前提**：这一步会终止一个进程，因此**只终止能完整核实的那个进程**。五条判据必须**同时**成立：
+
+① PID 与 §4 写下的身份记录一致；② 进程名是 `java.exe`/`javaw.exe`；
+③ 命令行指向本仓库的 `flowdesk-bootstrap-*.jar`；④ 命令行带 `spring.profiles.active=…postgres`；
+⑤ **进程的真实启动时间**与身份记录里的 `startTime` 一致 —— 这条不可省：PID 会被系统回收复用，
+只有启动时间能排除「同 PID 的另一个进程」。
+
+第 ⑤ 条**取不到**（身份记录缺 `startTime`、时间不可解析、进程已退出或 `CreationDate` 不可读）或**与记录不一致**时，
+一律**拒绝终止**。任一条不满足即失败退出（`exit 1`），并且拒绝分支**只输出安全的判定结果（布尔）与人工指引**，
+**不回显完整命令行**（命令行可能带路径与参数，本步骤没有理由把它打印出来）。
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -191,16 +197,38 @@ if (-not $conn) {
     $isPgProfile   = [bool]($cmd -match 'spring\.profiles\.active=[^"\s]*postgres')
     $matchesRecord = ([int]$record.pid -eq $ownerPid) -and ($cmd -like "*$($record.jar)*")
 
-    if (-not ($isJavaProcess -and $isOurJar -and $isPgProfile -and $matchesRecord)) {
-        Write-Host "[停止] 8080 的持有者是 PID=$ownerPid（$($proc.Name)），但它**不是本次启动的 FlowDesk 主服务**，不做任何终止：" -ForegroundColor Red
-        Write-Host "        java 进程=$isJavaProcess；本仓库 JAR=$isOurJar；postgres profile=$isPgProfile；与身份记录一致=$matchesRecord"
-        Write-Host "        实际命令行：$cmd"
-        Write-Host '        请人工确认这是什么进程；本步骤不会强制结束无法核实的进程。'
+    # 启动时间核对：PID 会被系统回收复用，只有启动时间能排除「同 PID 的另一个进程」
+    $recordedStart = $null
+    if ($record.PSObject.Properties['startTime'] -and $record.startTime) {
+        $parsed = [datetimeoffset]::MinValue
+        if ([datetimeoffset]::TryParse([string]$record.startTime, [ref]$parsed)) { $recordedStart = $parsed }
+    }
+    $actualStart = $null
+    if ($proc.CreationDate) { $actualStart = [datetimeoffset]$proc.CreationDate }
+
+    $startTimeAvailable = ($null -ne $recordedStart) -and ($null -ne $actualStart)
+    $startTimeMatches = $false
+    if ($startTimeAvailable) {
+        # 允许 2 秒偏差：记录时刻与内核创建时刻之间本来就有正常的微小间隔
+        $startTimeMatches = [math]::Abs(($actualStart - $recordedStart).TotalSeconds) -le 2
+    }
+
+    if (-not ($isJavaProcess -and $isOurJar -and $isPgProfile -and $matchesRecord -and $startTimeAvailable -and $startTimeMatches)) {
+        Write-Host '[停止] 无法证明 8080 的持有者是本次启动的 FlowDesk 主服务，因此**不做任何终止**。' -ForegroundColor Red
+        Write-Host '        安全判定结果（只列布尔值，不回显命令行内容）：'
+        Write-Host ("          进程名是 java/javaw           : " + $isJavaProcess)
+        Write-Host ("          命令行指向本仓库 JAR          : " + $isOurJar)
+        Write-Host ("          命令行带 postgres profile     : " + $isPgProfile)
+        Write-Host ("          PID / JAR 与身份记录一致      : " + $matchesRecord)
+        Write-Host ("          启动时间可取到                : " + $startTimeAvailable)
+        Write-Host ("          启动时间与身份记录一致        : " + $startTimeMatches)
+        Write-Host '        请人工确认该进程是什么、由谁启动；本步骤不会结束无法核实的进程。'
         exit 1
     }
 
+    # 五条判据全部成立才终止（-Force 只在核实之后使用）
     Stop-Process -Id $ownerPid -Force
-    Write-Host "已核实并停止本次启动的主服务：PID=$ownerPid"
+    Write-Host "已核实并停止本次启动的主服务：PID=$ownerPid（启动时间与身份记录一致）"
 }
 
 # ---------- 2) 等端口释放：最多 30 秒，超时即失败退出 ----------
