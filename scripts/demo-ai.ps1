@@ -124,8 +124,8 @@ if (-not $InvokeModel) {
     Write-FlowDeskStep '2/3 未调用（预览模式）'
     Write-FlowDeskWarn '这次**不会**调用任何付费模型：未传入 -InvokeModel，因此没有发出任何请求。'
     Write-FlowDeskInfo '已发送 POST 次数：0'
-    Write-FlowDeskInfo '确认要产生一次真实调用时，由你自己显式加上 -InvokeModel：'
-    Write-FlowDeskInfo ("  powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Scenario $scenarioName -InvokeModel")
+    Write-FlowDeskInfo '要产生一次真实调用：**保留刚才命令里的所有参数**，在原命令末尾追加 -InvokeModel 再执行。'
+    Write-FlowDeskInfo '（本脚本不会替你重拼一条命令 —— 自动拼接会丢掉或改写你输入的参数。）'
     Write-FlowDeskStep '3/3 费用与前置条件提醒'
     Write-FlowDeskWarn '一次真实调用可能向模型供应商计费；本脚本不读取、不保存任何 Key。'
     Write-FlowDeskInfo '前置条件：主服务需要以 -Mode deepseek 启动（AI 端点才注册），并且 DEEPSEEK_API_KEY 由主服务的进程环境提供。'
@@ -142,8 +142,9 @@ Write-FlowDeskInfo '本脚本不自动重试：502 或其它失败会原样报�
 $client = New-FlowDeskHttpClient
 $client.Timeout = [TimeSpan]::FromSeconds($RequestTimeoutSec)
 try {
-    $result = Invoke-FlowDeskHttp -Client $client -Method 'POST' -Url $plan.Url -Body $plan.Json
-    $sentCount = 1
+    Reset-FlowDeskDemoSendCount
+    $result = Invoke-FlowDeskDemoSend -Client $client -Url $plan.Url -Body $plan.Json
+    $sentCount = Get-FlowDeskDemoSendCount
 }
 finally {
     $client.Dispose()

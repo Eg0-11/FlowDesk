@@ -16,8 +16,62 @@ $global:FlowDeskDemoBaseUrl = 'http://127.0.0.1:8080'
 $global:FlowDeskDemoDiagnosisPath = '/api/v1/ai/asset-diagnosis'
 $global:FlowDeskDemoTriagePath = '/api/v1/ai/incident-triage'
 
-# 稳定枚举：两侧查询与知识分支各自的状态
+# 稳定枚举（与现有 HTTP DTO / 应用层枚举逐字对应，校验时**区分大小写**）
 $global:FlowDeskDemoOutcomes = @('FOUND', 'NOT_FOUND', 'FAILED')
+$global:FlowDeskDemoSources = @('DEMO', 'REAL')
+$global:FlowDeskDemoHealthStates = @('HEALTHY', 'DEGRADED', 'CRITICAL', 'UNKNOWN')
+# 两侧查询的失败分类（QueryFailure）
+$global:FlowDeskDemoQueryFailures = @('INVALID_INPUT', 'DISABLED', 'TIMEOUT', 'UNAVAILABLE',
+    'INVALID_RESPONSE', 'REMOTE_TOOL_ERROR')
+# 知识分支的失败分类（KnowledgeFailure）
+$global:FlowDeskDemoKnowledgeFailures = @('DISABLED', 'EMBEDDING_PROVIDER_UNAVAILABLE',
+    'RERANK_PROVIDER_UNAVAILABLE', 'RETRIEVAL_FAILURE')
+
+# 真实发送计数：只在真正执行发送的路径上递增（预览模式不会走到这里）。
+# 这是「预览 0 次、显式调用 1 次、失败不重试」的可验证依据，而不是只靠计划断言。
+$global:FlowDeskDemoSendCount = 0
+
+function Reset-FlowDeskDemoSendCount {
+    $global:FlowDeskDemoSendCount = 0
+}
+
+function Get-FlowDeskDemoSendCount {
+    return $global:FlowDeskDemoSendCount
+}
+
+<#
+    真正执行发送的唯一入口。
+
+    只递增一次计数，然后调用既有 HTTP 函数发送；**不循环、不重试** ——
+    失败时把结果原样交回调用方，是否再来一次由用户自己决定。
+
+    @param Client    HttpClient（超时已由调用方设置）
+    @param Url       目标地址（demo-ai 只会传固定的本机地址）
+    @param Body      请求体（无 BOM 的 UTF-8）
+    @param Transport 测试替身：离线自测用来替代真实传输的脚本块（生产路径不传）
+    @return 与 Invoke-FlowDeskHttp 相同的结构化结果
+#>
+function Invoke-FlowDeskDemoSend {
+    param(
+        $Client,
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$Body,
+        $Transport
+    )
+
+    # 离线替身路径不需要 Client；真实路径必须给，否则发送无从谈起
+    if (-not $Transport -and -not $Client) {
+        throw 'Invoke-FlowDeskDemoSend：没有提供 Transport 替身时必须提供 HttpClient'
+    }
+
+    $global:FlowDeskDemoSendCount++
+
+    if ($Transport) {
+        return (& $Transport -Url $Url -Body $Body)
+    }
+
+    return (Invoke-FlowDeskHttp -Client $Client -Method 'POST' -Url $Url -Body $Body)
+}
 
 <#
     固定的中文演示问题（仅事件研判使用）。
@@ -129,6 +183,22 @@ function Get-FlowDeskDemoPlan {
     刻意**严格**：缺少必要字段、字段类型不符、状态枚举越界，一律判为契约错误。
     绝不允许「字段缺失就静默打印空值、然后按成功退出」。
 
+    校验依据是**现有 HTTP DTO**（按来源与状态决定字段集合，见各响应记录类）：
+      · asset FOUND        -> assetId / assetType / status / source
+      · asset NOT_FOUND    -> assetId / source
+      · monitoring FOUND   -> assetId / observedAt（ISO-8601）/ health / CPU 与内存使用率（0..100）/
+                              活跃告警数（>= 0）/ source
+      · monitoring NOT_FOUND -> assetId / source
+      · FAILED             -> failure 必须属于该来源自己的失败枚举（QueryFailure / KnowledgeFailure）
+      · source             -> 只能是 DEMO 或 REAL
+      · knowledge FOUND/NOT_FOUND -> retrieval 存在，且 citations 是数组、每条引用有非空 citationId
+      · usedEvidenceIds / executionPath -> 逐项是非空白字符串（不是只看外层是不是数组）
+      · requestId / answer -> 非空白字符串
+      · grounded 与引用集合不得明显矛盾（true 必须有引用，false 必须没有）
+      · 状态枚举**区分大小写**（服务端输出的是大写枚举名）
+
+    刻意**不**做：模型事实判断、完整引用解析器（那超出演示脚本的职责）。
+
     @param Scenario diagnosis / triage
     @param Json     已解析的响应对象（未解析时为 $null）
     @return [pscustomobject] @{ Ok; Reason }
@@ -146,72 +216,272 @@ function Test-FlowDeskDemoResponse {
         return [pscustomobject]@{ Ok = $false; Reason = '响应体不是 JSON 对象' }
     }
 
-    # ---- 通用必要字段 ----
-    if (-not $Json.PSObject.Properties['requestId'] -or -not $Json.requestId -or $Json.requestId -isnot [string]) {
-        return [pscustomobject]@{ Ok = $false; Reason = '缺少必要的字符串字段 requestId' }
-    }
-    if (-not $Json.PSObject.Properties['answer'] -or $Json.answer -isnot [string]) {
-        return [pscustomobject]@{ Ok = $false; Reason = '缺少必要的字符串字段 answer' }
-    }
+    # ---- 通用必要字段（非空白字符串，而不是只判断存在）----
+    $verdict = Test-FlowDeskDemoNonBlankString -Name 'requestId' -Value $Json.requestId
+    if (-not $verdict.Ok) { return $verdict }
+    $verdict = Test-FlowDeskDemoNonBlankString -Name 'answer' -Value $Json.answer
+    if (-not $verdict.Ok) { return $verdict }
+
     if (-not $Json.PSObject.Properties['grounded'] -or $Json.grounded -isnot [bool]) {
         return [pscustomobject]@{ Ok = $false; Reason = '缺少必要的布尔字段 grounded' }
     }
-    if (-not $Json.PSObject.Properties['usedEvidenceIds'] -or $Json.usedEvidenceIds -isnot [array]) {
-        return [pscustomobject]@{ Ok = $false; Reason = '缺少必要的数组字段 usedEvidenceIds' }
+
+    $verdict = Test-FlowDeskDemoStringList -Name 'usedEvidenceIds' -List $Json.usedEvidenceIds
+    if (-not $verdict.Ok) { return $verdict }
+
+    # ---- grounded 与引用集合不得明显矛盾（这是用例的构造期不变量）----
+    # 注意：空数组在 PowerShell 里是 falsy，判断「有没有」必须用 Count，不能用 -not
+    $hasEvidence = (@($Json.usedEvidenceIds).Count -gt 0)
+    if ($Json.grounded -and -not $hasEvidence) {
+        return [pscustomobject]@{ Ok = $false; Reason = 'grounded=true 但 usedEvidenceIds 为空，两者明显矛盾' }
+    }
+    if (-not $Json.grounded -and $hasEvidence) {
+        return [pscustomobject]@{ Ok = $false; Reason = 'grounded=false 但 usedEvidenceIds 非空，两者明显矛盾' }
     }
 
-    # ---- 两侧查询 ----
+    # ---- 两侧查询（asset / monitoring 都必须带合法 source）----
     foreach ($side in @('asset', 'monitoring')) {
         if (-not $Json.PSObject.Properties[$side] -or $Json.$side -isnot [psobject]) {
             return [pscustomobject]@{ Ok = $false; Reason = "缺少必要的对象字段 $side" }
         }
-        $verdict = Test-FlowDeskDemoSide -Name $side -Item $Json.$side -StateField 'outcome'
+        $verdict = Test-FlowDeskDemoSide -Name $side -Item $Json.$side -StateField 'outcome' `
+            -Failures $global:FlowDeskDemoQueryFailures -RequiresSource
         if (-not $verdict.Ok) { return $verdict }
+        if ($Json.$side.outcome -eq 'FOUND') {
+            $verdict = Test-FlowDeskDemoAssetishSide -Name $side -Item $Json.$side
+            if (-not $verdict.Ok) { return $verdict }
+        }
     }
 
-    # ---- 事件研判额外字段 ----
+    # ---- 事件研判额外字段（knowledge 没有 source 字段，因此不要求）----
     if ($Scenario -eq 'triage') {
         if (-not $Json.PSObject.Properties['knowledge'] -or $Json.knowledge -isnot [psobject]) {
             return [pscustomobject]@{ Ok = $false; Reason = '缺少必要的对象字段 knowledge' }
         }
-        $verdict = Test-FlowDeskDemoSide -Name 'knowledge' -Item $Json.knowledge -StateField 'status'
+        $verdict = Test-FlowDeskDemoSide -Name 'knowledge' -Item $Json.knowledge -StateField 'status' `
+            -Failures $global:FlowDeskDemoKnowledgeFailures
         if (-not $verdict.Ok) { return $verdict }
-        if (-not $Json.PSObject.Properties['executionPath'] -or $Json.executionPath -isnot [array]) {
-            return [pscustomobject]@{ Ok = $false; Reason = '缺少必要的数组字段 executionPath' }
+
+        if ($Json.knowledge.status -ne 'FAILED') {
+            # retrieval 缺失时不能把 $null 传给强制参数：先在这里判为契约错误
+            if ($null -eq $Json.knowledge.retrieval -or $Json.knowledge.retrieval -isnot [psobject]) {
+                return [pscustomobject]@{ Ok = $false; Reason = 'knowledge.retrieval 缺失或不是对象' }
+            }
+            $verdict = Test-FlowDeskDemoKnowledgeRetrieval -Item $Json.knowledge.retrieval
+            if (-not $verdict.Ok) { return $verdict }
         }
+
+        $verdict = Test-FlowDeskDemoStringList -Name 'executionPath' -List $Json.executionPath
+        if (-not $verdict.Ok) { return $verdict }
     }
 
     return [pscustomobject]@{ Ok = $true; Reason = '响应形状符合契约' }
 }
 
 <#
-    校验一个来源分支：状态字段必须是稳定枚举，FAILED 时必须带稳定失败分类。
+    非空白字符串校验（缺失 / null / 非字符串 / 纯空白都算失败）。
+#>
+function Test-FlowDeskDemoNonBlankString {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        $Value
+    )
 
-    @param Name       分支名（asset / monitoring / knowledge）
-    @param Item       分支对象
-    @param StateField 状态字段名（outcome 或 status）
+    if (-not $Value -or $Value -isnot [string] -or -not $Value.Trim()) {
+        return [pscustomobject]@{ Ok = $false; Reason = "$Name 必须是非空白字符串" }
+    }
+    return [pscustomobject]@{ Ok = $true; Reason = "$Name 合法" }
+}
+
+<#
+    字符串数组校验：外层必须是数组，且**逐项**都是非空白字符串。
+#>
+function Test-FlowDeskDemoStringList {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        $List
+    )
+
+    # 空数组在 PowerShell 里是 falsy：判断「缺失」必须用 $null -eq，不能用 -not
+    if ($null -eq $List -or $List -isnot [array]) {
+        return [pscustomobject]@{ Ok = $false; Reason = "缺少必要的数组字段 $Name" }
+    }
+    $items = @($List)
+    for ($index = 0; $index -lt $items.Count; $index++) {
+        $value = $items[$index]
+        if ($null -eq $value -or $value -isnot [string] -or -not $value.Trim()) {
+            return [pscustomobject]@{
+                Ok     = $false
+                Reason = "$Name[$index] 必须是非空白字符串（实际：'$value'）"
+            }
+        }
+    }
+    return [pscustomobject]@{ Ok = $true; Reason = "$Name 合法（$($items.Count) 项）" }
+}
+
+<#
+    校验一个来源分支：状态字段必须是稳定枚举（**区分大小写**），
+    FAILED 时的 failure 必须属于**该来源自己的**失败枚举。
+
+    @param Name           分支名（asset / monitoring / knowledge）
+    @param Item           分支对象
+    @param StateField     状态字段名（outcome 或 status）
+    @param Failures       该来源允许的失败分类
+    @param RequiresSource 是否必须带 source（asset / monitoring 有，knowledge 没有）
     @return [pscustomobject] @{ Ok; Reason }
 #>
 function Test-FlowDeskDemoSide {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)]$Item,
-        [Parameter(Mandatory = $true)][string]$StateField
+        [Parameter(Mandatory = $true)][string]$StateField,
+        [Parameter(Mandatory = $true)][string[]]$Failures,
+        [switch]$RequiresSource
     )
 
     if (-not $Item.PSObject.Properties[$StateField] -or $Item.$StateField -isnot [string]) {
         return [pscustomobject]@{ Ok = $false; Reason = "$Name 缺少必要的字符串字段 $StateField" }
     }
-    if ($global:FlowDeskDemoOutcomes -notcontains $Item.$StateField) {
-        return [pscustomobject]@{ Ok = $false; Reason = "$Name.$StateField 不是已知状态：$($Item.$StateField)" }
+    if ($global:FlowDeskDemoOutcomes -cnotcontains $Item.$StateField) {
+        return [pscustomobject]@{ Ok = $false; Reason = "$Name.$StateField 不是已知状态（区分大小写）：$($Item.$StateField)" }
     }
+
     if ($Item.$StateField -eq 'FAILED') {
-        if (-not $Item.PSObject.Properties['failure'] -or $Item.failure -isnot [string] -or -not $Item.failure) {
+        $failure = $Item.failure
+        if (-not $Item.PSObject.Properties['failure'] -or $failure -isnot [string] -or -not $failure.Trim()) {
             return [pscustomobject]@{ Ok = $false; Reason = "$Name 状态为 FAILED 但没有稳定的 failure 分类" }
         }
+        if ($Failures -cnotcontains $failure) {
+            return [pscustomobject]@{
+                Ok     = $false
+                Reason = "$Name.failure 不属于该来源的失败分类（$($Failures -join '/')）：$failure"
+            }
+        }
+        return [pscustomobject]@{ Ok = $true; Reason = "$Name 形状合法" }
+    }
+
+    if ($RequiresSource) {
+        $verdict = Test-FlowDeskDemoSource -Name $Name -Item $Item
+        if (-not $verdict.Ok) { return $verdict }
+    }
+
+    # NOT_FOUND（asset / monitoring）：必须有 assetId（不伪造其它详情）；knowledge 没有 assetId
+    if ($RequiresSource -and $Item.$StateField -eq 'NOT_FOUND') {
+        $verdict = Test-FlowDeskDemoNonBlankString -Name "$Name.assetId" -Value $Item.assetId
+        if (-not $verdict.Ok) { return $verdict }
     }
 
     return [pscustomobject]@{ Ok = $true; Reason = "$Name 形状合法" }
+}
+
+<#
+    asset / monitoring 共用的 FOUND 字段校验（除监控数值外）。
+#>
+function Test-FlowDeskDemoAssetishSide {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)]$Item
+    )
+
+    foreach ($field in @('assetId')) {
+        $verdict = Test-FlowDeskDemoNonBlankString -Name "$Name.$field" -Value $Item.$field
+        if (-not $verdict.Ok) { return $verdict }
+    }
+
+    if ($Name -eq 'asset') {
+        foreach ($field in @('assetType', 'status')) {
+            $verdict = Test-FlowDeskDemoNonBlankString -Name "$Name.$field" -Value $Item.$field
+            if (-not $verdict.Ok) { return $verdict }
+        }
+        return [pscustomobject]@{ Ok = $true; Reason = "$Name FOUND 字段齐全" }
+    }
+
+    # ---- monitoring FOUND：时间、健康枚举与数值范围 ----
+    $observedAt = $Item.observedAt
+    if (-not $observedAt -or $observedAt -isnot [string]) {
+        return [pscustomobject]@{ Ok = $false; Reason = 'monitoring.observedAt 必须是 ISO-8601 字符串' }
+    }
+    $parsed = [datetimeoffset]::MinValue
+    if (-not [datetimeoffset]::TryParse($observedAt, [ref]$parsed)) {
+        return [pscustomobject]@{ Ok = $false; Reason = "monitoring.observedAt 不是可解析的 ISO-8601 时间：$observedAt" }
+    }
+
+    $health = $Item.health
+    if (-not $health -or $health -isnot [string] -or ($global:FlowDeskDemoHealthStates -cnotcontains $health)) {
+        return [pscustomobject]@{
+            Ok     = $false
+            Reason = "monitoring.health 不是已知状态（区分大小写）：$health"
+        }
+    }
+
+    foreach ($field in @('cpuUtilizationPercent', 'memoryUtilizationPercent')) {
+        $value = $Item.$field
+        if ($null -eq $value -or $value -isnot [int] -or $value -lt 0 -or $value -gt 100) {
+            return [pscustomobject]@{
+                Ok     = $false
+                Reason = "monitoring.$field 必须是 0..100 的整数（实际：'$value'）"
+            }
+        }
+    }
+
+    $alerts = $Item.activeAlertCount
+    if ($null -eq $alerts -or $alerts -isnot [int] -or $alerts -lt 0) {
+        return [pscustomobject]@{
+            Ok     = $false
+            Reason = "monitoring.activeAlertCount 必须是 >= 0 的整数（实际：'$alerts'）"
+        }
+    }
+
+    return [pscustomobject]@{ Ok = $true; Reason = "$Name FOUND 字段齐全" }
+}
+
+<#
+    knowledge.retrieval 校验：展示依赖 citations 数组与每条引用的编号。
+
+    （只校验展示所依赖的部分；不在这里重做检索参数或引用与答案的匹配。）
+#>
+function Test-FlowDeskDemoKnowledgeRetrieval {
+    param([Parameter(Mandatory = $true)]$Item)
+
+    if (-not $Item -or $Item -isnot [psobject]) {
+        return [pscustomobject]@{ Ok = $false; Reason = 'knowledge.retrieval 缺失或不是对象' }
+    }
+    if (-not $Item.PSObject.Properties['citations'] -or $null -eq $Item.citations -or $Item.citations -isnot [array]) {
+        return [pscustomobject]@{ Ok = $false; Reason = 'knowledge.retrieval 缺少必要的数组字段 citations' }
+    }
+
+    $citations = @($Item.citations)
+    for ($index = 0; $index -lt $citations.Count; $index++) {
+        $citation = $citations[$index]
+        if ($citation -isnot [psobject]) {
+            return [pscustomobject]@{ Ok = $false; Reason = "citations[$index] 不是对象" }
+        }
+        if (-not $citation.PSObject.Properties['citationId'] -or $citation.citationId -isnot [string] -or
+                -not $citation.citationId.Trim()) {
+            return [pscustomobject]@{ Ok = $false; Reason = "citations[$index] 缺少非空的 citationId" }
+        }
+    }
+
+    return [pscustomobject]@{ Ok = $true; Reason = "knowledge.retrieval 合法（citations 共 $($citations.Count) 条）" }
+}
+
+<#
+    source 必须是 DEMO 或 REAL（区分大小写，缺失或不认识都算契约错误）。
+#>
+function Test-FlowDeskDemoSource {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)]$Item
+    )
+
+    $source = $Item.source
+    if (-not $Item.PSObject.Properties['source'] -or $source -isnot [string] -or -not $source.Trim()) {
+        return [pscustomobject]@{ Ok = $false; Reason = "$Name 缺少必要的 source 字段" }
+    }
+    if ($global:FlowDeskDemoSources -cnotcontains $source) {
+        return [pscustomobject]@{ Ok = $false; Reason = "$Name.source 只能是 DEMO 或 REAL（实际：$source）" }
+    }
+    return [pscustomobject]@{ Ok = $true; Reason = "$Name.source 合法" }
 }
 
 <#
@@ -302,7 +572,13 @@ function Get-FlowDeskDemoDisplayLines {
         $lines += Format-FlowDeskDemoSide -Name 'knowledge' -Item $Json.knowledge -StateField 'status'
         if ($Json.knowledge.status -ne 'FAILED' -and $Json.knowledge.PSObject.Properties['retrieval']) {
             $citations = @($Json.knowledge.retrieval.citations)
-            $lines += "  knowledge.retrieval.citations: 共 $($citations.Count) 条"
+            if ($citations.Count -eq 0) {
+                $lines += '  knowledge.retrieval.citations: （空）'
+            }
+            else {
+                $ids = @($citations | ForEach-Object { "$($_.citationId)" })
+                $lines += '  knowledge.retrieval.citations: ' + ($ids -join ', ') + "（共 $($ids.Count) 条）"
+            }
         }
     }
     $lines += Format-FlowDeskDemoSide -Name 'asset' -Item $Json.asset -StateField 'outcome'
@@ -448,7 +724,8 @@ function Resolve-FlowDeskDemoFailure {
             return [pscustomobject]@{ Kind = 'Http404'; Lines = $lines }
         }
         502 {
-            $lines += 'HTTP 502：AI 服务错误（上游模型调用失败）。'
+            $lines += 'HTTP 502：AI 诊断/研判处理失败（服务端返回 AI_PROVIDER_ERROR）。'
+            $lines += '  这个结果不区分具体是哪一步出错，因此这里**不**推断「一定是供应商调用失败」。'
             if ($problem) {
                 $lines += "  code = $($problem.code)"
                 if ($problem.PSObject.Properties['requestId'] -and $problem.requestId) {
