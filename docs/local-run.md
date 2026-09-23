@@ -245,8 +245,12 @@ mvnw.cmd clean package
 3. **演示数据是虚构的。** 所有命中的 `source` 都是 `DEMO`，不是真实企业资产或监控系统。
 4. **本阶段没有验证真实 DeepSeek**（`LIVE_SMOKE=NOT_RUN`）、
    **没有验证真实 DashScope**（`DASHSCOPE_LIVE=NOT_RUN`）、
-   **没有验证真实 PostgreSQL/pgvector**（`POSTGRES_LIVE=NOT_RUN`）。
-   冒烟脚本用的是**真实进程 + 真实 MCP 协议 + 演示数据**，这三点都不能替代上面的真实依赖验证。
+   **没有做「应用以 `postgres` profile 连接外部数据库」的端到端联调**
+   （这条路径仍未执行）。注意区分：pgvector 的两个 Testcontainers 集成测试
+   （`pgvector/pgvector:0.8.6-pg16`，共 26 条）**已在 Docker 就绪后跑通**（见 README 的
+   `POSTGRESQL_PGVECTOR_IT = RUN`），那验证的是容器上的存储与检索行为，
+   **不等于**上面的端到端联调。
+   冒烟脚本用的是**真实进程 + 真实 MCP 协议 + 演示数据**，这三点都不能替代真实依赖验证。
 5. 冒烟脚本**不调用 AI 接口生成答案**，也**不新建或修改**任何业务数据。
 
 ---

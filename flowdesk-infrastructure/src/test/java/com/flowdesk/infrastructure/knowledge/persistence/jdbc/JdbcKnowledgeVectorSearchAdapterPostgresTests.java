@@ -15,6 +15,7 @@ import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -139,8 +140,13 @@ class JdbcKnowledgeVectorSearchAdapterPostgresTests {
 
     @Test
     void breaksTiesByDocumentIdThenChunkIndex() {
-        UUID first = indexedDocument("A 手册", DESCRIPTOR);
-        UUID second = indexedDocument("B 手册", DESCRIPTOR);
+        // 距离完全相同的三行只能靠 tie-break 决定顺序，而 tie-break 的第一键是 document_id ASC，
+        // 因此这里必须用**固定且顺序已知**的文档标识：用随机 UUID 的话，
+        // 「谁排在前面」每次运行都不一样，断言会随机失败（测试夹具自身的不确定性）。
+        UUID first = UUID.fromString("00000000-0000-0000-0000-0000000000a1");
+        UUID second = UUID.fromString("00000000-0000-0000-0000-0000000000b2");
+        indexedDocument(first, "A 手册", DESCRIPTOR);
+        indexedDocument(second, "B 手册", DESCRIPTOR);
         // 三个完全相同的向量 → 距离完全相同，只能靠 tie-break 决定顺序
         chunk(first, 5, "A-5", similarity(0.8));
         chunk(first, 2, "A-2", similarity(0.8));
@@ -150,6 +156,7 @@ class JdbcKnowledgeVectorSearchAdapterPostgresTests {
 
         assertThat(matches).hasSize(3);
         assertThat(matches).extracting(match -> match.documentId().value() + "#" + match.chunkIndex())
+                .as("document_id 升序在前，同一文档内 chunk_index 升序")
                 .containsExactly(first + "#2", first + "#5", second + "#0");
     }
 
@@ -238,34 +245,81 @@ class JdbcKnowledgeVectorSearchAdapterPostgresTests {
         assertThat(updatedAtOf(documentId)).as("检索不得触碰 updated_at").isEqualTo(updatedAtBefore);
     }
 
+    /**
+     * 数据库查询阶段的失败必须收敛为 {@code KNOWLEDGE_RETRIEVAL_FAILURE}，而<b>不是</b>领域输入错误。
+     *
+     * <p>查询向量是**合法的 1024 维向量**：{@link KnowledgeQueryEmbedding} 的构造期不变量
+     * 要求「长度恰好等于描述符维度、全为有限值、不得全零」，所以不可能用「维度错的向量」
+     * 制造数据库错误 —— 那样的向量在进入适配器之前就会被领域层拒绝，异常发生在被测代码之外，
+     * 断言到的也不是数据库失败。</p>
+     *
+     * <p>因此失败由**测试范围内的真实数据库状态**制造：临时把向量表改名，让适配器那条
+     * {@code SELECT} 在真实 PostgreSQL 上执行失败（{@code undefined_table}），
+     * 并在 {@code finally} 里改回。前后各加一次正向对照，证明失败确实来自数据库状态，
+     * 而不是查询向量或别的输入。</p>
+     */
     @Test
     void aDatabaseFailureIsMappedToASafeRetrievalFailure() {
-        // 用错误维度的查询向量触发数据库端的类型错误（1024 维列 + 3 维参数）
-        KnowledgeQueryEmbedding mismatched = new KnowledgeQueryEmbedding(
-                EmbeddingDescriptor.of("dashscope", "text-embedding-v4"),
-                new float[] { 1.0f, 0.0f, 0.0f });
+        UUID documentId = indexedDocument("VPN 故障处理手册", DESCRIPTOR);
+        chunk(documentId, 0, "完全相关", similarity(1.0));
 
-        assertThatThrownBy(() -> adapter.search(mismatched, 0.0, 5))
-                .isInstanceOf(KnowledgeApplicationException.class)
-                .extracting(thrown -> ((KnowledgeApplicationException) thrown).errorCode())
-                .isEqualTo(KnowledgeApplicationErrorCode.KNOWLEDGE_RETRIEVAL_FAILURE);
+        // 合法的 1024 维查询向量（与其余用例用的是同一个构造函数）
+        KnowledgeQueryEmbedding legalQuery = query(similarity(1.0));
+
+        // 正向对照 1：合法查询在数据库正常时返回结果
+        assertThat(adapter.search(legalQuery, 0.0, 5)).hasSize(1);
+
+        // 在测试范围内制造真实的数据库查询失败：把向量表临时改名
+        jdbcClient.sql("ALTER TABLE knowledge_document_chunk_embeddings "
+                + "RENAME TO knowledge_document_chunk_embeddings_offline").update();
+        try {
+            assertThatThrownBy(() -> adapter.search(legalQuery, 0.0, 5))
+                    .isInstanceOf(KnowledgeApplicationException.class)
+                    // 根因必须是数据库访问失败（Spring 的 DataAccessException），
+                    // 而不是参数校验或领域不变量拒绝
+                    .hasCauseInstanceOf(DataAccessException.class)
+                    .extracting(thrown -> ((KnowledgeApplicationException) thrown).errorCode())
+                    .isEqualTo(KnowledgeApplicationErrorCode.KNOWLEDGE_RETRIEVAL_FAILURE);
+        }
+        finally {
+            jdbcClient.sql("ALTER TABLE knowledge_document_chunk_embeddings_offline "
+                    + "RENAME TO knowledge_document_chunk_embeddings").update();
+        }
+
+        // 正向对照 2：表恢复后同一个合法查询又能正常工作
+        assertThat(adapter.search(legalQuery, 0.0, 5)).hasSize(1);
     }
 
     // ---------- 数据构造 ----------
 
     /**
-     * 造一个「已索引」的文档（状态 INDEXED、版本 4、完整时间线）。
+     * 造一个「已索引」的文档（状态 INDEXED、版本 4、完整时间线），标识随机。
      *
      * @param title      标题
      * @param descriptor 文档上声明的描述符
      * @return 文档标识
      */
     private static UUID indexedDocument(String title, EmbeddingDescriptor descriptor) {
-        return documentWithStatus("INDEXED", title, descriptor);
+        return documentWithStatus(UUID.randomUUID(), "INDEXED", title, descriptor);
     }
 
     /**
-     * 造一个指定状态的文档。
+     * 造一个「已索引」的文档，**指定**文档标识。
+     *
+     * <p>给 tie-break 用例使用：那一类断言依赖 {@code document_id ASC} 的排序，
+     * 随机标识会让顺序两可。</p>
+     *
+     * @param documentId 文档标识
+     * @param title      标题
+     * @param descriptor 文档上声明的描述符
+     * @return 文档标识（原样返回，便于链式使用）
+     */
+    private static UUID indexedDocument(UUID documentId, String title, EmbeddingDescriptor descriptor) {
+        return documentWithStatus(documentId, "INDEXED", title, descriptor);
+    }
+
+    /**
+     * 造一个指定状态的文档（标识随机）。
      *
      * @param status     状态：{@code PARSED} 或 {@code INDEXED}
      * @param title      标题
@@ -273,7 +327,20 @@ class JdbcKnowledgeVectorSearchAdapterPostgresTests {
      * @return 文档标识
      */
     private static UUID documentWithStatus(String status, String title, EmbeddingDescriptor descriptor) {
-        UUID documentId = UUID.randomUUID();
+        return documentWithStatus(UUID.randomUUID(), status, title, descriptor);
+    }
+
+    /**
+     * 造一个指定状态、指定标识的文档。
+     *
+     * @param documentId 文档标识
+     * @param status     状态：{@code PARSED} 或 {@code INDEXED}
+     * @param title      标题
+     * @param descriptor 描述符（仅 INDEXED 文档才有索引字段）
+     * @return 文档标识（原样返回）
+     */
+    private static UUID documentWithStatus(UUID documentId, String status, String title,
+            EmbeddingDescriptor descriptor) {
         Instant parsedAt = CREATED_AT.plusSeconds(1);
         Instant indexStartedAt = CREATED_AT.plusSeconds(2);
         Instant indexedAt = CREATED_AT.plusSeconds(3);
