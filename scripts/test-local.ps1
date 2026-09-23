@@ -143,8 +143,15 @@ if ($state -and $state.services) {
             continue
         }
         if ($urls.ContainsKey($record.name)) {
-            $urls[$record.name] = $record.url
-            $ports[$record.name] = [int]$record.port
+            # 端口同样先 TryParse 再使用：坏字段不允许在这里抛异常
+            $recordPort = 0
+            if ([int]::TryParse("$($record.port)", [ref]$recordPort) -and $recordPort -ge 1 -and $recordPort -le 65535) {
+                $urls[$record.name] = $record.url
+                $ports[$record.name] = $recordPort
+            }
+            else {
+                Add-FlowDeskResult "运行记录端口合法（$($record.name)）" 'FAIL' "运行记录里的端口不合法：$($record.port)"
+            }
         }
     }
 }

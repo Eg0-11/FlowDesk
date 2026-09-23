@@ -581,21 +581,180 @@ function Test-FlowDeskServiceJarPath([psobject]$Service, [string]$JarPath) {
 }
 
 <#
-    从命令行里取出真正的 {@code -jar} 参数。
+    按 Windows 的命令行引号/转义规则把整条命令行切成参数表。
 
-    <p>刻意不做子串匹配：只有「以独立 token 出现的 {@code -jar}」后面跟的那个参数才算数。
-    这样「别的参数里恰好含有同一个路径」不会被误判成身份一致，而
-    {@code --foo=-jar ...} 这类写法也不会被当成 {@code -jar}。</p>
+    规则与 {@code CommandLineToArgvW} 一致（这是 JVM 实际拿到的切分方式）：
+      · 空白分隔参数；
+      · 连续 2n 个反斜杠后跟一个引号时，输出 n 个反斜杠并把该引号当**引号定界符**
+        （奇数个反斜杠时，输出 n 个反斜杠 + 一个字面量引号，定界状态不变）；
+      · 引号内的 {@code ""} 表示一个字面量引号。
+
+    为什么要自己切：直接对整条命令行做「空白 + 引号」的正则搜索会把
+    引号内、或被引号包住的属性值里的 {@code -jar} 也当成真的启动参数。
+
+    引号不成对（例如路径以反斜杠结尾把闭合引号吞掉了）时**拒绝**，而不是猜一个结果。
 
     @param CommandLine 进程命令行
-    @return JAR 路径；命令行里没有 -jar 参数时返回 $null
+    @return [pscustomobject] @{ Ok; Arguments; Reason }
 #>
-function Get-FlowDeskJarArgument([string]$CommandLine) {
-    if (-not $CommandLine) { return $null }
-    if ($CommandLine -match '(?:^|\s)-jar\s+(?:"(?<p>[^"]+)"|(?<p>[^"\s]+))') {
-        return $Matches['p']
+function ConvertTo-FlowDeskArgumentList([string]$CommandLine) {
+    $arguments = @()
+    if (-not $CommandLine) {
+        return [pscustomobject]@{ Ok = $false; Arguments = $arguments; Reason = '命令行为空' }
     }
-    return $null
+
+    $buffer = New-Object System.Text.StringBuilder
+    $inQuotes = $false
+    $hasToken = $false
+    $index = 0
+    $length = $CommandLine.Length
+
+    while ($index -lt $length) {
+        $character = $CommandLine[$index]
+
+        if ($character -eq '\') {
+            $slashes = 0
+            while ($index -lt $length -and $CommandLine[$index] -eq '\') {
+                $slashes++
+                $index++
+            }
+
+            if ($index -lt $length -and $CommandLine[$index] -eq '"') {
+                # 反斜杠后面跟引号：2n 个 → n 个字面反斜杠 + 引号定界；
+                # 2n+1 个 → n 个字面反斜杠 + 一个字面量引号（定界状态不变）。
+                for ($k = 0; $k -lt [math]::Floor($slashes / 2); $k++) { [void]$buffer.Append('\') }
+                if ($slashes % 2 -eq 1) {
+                    [void]$buffer.Append('"')
+                }
+                else {
+                    $inQuotes = -not $inQuotes
+                }
+                $index++
+            }
+            else {
+                # 后面不是引号：这些反斜杠全是字面量，**一个都不能少**
+                for ($k = 0; $k -lt $slashes; $k++) { [void]$buffer.Append('\') }
+            }
+
+            $hasToken = $true
+            continue
+        }
+
+        if ($character -eq '"') {
+            if ($inQuotes -and ($index + 1) -lt $length -and $CommandLine[$index + 1] -eq '"') {
+                [void]$buffer.Append('"')
+                $index += 2
+                $hasToken = $true
+                continue
+            }
+            $inQuotes = -not $inQuotes
+            $hasToken = $true
+            $index++
+            continue
+        }
+
+        if (-not $inQuotes -and ($character -eq ' ' -or $character -eq "`t")) {
+            if ($hasToken) {
+                $arguments += $buffer.ToString()
+                [void]$buffer.Clear()
+                $hasToken = $false
+            }
+            $index++
+            continue
+        }
+
+        [void]$buffer.Append($character)
+        $hasToken = $true
+        $index++
+    }
+
+    if ($inQuotes) {
+        return [pscustomobject]@{
+            Ok        = $false
+            Arguments = $arguments
+            Reason    = '命令行里的引号不成对，无法可靠切分（拒绝核验，不猜）'
+        }
+    }
+
+    if ($hasToken) { $arguments += $buffer.ToString() }
+    return [pscustomobject]@{ Ok = $true; Arguments = $arguments; Reason = '命令行切分成功' }
+}
+
+<#
+    Java 启动期「需要单独一个值」的选项：识别启动目标时必须跳过它们的值，
+    否则那个值会被误当成主类。
+
+    （{@code -D}、{@code -X}、{@code -XX:}、{@code --add-opens=} 这类都是自带 {@code =} 的单 token，
+    不需要在这里列。）
+#>
+$global:FlowDeskJavaValueOptions = @(
+    '-cp', '-classpath', '--class-path',
+    '-p', '--module-path', '--upgrade-module-path',
+    '--add-modules', '--limit-modules', '--patch-module',
+    '--source', '--module-source-path',
+    '-splash'
+)
+
+<#
+    从命令行里识别 Java 的**实际启动目标**。
+
+    做法：先按 Windows 规则切成参数表，再从第二个参数开始扫描「JVM 选项 → 启动目标」：
+      · 遇到独立的 {@code -jar}：它后面那个参数就是启动目标；
+      · 遇到 {@code -cp}/{@code -classpath}/{@code -p}/... 这类带值的选项：跳过它的值；
+      · 其它以 {@code -} 开头的 token 视为 JVM 选项，继续；
+      · 遇到不以 {@code -} 开头的 token：那是主类 / 模块 / 源文件，或者是直接写成
+        {@code xxx.jar} 的启动目标（等价于 {@code -jar}）。
+
+    这样一来：
+      · 引号内或被引号包住的 {@code -D} 属性值里的 {@code -jar} **不会**被当成启动目标；
+      · 主类（或 JAR）**之后**的应用参数里的 {@code -jar} **不会**被当成启动目标；
+      · 只要启动目标不是 JAR（例如是主类），或者无法可靠解析，就**明确拒绝**，绝不猜。
+
+    @param CommandLine 进程命令行
+    @return [pscustomobject] @{ Ok; Jar; Reason }；Ok=$false 表示无法确定启动目标
+#>
+function Resolve-FlowDeskJavaLaunchTarget([string]$CommandLine) {
+    if (-not $CommandLine) {
+        return [pscustomobject]@{ Ok = $false; Jar = $null; Reason = '命令行为空，无法识别启动目标' }
+    }
+
+    $split = ConvertTo-FlowDeskArgumentList -CommandLine $CommandLine
+    if (-not $split.Ok) {
+        return [pscustomobject]@{ Ok = $false; Jar = $null; Reason = $split.Reason }
+    }
+
+    $arguments = @($split.Arguments)
+    if ($arguments.Count -lt 2) {
+        return [pscustomobject]@{ Ok = $false; Jar = $null; Reason = "命令行参数不足，无法识别启动目标：$CommandLine" }
+    }
+
+    for ($index = 1; $index -lt $arguments.Count; $index++) {
+        $token = $arguments[$index]
+
+        if ($token -eq '-jar') {
+            if (($index + 1) -ge $arguments.Count) {
+                return [pscustomobject]@{ Ok = $false; Jar = $null; Reason = '-jar 后面没有参数，无法识别启动目标' }
+            }
+            return [pscustomobject]@{ Ok = $true; Jar = $arguments[$index + 1]; Reason = '启动目标是 -jar 后面的参数' }
+        }
+
+        if ($global:FlowDeskJavaValueOptions -contains $token) {
+            $index++
+            continue
+        }
+
+        if ($token.StartsWith('-')) {
+            continue
+        }
+
+        if ($token -like '*.jar') {
+            return [pscustomobject]@{ Ok = $true; Jar = $token; Reason = '启动目标直接写成 JAR 路径' }
+        }
+
+        return [pscustomobject]@{ Ok = $false; Jar = $null; Reason = "启动目标是主类（$token）而不是 JAR，无法核验为目标 JAR 启动" }
+    }
+
+    return [pscustomobject]@{ Ok = $false; Jar = $null; Reason = '命令行里没有找到启动目标' }
 }
 
 <#
@@ -676,47 +835,53 @@ function Test-FlowDeskRecordShape {
 <#
     校验一条运行记录现在还是不是「我们启动的那一个进程」。
 
-    核验顺序（任何一步失败都返回 Killable=$false，且**禁止终止**）：
-      1. 记录的形状合法（必要字段、服务名、目标 JAR 属于该服务，见 Test-FlowDeskRecordShape）；
-      2. PID 存在、进程名是 java、启动时间与记录一致（2 秒容差）；
-      3. 命令行里真的有一个 {@code -jar} 参数，且它的**规范化完整路径**与记录的目标 JAR 完全相同
-         （不是子串包含）。
+    返回值刻意把两种「否定」分开，因为它们的处置完全不同：
+      · {@code Killable}  = 身份已核实，**可以终止**；
+      · {@code PidAbsent} = **实际确认该 PID 不存在** —— 这是唯一可以说
+        「进程已经没了、记录可以丢掉」的情形；
+    两者都为 {@code $false} 表示**无法判定**（记录缺字段 / 字段非法 / JAR 不属于该服务 /
+    PID 被别的进程占用 / 启动时间读不到 / 命令行读不到 / 启动目标识别不出来）。
+    无法判定的记录既不能终止，也**不能**当成「已经不存在」，只能作为未处理项保留下来。
 
     @param Record 运行记录
-    @return [pscustomobject] @{ Killable; Exists; Reason }
+    @return [pscustomobject] @{ Killable; PidAbsent; Reason }
 #>
 function Test-FlowDeskRecordedProcess {
     param([Parameter(Mandatory = $true)]$Record)
 
-    # ---- 1. 记录形状 ----
+    # ---- 1. 记录形状（缺字段 / 字段非法 / JAR 不属于该服务）----
     $shape = Test-FlowDeskRecordShape -Record $Record
     if (-not $shape.Ok) {
-        return [pscustomobject]@{ Killable = $false; Exists = $false; Reason = $shape.Reason }
+        return [pscustomobject]@{ Killable = $false; PidAbsent = $false; Reason = $shape.Reason }
     }
     $service = $shape.Service
     $processId = $shape.Pid
     $recordedStart = $shape.StartTime
 
-    # ---- 2. 进程本身 ----
+    # ---- 2. PID 是否存在 ----
     $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
     if (-not $process) {
-        return [pscustomobject]@{ Killable = $false; Exists = $false; Reason = '进程已不存在' }
+        return [pscustomobject]@{ Killable = $false; PidAbsent = $true; Reason = '实际确认该 PID 不存在' }
     }
     if ($process.ProcessName -ne 'java') {
-        return [pscustomobject]@{ Killable = $false; Exists = $true; Reason = "PID 现在的进程名是 $($process.ProcessName)，不是 java" }
+        return [pscustomobject]@{
+            Killable  = $false
+            PidAbsent = $false
+            Reason    = "该 PID 现在被另一个进程占用（进程名 $($process.ProcessName)），无法确认原进程是否已退出"
+        }
     }
 
     $startTime = $null
     try { $startTime = $process.StartTime } catch { $startTime = $null }
     if (-not $startTime) {
-        return [pscustomobject]@{ Killable = $false; Exists = $true; Reason = '读不到进程启动时间，无法核对身份' }
+        return [pscustomobject]@{ Killable = $false; PidAbsent = $false; Reason = '读不到进程启动时间，无法核对身份' }
     }
     $delta = [math]::Abs(($startTime.ToUniversalTime() - $recordedStart.ToUniversalTime()).TotalSeconds)
     if ($delta -gt 2) {
-        return [pscustomobject]@{ Killable = $false; Exists = $true; Reason = "启动时间不符（差 $([math]::Round($delta,1)) 秒），PID 可能已被系统复用" }
+        return [pscustomobject]@{ Killable = $false; PidAbsent = $false; Reason = "启动时间不符（差 $([math]::Round($delta,1)) 秒），PID 可能已被系统复用" }
     }
 
-    # ---- 3. 命令行里的 -jar 参数（完整路径，不做子串匹配）----
+    # ---- 3. 启动目标：按 Windows 引号规则切分命令行后识别，并比对完整路径 ----
     $commandLine = $null
     try {
         $cim = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$processId" -ErrorAction Stop
@@ -724,33 +889,35 @@ function Test-FlowDeskRecordedProcess {
     }
     catch { $commandLine = $null }
     if (-not $commandLine) {
-        return [pscustomobject]@{ Killable = $false; Exists = $true; Reason = '读不到进程命令行，无法确认目标 JAR' }
+        return [pscustomobject]@{ Killable = $false; PidAbsent = $false; Reason = '读不到进程命令行，无法确认目标 JAR' }
     }
 
-    $jarArgument = Get-FlowDeskJarArgument -CommandLine $commandLine
-    if (-not $jarArgument) {
-        return [pscustomobject]@{ Killable = $false; Exists = $true; Reason = '进程命令行里没有 -jar 参数，无法确认目标 JAR' }
+    $target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $commandLine
+    if (-not $target.Ok) {
+        return [pscustomobject]@{ Killable = $false; PidAbsent = $false; Reason = "无法可靠识别 Java 启动目标：$($target.Reason)" }
     }
 
     $argumentNormalized = $null
-    try { $argumentNormalized = [System.IO.Path]::GetFullPath($jarArgument) }
-    catch { return [pscustomobject]@{ Killable = $false; Exists = $true; Reason = "命令行里的 -jar 路径无法规范化：$jarArgument" } }
+    try { $argumentNormalized = [System.IO.Path]::GetFullPath($target.Jar) }
+    catch {
+        return [pscustomobject]@{ Killable = $false; PidAbsent = $false; Reason = "启动目标路径无法规范化：$($target.Jar)" }
+    }
 
     $argumentVerdict = Test-FlowDeskServiceJarPath -Service $service -JarPath $argumentNormalized
     if (-not $argumentVerdict.Ok) {
-        return [pscustomobject]@{ Killable = $false; Exists = $true; Reason = "命令行里的 -jar 不属于该服务：$($argumentVerdict.Reason)" }
+        return [pscustomobject]@{ Killable = $false; PidAbsent = $false; Reason = "启动目标不属于该服务：$($argumentVerdict.Reason)" }
     }
 
     $recordedNormalized = [System.IO.Path]::GetFullPath("$($Record.jar)")
     if ($argumentNormalized -ine $recordedNormalized) {
         return [pscustomobject]@{
-            Killable = $false
-            Exists   = $true
-            Reason   = "命令行里的 -jar 与记录的目标 JAR 不一致（实际 $argumentNormalized，记录 $recordedNormalized）"
+            Killable  = $false
+            PidAbsent = $false
+            Reason    = "启动目标与记录的目标 JAR 不一致（实际 $argumentNormalized，记录 $recordedNormalized）"
         }
     }
 
-    return [pscustomobject]@{ Killable = $true; Exists = $true; Reason = '身份已核实（PID + 进程名 + 启动时间 + -jar 完整路径）' }
+    return [pscustomobject]@{ Killable = $true; PidAbsent = $false; Reason = '身份已核实（PID + 进程名 + 启动时间 + 启动目标完整路径）' }
 }
 
 <#
@@ -776,22 +943,25 @@ function Clear-FlowDeskStartedProcesses {
     foreach ($record in @($Records)) {
         $verdict = Test-FlowDeskRecordedProcess -Record $record
 
-        if (-not $verdict.Killable -and -not $verdict.Exists) {
-            $alreadyGone += [pscustomobject]@{ Record = $record; Reason = $verdict.Reason }
-            continue
-        }
-        if (-not $verdict.Killable) {
-            $unresolved += [pscustomobject]@{ Record = $record; Reason = $verdict.Reason }
+        if ($verdict.Killable) {
+            $result = Stop-FlowDeskVerifiedProcess -Record $record -GracefulWaitSec $GracefulWaitSec
+            if ($result.Stopped) {
+                $cleared += [pscustomobject]@{ Record = $record; Method = $result.Method }
+            }
+            else {
+                $unresolved += [pscustomobject]@{ Record = $record; Reason = $result.Note }
+            }
             continue
         }
 
-        $result = Stop-FlowDeskVerifiedProcess -Record $record -GracefulWaitSec $GracefulWaitSec
-        if ($result.Stopped) {
-            $cleared += [pscustomobject]@{ Record = $record; Method = $result.Method }
+        # 只有**实际确认该 PID 不存在**，才允许归入「已经没了、可以丢记录」。
+        # 记录缺字段 / 字段非法 / 身份无法证明 / PID 被别的进程占用，一律算未处理。
+        if ($verdict.PidAbsent) {
+            $alreadyGone += [pscustomobject]@{ Record = $record; Reason = $verdict.Reason }
+            continue
         }
-        else {
-            $unresolved += [pscustomobject]@{ Record = $record; Reason = $result.Note }
-        }
+
+        $unresolved += [pscustomobject]@{ Record = $record; Reason = $verdict.Reason }
     }
 
     return [pscustomobject]@{
@@ -920,17 +1090,38 @@ function Save-FlowDeskRunState {
 }
 
 <#
-    只返回仍然存活（或记录不自洽但进程仍在）的记录，用于「重复启动」检测。
+    把一份运行记录按核验结果分成三类，供「重复启动」与「旧记录检查」使用：
+
+      · Live        —— 身份已核实、进程仍在（占用着那套端口）
+      · Stale       —— **实际确认 PID 不存在**（陈旧记录，可以安全丢弃）
+      · Unjudgeable —— 无法判定（记录缺字段 / 字段非法 / 身份无法证明 / PID 被别的进程占用）
+
+    任何记录都不会被「猜」成 Stale：只有 PidAbsent 才算。
+
+    @param State 已解析的运行记录
+    @return [pscustomobject] @{ Live; Stale; Unjudgeable }
 #>
-function Get-FlowDeskLiveRecords($State) {
+function Split-FlowDeskRecordsByVerdict($State) {
     $live = @()
-    if (-not $State -or -not $State.services) { return $live }
+    $stale = @()
+    $unjudgeable = @()
+
+    if (-not $State -or -not $State.services) {
+        return [pscustomobject]@{ Live = $live; Stale = $stale; Unjudgeable = $unjudgeable }
+    }
 
     foreach ($record in @($State.services)) {
         $verdict = Test-FlowDeskRecordedProcess -Record $record
-        if ($verdict.Exists) {
+        if ($verdict.Killable) {
             $live += [pscustomobject]@{ Record = $record; Verdict = $verdict }
         }
+        elseif ($verdict.PidAbsent) {
+            $stale += [pscustomobject]@{ Record = $record; Verdict = $verdict }
+        }
+        else {
+            $unjudgeable += [pscustomobject]@{ Record = $record; Verdict = $verdict }
+        }
     }
-    return $live
+
+    return [pscustomobject]@{ Live = $live; Stale = $stale; Unjudgeable = $unjudgeable }
 }

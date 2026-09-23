@@ -4,7 +4,8 @@
 
 .DESCRIPTION
     对 scripts/flowdesk-local-common.ps1 里「只读的判定函数」做反例测试：
-    目标 JAR 路径校验、-jar 参数提取、运行记录形状校验、进程身份核验。
+    目标 JAR 路径校验、Java 启动目标识别（按 Windows 引号/转义规则切分命令行）、
+    运行记录形状校验、进程身份核验，以及「无法确认」与「确认进程不存在」的分类。
 
     **本脚本是只读的**：
       · 它不启动任何服务；
@@ -83,35 +84,65 @@ $verdict = Test-FlowDeskServiceJarPath -Service $assetService -JarPath $shapeOkP
 Assert-FlowDesk 'A12 形状合法但当前不存在的路径仍被接受（不要求文件存在）' $verdict.Ok $verdict.Reason
 
 # =====================================================================================
-# B. -jar 参数提取（不做子串匹配）
+# B. Java 启动目标的识别（按 Windows 引号规则切分命令行，不做整条命令行的正则搜索）
 # =====================================================================================
-Write-FlowDeskStep 'B. 只认真正的 -jar 参数，不做子串匹配'
+Write-FlowDeskStep 'B. 识别 Java 的实际启动目标（按 Windows 引号/转义规则切分命令行）'
 
-$quoted = '"C:\jdk\bin\java.exe" -jar "' + $assetJar + '" --server.port=8091'
-$extracted = Get-FlowDeskJarArgument -CommandLine $quoted
-Assert-FlowDesk 'B1 带引号的 -jar 参数被完整提取' ($extracted -eq $assetJar) "提取结果：$extracted"
+$cmd = '"C:\Program Files\Java\jdk-17\bin\java.exe" -jar "D:\Flow Desk\my app.jar" --server.port=8091'
+$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
+Assert-FlowDesk 'B1 含空格路径的 -jar 目标被完整识别（引号切分正确）' `
+    ($target.Ok -and $target.Jar -eq 'D:\Flow Desk\my app.jar') "Ok=$($target.Ok) Jar='$($target.Jar)'"
 
-$bare = 'C:\jdk\bin\java.exe -jar ' + $assetJar + ' --server.port=8091'
-$extracted = Get-FlowDeskJarArgument -CommandLine $bare
-Assert-FlowDesk 'B2 不带引号的 -jar 参数被完整提取' ($extracted -eq $assetJar) "提取结果：$extracted"
+$cmd = '"C:\jdk\bin\java.exe" -Dflowdesk.note="-jar C:\fake\fake.jar" -jar "' + $assetJar + '" --server.port=8091'
+$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
+Assert-FlowDesk 'B2 引号内 -D 属性值里的 -jar 不被当成启动目标' `
+    ($target.Ok -and $target.Jar -eq $assetJar) "Ok=$($target.Ok) Jar='$($target.Jar)'"
 
-$substringTrap = 'C:\jdk\bin\java.exe -Dflowdesk.note=' + $assetJar + '.suffix --server.port=8091'
-$extracted = Get-FlowDeskJarArgument -CommandLine $substringTrap
-Assert-FlowDesk 'B3 路径只作为别的参数的一部分出现时不匹配（无子串匹配）' `
-    ($null -eq $extracted) "提取结果：'$extracted'（应为空）"
+$cmd = '"C:\jdk\bin\java.exe" -jar "D:\somewhere\else\other.jar"'
+$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
+$ownership = Test-FlowDeskServiceJarPath -Service $assetService -JarPath $target.Jar
+Assert-FlowDesk 'B3 实际启动别的 JAR：被识别出来，并由服务归属检查拒绝' `
+    ($target.Ok -and -not $ownership.Ok) "识别='$($target.Jar)'；归属检查：$($ownership.Reason)"
 
-$trap2 = 'C:\jdk\bin\java.exe -jar NotAJar --note=x-jar nope'
-$extracted = Get-FlowDeskJarArgument -CommandLine $trap2
-Assert-FlowDesk 'B4 取的是真正的 -jar 参数，而不是后面那个像 -jar 的片段' `
-    ($extracted -eq 'NotAJar') "提取结果：'$extracted'"
+$cmd = '"C:\jdk\bin\java.exe" -cp app.jar com.example.Main -jar something.jar'
+$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
+Assert-FlowDesk 'B4 主类启动后应用参数里的 -jar 不被当成启动目标（明确拒绝）' `
+    (-not $target.Ok) $target.Reason
 
-$trap3 = 'C:\jdk\bin\java.exe --note=-jar NotAJar'
-$extracted = Get-FlowDeskJarArgument -CommandLine $trap3
-Assert-FlowDesk 'B5 --note=-jar 这种写法不被当成 -jar（前面必须是空白或行首）' `
-    ($null -eq $extracted) "提取结果：'$extracted'（应为空）"
+$cmd = '"C:\jdk\bin\java.exe" -cp "D:\libs\a b.jar" com.example.Main'
+$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
+Assert-FlowDesk 'B5 -cp 的值（含空格）被跳过，识别到主类后拒绝' `
+    ((-not $target.Ok) -and ($target.Reason -like '*主类*')) $target.Reason
 
-$extracted = Get-FlowDeskJarArgument -CommandLine 'C:\jdk\bin\java.exe --server.port=8091'
-Assert-FlowDesk 'B6 命令行里没有 -jar 时返回空' ($null -eq $extracted) "提取结果：'$extracted'（应为空）"
+$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine '"C:\jdk\bin\java.exe" -jar'
+Assert-FlowDesk 'B6 -jar 后面没有参数时拒绝' (-not $target.Ok) $target.Reason
+
+$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine '"C:\jdk\bin\java.exe" --version'
+Assert-FlowDesk 'B7 命令行里没有启动目标时拒绝' (-not $target.Ok) $target.Reason
+
+$cmd = '"C:\jdk\bin\java.exe" -Xmx256m "' + $assetJar + '" --server.port=8091'
+$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
+Assert-FlowDesk 'B8 启动目标直接写成 JAR 路径（等价 -jar）时被识别' `
+    ($target.Ok -and $target.Jar -eq $assetJar) "Jar='$($target.Jar)'"
+
+$cmd = '"C:\jdk\bin\java.exe" -jar "' + $assetJar + '" --server.port=8091 --server.address=127.0.0.1'
+$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
+Assert-FlowDesk 'B9 正向对照：本脚本自己使用的形式被正确识别' `
+    ($target.Ok -and $target.Jar -eq $assetJar) "Jar='$($target.Jar)'"
+
+$cmd = '"C:\jdk\bin\java.exe" -jar "D:\dir\" --server.port=8091'
+$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
+Assert-FlowDesk 'B10 病态转义（路径以反斜杠吞掉闭合引号）被拒绝，不猜' `
+    (-not $target.Ok) $target.Reason
+
+$cmd = '"C:\jdk\bin\java.exe" -Dnote="unclosed -jar ' + $assetJar
+$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
+Assert-FlowDesk 'B11 引号不成对时拒绝核验（不猜）' (-not $target.Ok) $target.Reason
+
+$cmd = '"C:\jdk\bin\java.exe" -Dnote="a""b" -jar "' + $assetJar + '"'
+$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
+Assert-FlowDesk 'B12 引号内 "" 表示字面量引号（不影响后续 -jar 识别）' `
+    ($target.Ok -and $target.Jar -eq $assetJar) "Jar='$($target.Jar)'"
 
 # =====================================================================================
 # C. 运行记录形状
@@ -154,8 +185,8 @@ $selfRecord = [pscustomobject]@{
     port             = 8091
 }
 $verdict = Test-FlowDeskRecordedProcess -Record $selfRecord
-Assert-FlowDesk 'D1 进程名不是 java 时拒绝终止（拒绝理由清晰）' `
-    ((-not $verdict.Killable) -and $verdict.Exists) $verdict.Reason
+Assert-FlowDesk 'D1 PID 被别的进程占用时拒绝终止，且**不得**判成「已经不存在」' `
+    ((-not $verdict.Killable) -and (-not $verdict.PidAbsent)) $verdict.Reason
 
 $stillAlive = [bool](Get-Process -Id $PID -ErrorAction SilentlyContinue)
 Assert-FlowDesk 'D2 上一步之后本进程仍然存活（核验是只读的，没有终止任何东西）' `
@@ -169,8 +200,13 @@ $missingPidRecord = [pscustomobject]@{
     port             = 8091
 }
 $verdict = Test-FlowDeskRecordedProcess -Record $missingPidRecord
-Assert-FlowDesk 'D3 不存在的 PID 被拒绝且标记为不存在' `
-    ((-not $verdict.Killable) -and (-not $verdict.Exists)) $verdict.Reason
+Assert-FlowDesk 'D3 实际确认 PID 不存在时才判成「已经不存在」' `
+    ((-not $verdict.Killable) -and $verdict.PidAbsent) $verdict.Reason
+
+$shapeBrokenRecord = [pscustomobject]@{ name = 'asset-mcp'; port = 8091 }
+$verdict = Test-FlowDeskRecordedProcess -Record $shapeBrokenRecord
+Assert-FlowDesk 'D3b 记录缺字段时是「无法判定」，**不得**判成「已经不存在」' `
+    ((-not $verdict.Killable) -and (-not $verdict.PidAbsent)) $verdict.Reason
 
 $badJarRecord = [pscustomobject]@{
     name             = 'asset-mcp'
@@ -180,8 +216,8 @@ $badJarRecord = [pscustomobject]@{
     port             = 8091
 }
 $verdict = Test-FlowDeskRecordedProcess -Record $badJarRecord
-Assert-FlowDesk 'D4 记录里的 JAR 在仓库外时被拒绝（连进程都不看）' `
-    (-not $verdict.Killable) $verdict.Reason
+Assert-FlowDesk 'D4 记录里的 JAR 在仓库外时被拒绝（连进程都不看），且不算「已不存在」' `
+    ((-not $verdict.Killable) -and (-not $verdict.PidAbsent)) $verdict.Reason
 
 $crossServiceRecord = [pscustomobject]@{
     name             = 'asset-mcp'
@@ -191,7 +227,8 @@ $crossServiceRecord = [pscustomobject]@{
     port              = 8091
 }
 $verdict = Test-FlowDeskRecordedProcess -Record $crossServiceRecord
-Assert-FlowDesk 'D5 记录的服务与 JAR 不匹配时被拒绝' (-not $verdict.Killable) $verdict.Reason
+Assert-FlowDesk 'D5 记录的服务与 JAR 不匹配时被拒绝，且不算「已不存在」' `
+    ((-not $verdict.Killable) -and (-not $verdict.PidAbsent)) $verdict.Reason
 
 $wrongStartRecord = [pscustomobject]@{
     name             = 'asset-mcp'
@@ -225,8 +262,9 @@ foreach ($process in $javaProcesses) {
     catch { $commandLine = $null }
     if (-not $commandLine) { continue }
 
-    $jarArgument = Get-FlowDeskJarArgument -CommandLine $commandLine
-    if (-not $jarArgument) { continue }
+    $target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $commandLine
+    if (-not $target.Ok) { continue }
+    $jarArgument = $target.Jar
 
     # 用「哪个服务的 JAR 校验接受它」来定服务，而不是猜
     $service = $null
@@ -276,6 +314,72 @@ if ($checked -eq 0) {
 Assert-FlowDesk 'E9 以上核验过程没有终止任何 java 进程' `
     (@(Get-Process -Name java -ErrorAction SilentlyContinue).Count -eq $javaProcesses.Count) `
     ("核验前 $($javaProcesses.Count) 个 / 核验后 " + @(Get-Process -Name java -ErrorAction SilentlyContinue).Count + ' 个')
+
+# =====================================================================================
+# F. 分类：区分「无法确认」与「确认进程不存在」（只读：整段不调用任何终止）
+# =====================================================================================
+Write-FlowDeskStep 'F. 无法确认 vs 确认不存在（分类结果）'
+
+$absentRecord = [pscustomobject]@{
+    name = 'asset-mcp'; pid = 999998
+    processStartTime = (Get-Date).ToUniversalTime().ToString('o')
+    jar = $assetJar; port = 8091
+}
+$corruptRecord = [pscustomobject]@{ name = 'asset-mcp'; port = 8091 }
+$badPortRecord = [pscustomobject]@{
+    name = 'asset-mcp'; pid = $PID
+    processStartTime = $selfProcess.StartTime.ToUniversalTime().ToString('o')
+    jar = $assetJar; port = '不是数字'
+}
+$unprovableRecord = [pscustomobject]@{
+    name = 'asset-mcp'; pid = $PID
+    processStartTime = $selfProcess.StartTime.ToUniversalTime().ToString('o')
+    jar = $assetJar; port = 8091
+}
+
+# F1 仅含损坏记录：一条都不能算「已经不存在」，也不能宣称全部清理
+$onlyCorrupt = Clear-FlowDeskStartedProcesses -Records @($corruptRecord, $badPortRecord)
+Assert-FlowDesk 'F1a 仅含损坏记录时不算「已不存在」' ($onlyCorrupt.AlreadyGone.Count -eq 0) `
+    "AlreadyGone=$($onlyCorrupt.AlreadyGone.Count)，Unresolved=$($onlyCorrupt.Unresolved.Count)"
+Assert-FlowDesk 'F1b 仅含损坏记录时不得宣称 AllCleared' (-not $onlyCorrupt.AllCleared) `
+    "AllCleared=$($onlyCorrupt.AllCleared)，Cleared=$($onlyCorrupt.Cleared.Count)"
+Assert-FlowDesk 'F1c 仅含损坏记录时全部归入未处理' ($onlyCorrupt.Unresolved.Count -eq 2) `
+    ("未处理：" + (($onlyCorrupt.Unresolved | ForEach-Object { $_.Reason }) -join ' | '))
+
+# F2 混合记录：只有「实际确认 PID 不存在」的那条进 AlreadyGone
+$mixed = Clear-FlowDeskStartedProcesses -Records @($absentRecord, $corruptRecord, $unprovableRecord)
+Assert-FlowDesk 'F2a 混合记录里只有确认不存在的那条进 AlreadyGone' `
+    ($mixed.AlreadyGone.Count -eq 1) "AlreadyGone=$($mixed.AlreadyGone.Count)"
+Assert-FlowDesk 'F2b 混合记录里损坏与无法证明的都进未处理' `
+    ($mixed.Unresolved.Count -eq 2) "Unresolved=$($mixed.Unresolved.Count)"
+Assert-FlowDesk 'F2c 混合记录时不宣称 AllCleared、也没有终止任何东西' `
+    ((-not $mixed.AllCleared) -and ($mixed.Cleared.Count -eq 0)) `
+    "AllCleared=$($mixed.AllCleared)，Cleared=$($mixed.Cleared.Count)"
+
+# F3 正向对照：全部都是确认不存在的记录 → 可以全部丢掉
+$allAbsent = Clear-FlowDeskStartedProcesses -Records @($absentRecord)
+Assert-FlowDesk 'F3 全部记录都确认 PID 不存在时，才允许 AllCleared' `
+    ($allAbsent.AllCleared -and $allAbsent.AlreadyGone.Count -eq 1) `
+    "AllCleared=$($allAbsent.AllCleared)，AlreadyGone=$($allAbsent.AlreadyGone.Count)"
+
+# F4 损坏的 port 字段不得在分类/后续处理里抛异常
+$threw = $false
+try { $null = Clear-FlowDeskStartedProcesses -Records @($badPortRecord) }
+catch { $threw = $true }
+Assert-FlowDesk 'F4 损坏的 port 字段不会引发未处理异常' (-not $threw) '（整段分类过程无异常抛出）'
+
+# F5 反向分类器：三类互斥且不重复计数
+$state = [pscustomobject]@{ services = @($absentRecord, $corruptRecord, $unprovableRecord) }
+$split = Split-FlowDeskRecordsByVerdict -State $state
+Assert-FlowDesk 'F5 分类器把三类分开（Live / Stale / Unjudgeable）' `
+    (($split.Live.Count -eq 0) -and ($split.Stale.Count -eq 1) -and ($split.Unjudgeable.Count -eq 2)) `
+    "Live=$($split.Live.Count) Stale=$($split.Stale.Count) Unjudgeable=$($split.Unjudgeable.Count)"
+
+# F6 整段 F 没有终止任何进程
+Assert-FlowDesk 'F6 F 段没有终止任何进程（本进程与 java 计数不变）' `
+    (([bool](Get-Process -Id $PID -ErrorAction SilentlyContinue)) -and
+     (@(Get-Process -Name java -ErrorAction SilentlyContinue).Count -eq $javaProcesses.Count)) `
+    "PID=$PID 仍在；java 计数 " + @(Get-Process -Name java -ErrorAction SilentlyContinue).Count
 
 # =====================================================================================
 # 汇总

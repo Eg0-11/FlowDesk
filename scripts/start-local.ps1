@@ -108,19 +108,38 @@ catch {
 Write-FlowDeskOk "java.exe：$javaExe"
 Write-FlowDeskInfo '（未修改系统/用户 JAVA_HOME 或 PATH；子进程用绝对路径启动）'
 
-# ---------- 2. 重复启动检测 ----------
-Write-FlowDeskStep '2/6 检查是否已经有一套运行实例'
+# ---------- 2. 重复启动与旧记录检查 ----------
+Write-FlowDeskStep '2/6 检查是否已经有一套运行实例（并检查旧记录是否可判定）'
 
 $existing = Read-FlowDeskState
-$liveRecords = @(Get-FlowDeskLiveRecords -State $existing)
-if ($liveRecords.Count -gt 0) {
-    Write-FlowDeskWarn "检测到已有 $($liveRecords.Count) 个由本脚本启动且仍在运行的进程，不会启动第二套："
-    foreach ($item in $liveRecords) {
+$classification = Split-FlowDeskRecordsByVerdict -State $existing
+
+if ($classification.Live.Count -gt 0) {
+    Write-FlowDeskWarn "检测到已有 $($classification.Live.Count) 个由本脚本启动且仍在运行的进程，不会启动第二套："
+    foreach ($item in $classification.Live) {
         $record = $item.Record
         Write-FlowDeskInfo "  $($record.name)  PID=$($record.pid)  端口=$($record.port)  模式=$($existing.mode)  $($item.Verdict.Reason)"
     }
     Write-FlowDeskInfo '如需重启：先执行 scripts\stop-local.ps1，再运行本脚本。'
     exit 0
+}
+
+if ($classification.Unjudgeable.Count -gt 0) {
+    # 无法判定的旧记录必须先由人处理：既不能终止（身份不明），也不能当成「已经不存在」丢掉。
+    # 因此这里**不启动任何服务**，也**不覆盖**运行记录 —— 否则这些线索就没了。
+    Write-FlowDeskFail "运行记录里有 $($classification.Unjudgeable.Count) 条**无法判定**的条目，无法确认它们对应的进程是否还在："
+    foreach ($item in $classification.Unjudgeable) {
+        $record = $item.Record
+        Write-FlowDeskInfo "  name=$($record.name)  pid=$($record.pid)  jar=$($record.jar)  reason=$($item.Verdict.Reason)"
+    }
+    Write-FlowDeskInfo '为避免覆盖这些线索，本次**不会**启动任何服务，也**不会**改写运行记录。'
+    Write-FlowDeskInfo "运行记录：$global:FlowDeskStatePath"
+    Write-FlowDeskInfo '人工确认后处理：确认这些进程确实不在，就删除该记录文件；否则请先手动处理这些进程。'
+    exit 8
+}
+
+if ($classification.Stale.Count -gt 0) {
+    Write-FlowDeskInfo "运行记录里有 $($classification.Stale.Count) 条陈旧条目（已实际确认对应 PID 不存在），将随本次启动被覆盖。"
 }
 
 # ---------- 3. 端口 ----------

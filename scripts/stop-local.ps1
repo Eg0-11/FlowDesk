@@ -73,16 +73,18 @@ $unresolved = @()
 foreach ($record in $records) {
     $verdict = Test-FlowDeskRecordedProcess -Record $record
 
-    if (-not $verdict.Exists) {
+    # 只有**实际确认该 PID 不存在**，才算「已经没了」。
+    if ($verdict.PidAbsent) {
         Write-FlowDeskInfo "$($record.name)（PID=$($record.pid)）：$($verdict.Reason)，跳过。"
         $gone += $record
         continue
     }
 
+    # 其余非 Killable 的情形都是「无法判定」：不能终止，也不能当成已经不存在。
     if (-not $verdict.Killable) {
         Write-FlowDeskWarn "$($record.name)（PID=$($record.pid)）：$($verdict.Reason) —— 跳过，不终止。"
         Write-FlowDeskWarn ('  （记录里的目标 JAR：' + $record.jar + '）')
-        Write-FlowDeskWarn '  该进程仍然存在，因此这条记录会被保留以便人工确认后重试。'
+        Write-FlowDeskWarn '  无法判定，因此这条记录会被保留，以便人工确认后重试。'
         $unresolved += $record
         continue
     }
@@ -110,9 +112,17 @@ foreach ($record in $records) {
 Write-FlowDeskStep '确认端口释放'
 
 $stillBusy = @()
-# 按**去重后的端口**核对一次即可：多条记录可能指向同一个端口（例如记录被人工改坏）
-$portsToCheck = @($records | ForEach-Object { [int]$_.port } | Where-Object { $_ -ge 1 -and $_ -le 65535 } |
-    Sort-Object -Unique)
+# 按**去重后的端口**核对一次即可：多条记录可能指向同一个端口（例如记录被人工改坏）。
+# 端口字段可能是损坏的（不是数字、越界、甚至 null）：一律先 TryParse 再判断，
+# 绝不让一个坏字段把整个停止流程抛成未处理异常。
+$portsToCheck = @()
+foreach ($record in $records) {
+    $parsedPort = 0
+    if ([int]::TryParse("$($record.port)", [ref]$parsedPort) -and $parsedPort -ge 1 -and $parsedPort -le 65535) {
+        $portsToCheck += $parsedPort
+    }
+}
+$portsToCheck = @($portsToCheck | Sort-Object -Unique)
 foreach ($port in $portsToCheck) {
     $released = $false
     $deadline = (Get-Date).AddSeconds(15)
