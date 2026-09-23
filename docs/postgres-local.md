@@ -127,14 +127,77 @@ $id = ([string]$r.Headers['Location']).Split('/')[-1]
 # 5) 读回（200）
 (Invoke-WebRequest -Uri "http://127.0.0.1:8080/api/v1/tickets/$id" -UseBasicParsing).StatusCode
 
-# 6) 重启主服务后再读（200，数据仍在）
-#    重启数据库容器后再读（200，数据仍在）
-docker compose -p flowdesk -f D:\FlowDesk\compose.postgres.yml restart
-(Invoke-WebRequest -Uri "http://127.0.0.1:8080/api/v1/tickets/$id" -UseBasicParsing).StatusCode
+# 6) 重启主服务后再读、重启数据库容器后再读 —— 见下面 5.1/5.2 的完整步骤
 ```
 
 > `psql` 走容器内**本地 socket**（镜像的 `pg_hba.conf` 对 local 是 trust），
 > 因此这些命令**不需要、也不会打印**数据库密码；不要在命令行里传 `PGPASSWORD`。
+
+### 5.1 重启主服务后复读（可执行步骤）
+
+```powershell
+# 0) 新开的终端要先恢复环境变量（每个 shell 都要单独设置）
+$env:JAVA_HOME           = 'C:\Users\ll189\.jdks\jdk-17.0.20.1+1'
+$env:FLOWDESK_DB_URL      = 'jdbc:postgresql://127.0.0.1:5433/flowdesk'
+$env:FLOWDESK_DB_USERNAME = 'flowdesk'
+$env:FLOWDESK_DB_PASSWORD = [Environment]::GetEnvironmentVariable('FLOWDESK_DB_PASSWORD','User')
+$id = '<第 4 步返回的工单 id>'
+
+# 1) 停止主服务：按「谁在监听 8080」定位 PID，只停那一个 java 进程
+$owner = (Get-NetTCPConnection -State Listen -LocalPort 8080 -ErrorAction SilentlyContinue).OwningProcess
+if ($owner) { Stop-Process -Id $owner -Force }
+# 等端口真正释放
+while (Get-NetTCPConnection -State Listen -LocalPort 8080 -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 1 }
+
+# 2) 用第 4 节那条 java 命令**重新启动**主服务（另开一个窗口或后台任务）
+
+# 3) 等主服务健康（UP）再继续
+$h = ''
+while ($h -ne 'UP') {
+    try { $h = (Invoke-RestMethod 'http://127.0.0.1:8080/actuator/health' -TimeoutSec 3).status } catch { $h = '' }
+    if ($h -ne 'UP') { Start-Sleep -Seconds 2 }
+}
+
+# 4) 复读同一张工单：应为 200
+(Invoke-WebRequest -Uri "http://127.0.0.1:8080/api/v1/tickets/$id" -UseBasicParsing).StatusCode
+
+# 5) 顺手确认迁移没有重跑（第二次启动应看到）
+#    Current version of schema "public": 6
+#    Schema "public" is up to date. No migration necessary.
+```
+
+> 只停**自己启动的那个** java 进程（靠 8080 的持有者 PID 定位）；不要按名字批量结束 java，
+> 否则会误伤其它服务。若你是从某个会话/工具里启动的 JVM，注意关闭该会话可能连带结束它。
+
+### 5.2 重启数据库容器后复读（先等 healthy，再读）
+
+```powershell
+# 0) 每条 compose 命令都要求 shell 里有 FLOWDESK_DB_PASSWORD
+$env:FLOWDESK_DB_PASSWORD = [Environment]::GetEnvironmentVariable('FLOWDESK_DB_PASSWORD','User')
+$id = '<第 4 步返回的工单 id>'
+
+# 1) 重启数据库容器（保留命名卷；**不要**用 down -v）
+docker compose -p flowdesk -f D:\FlowDesk\compose.postgres.yml restart
+
+# 2) **等数据库 healthy**（关键：容器进程起来 ≠ 数据库可接受连接）
+$health = ''
+while ($health -ne 'healthy') {
+    $health = (docker inspect --format '{{.State.Health.Status}}' flowdesk-postgres).Trim()
+    if ($health -ne 'healthy') { Start-Sleep -Seconds 2 }
+}
+
+# 3) 只读确认数据仍在（不需要密码）
+docker exec flowdesk-postgres psql -U flowdesk -d flowdesk -tAc `
+  "SELECT COUNT(*) FROM tickets WHERE id = '$id';"          # -> 1
+
+# 4) 再经 HTTP 读同一张工单：应为 200
+#    连接池需要重连，若**第一次**请求遇到连接类错误，重试一次即可（此时数据库已 healthy）
+(Invoke-WebRequest -Uri "http://127.0.0.1:8080/api/v1/tickets/$id" -UseBasicParsing).StatusCode
+```
+
+> 顺序很重要：**先等到 healthy 再读**。容器刚 `restart` 时进程已存在但 `pg_isready` 还没通过，
+> 这时请求会失败——那不是数据丢失，也不该被记成「重启后读不到」。
+> 真实验收中该顺序的实测结果为：容器 `StartedAt` 变化（真实重启）→ healthy → `COUNT(*)=1` → HTTP **200**。
 
 ## 6. 常见问题
 
