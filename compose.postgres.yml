@@ -1,0 +1,47 @@
+# FlowDesk 本地 PostgreSQL + pgvector（联调专用，最小配置）
+#
+# 密码**只从本机环境变量读取**，绝不写入本文件或仓库：
+#
+#   PowerShell:  $env:FLOWDESK_DB_PASSWORD = '<本机自定的密码>'
+#   bash:        export FLOWDESK_DB_PASSWORD='<本机自定的密码>'
+#
+# 启动（项目名固定为 flowdesk，所有操作都被限定在本项目范围内）：
+#   docker compose -p flowdesk -f compose.postgres.yml up -d
+#
+# 停止（两种都保留命名卷；**不要**用 `down -v`，那会连数据卷一起删掉）：
+#   docker compose -p flowdesk -f compose.postgres.yml stop
+#   docker compose -p flowdesk -f compose.postgres.yml down
+#
+# 本文件刻意约束住的三件事：
+#   1. 端口只绑回环地址且用 5433（避开默认 5432，既不与机器上已有数据库冲突，也不暴露到局域网）；
+#   2. 数据落在**专属命名卷** flowdesk-pgdata 上，重启容器/重启 Docker 都不会丢；
+#   3. 只声明本项目自己的容器与卷，不引用、不清理任何其它容器或卷。
+#
+# 详细操作与验收步骤见 docs/postgres-local.md。
+
+name: flowdesk
+
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.6-pg16
+    container_name: flowdesk-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: flowdesk
+      POSTGRES_USER: flowdesk
+      # 未设置该变量时 compose 直接报错退出，不会用空密码或默认密码把库跑起来
+      POSTGRES_PASSWORD: ${FLOWDESK_DB_PASSWORD:?请先在环境变量 FLOWDESK_DB_PASSWORD 中提供数据库密码}
+    ports:
+      - 127.0.0.1:5433:5432
+    volumes:
+      - flowdesk-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flowdesk -d flowdesk"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+
+volumes:
+  # 显式命名（不带项目名前缀），便于人工识别与单独备份
+  flowdesk-pgdata:
+    name: flowdesk-pgdata

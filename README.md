@@ -1,6 +1,6 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0020-B —— pgvector 集成测试修复与验收（26/26 通过，0 跳过）（已完成）**
+> **当前阶段：FD-0020-C —— 本地 PostgreSQL/pgvector Compose 与 postgres profile 联调（已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
@@ -101,7 +101,15 @@
 > 查询向量 + 测试范围内**真实数据库查询失败**（临时改名向量表，`finally` 改回），
 > 断言保留 `KNOWLEDGE_RETRIEVAL_FAILURE` 并要求根因是 `DataAccessException`；
 > 另修掉 `breaksTiesByDocumentIdThenChunkIndex` 因**随机 UUID** 导致的顺序不确定性；
-> 定向执行 **26 运行 / 26 通过 / 0 跳过**）（FD-0020-B）。
+> 定向执行 **26 运行 / 26 通过 / 0 跳过**）（FD-0020-B）、
+> **本地 PostgreSQL/pgvector 联调**（新增最小 [`compose.postgres.yml`](compose.postgres.yml)：
+> 镜像 `pgvector/pgvector:0.8.6-pg16`、**仅绑 `127.0.0.1:5433`**、专属命名卷 `flowdesk-pgdata`、
+> 密码只从本机环境变量 `FLOWDESK_DB_PASSWORD` 读取（缺失即 compose 报错，不留空密码）；
+> 操作文档 [`docs/postgres-local.md`](docs/postgres-local.md)（明确禁止 `down -v`、
+> 只操作 `-p flowdesk` 项目）。用现有主服务 JAR 以 `postgres` profile 连上该库并**显式关闭**
+> AI / Embedding / MCP 客户端：**Flyway V1–V6 全部成功**、`vector` 0.8.6 扩展与向量表
+> （HNSW `vector_cosine_ops` 索引）就位；**HTTP 创建工单 201 → 重启主服务后读取 200 →
+> 重启数据库容器后仍为 200**（命名卷持久化））（FD-0020-C）。
 > 尚未实现：全文检索与混合检索、任意切片读取接口、文档列表/下载/删除、
 > 孤立文件清理任务、`PARSING`/`INDEXING` 悬挂的恢复扫描、问答的流式输出与会话记忆、
 > 游标分页、PostgreSQL 全文检索与 pg_trgm、真实资产/监控数据源、
@@ -594,7 +602,7 @@ java -jar flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar --spri
 | 项 | 状态 | 说明 |
 | --- | --- | --- |
 | `H2_INTEGRATION` | ✅ 已执行 | 真实 JDBC + 真实 Flyway 迁移 + 真实并发线程（两个连接） |
-| `POSTGRES_LIVE` | ⚠️ **NOT_RUN** | 本机没有 PostgreSQL 服务、没有 Docker、没有 psql，未做任何跳过式伪装 |
+| `POSTGRES_LIVE` | ✅ **RUN（本地容器 + postgres profile 联调已通）** | 本机已安装并运行 Docker Desktop。用 [`compose.postgres.yml`](compose.postgres.yml)（镜像 `pgvector/pgvector:0.8.6-pg16`、**仅绑 `127.0.0.1:5433`**、专属命名卷 `flowdesk-pgdata`）启动本地库，主服务以 `postgres` profile 连上它：Flyway **V1–V6 全部成功**，`vector` 扩展 0.8.6、向量表 `knowledge_document_chunk_embeddings` 与 **HNSW `vector_cosine_ops`** 索引就位；HTTP 创建工单 **201**，**重启主服务后读取 200**，**重启数据库容器后仍为 200**（命名卷持久化）。操作见 [`docs/postgres-local.md`](docs/postgres-local.md)。**边界**：本流程把 AI / Embedding / MCP 客户端显式关闭，真实 DeepSeek / DashScope 仍未验证 |
 
 > **`POSTGRES_LIVE=NOT_RUN` 不等于 PostgreSQL 已验收。** 目前只在 H2 的 PostgreSQL 兼容模式上
 > 验证过 SQL、约束与并发行为；迁移脚本与 SQL 都是按标准 SQL 编写、预期在 PostgreSQL 上同样成立，
@@ -855,6 +863,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0019-B | **AI 命令行演示入口**：`scripts/demo-ai.ps1`（CLI：`-Scenario diagnosis/triage`、`-AssetId`、`-Question`、`-RequestTimeoutSec` 1..600、`-InvokeModel`）、`scripts/flowdesk-demo-common.ps1`（纯函数：JSON 序列化构造请求、响应契约校验、展示行生成、错误分类映射）、`scripts/self-test-demo-ai.ps1`（离线自测，无 Key/无模型/无网络）、`docs/ai-demo.md`（操作顺序与读法）。调用**已有**的 `POST /api/v1/ai/asset-diagnosis` 与 `POST /api/v1/ai/incident-triage`，展示 `requestId`/`answer`/`grounded`/`usedEvidenceIds`/`asset.outcome`/`monitoring.outcome`/稳定 `failure`/`source`，研判另展示 `knowledge.status` 与 `executionPath`（按服务端原顺序）；未传 `-InvokeModel` 时 POST 次数为 0，传入后只发一次 POST、不循环不重试；固定访问 `http://127.0.0.1:8080`，不读取不传递模型 Key | ✅ 已完成 |
 | FD-0019-B-R1 | 演示收口：①**响应校验按现有 HTTP DTO 逐字段**（asset/monitoring 的 FOUND/NOT_FOUND/FAILED 字段集合、监控数值类型与范围、observedAt 可解析、health/source/failure 枚举区分大小写、knowledge 的 retrieval 与 citations/citationId、数组逐项非空白、requestId/answer 非空白、grounded 与引用集合不得矛盾）；非法响应一律 Contract + 退出码 1；②预览提示不再自动拼命令；③502 文案改中性；④发送次数改为实测计数（离线替身 + 子进程实测）；⑤命令文本不执行的证据改为「先创建测试自有哨兵文件，处理后确认仍存在」 | ✅ 已完成 |
 | FD-0020-B | pgvector 集成测试修复与验收：①`aDatabaseFailureIsMappedToASafeRetrievalFailure` 改用**合法 1024 维**查询向量，并在测试范围内制造**真实数据库查询失败**（临时重命名向量表 → `finally` 恢复），断言保留 `KNOWLEDGE_RETRIEVAL_FAILURE` 且要求根因是 `DataAccessException`（不删除、不跳过、不改判为领域输入错误）；②修掉 `breaksTiesByDocumentIdThenChunkIndex` 的**随机 UUID 导致的顺序不确定性**（tie-break 以 `document_id ASC` 为先，夹具改用固定标识）；③Docker Desktop 就绪后**定向执行两个 `*PostgresTests` 类：26 运行 / 26 通过 / 0 跳过** | ✅ 已完成 |
+| FD-0020-C | **本地 PostgreSQL/pgvector 联调**：①新增最小 `compose.postgres.yml`（`pgvector/pgvector:0.8.6-pg16`、**仅绑 `127.0.0.1:5433`**、专属命名卷 `flowdesk-pgdata`、密码只从本机环境变量读取且缺失即报错）；②新增 `docs/postgres-local.md`（启停/验收/常见问题 + 「禁止 `down -v`」「只操作 `-p flowdesk`」两条硬约束）；③用现有主服务 JAR 以 `postgres` profile 连该库、显式关闭 AI / Embedding / MCP；④实测验收：Flyway V1–V6 成功、`vector` 0.8.6 与向量表 + HNSW 索引就位、工单在**重启主服务**与**重启数据库容器**后均仍可读；⑤同步修正 README 中过时的「本机没有 Docker」与 17.7 / 18.6 的旧 `NOT_RUN` 表述（标为当时状态并指向现行结果） | ✅ 已完成 |
 | 后续 | 问答流式输出与会话记忆（当前为一次性完整响应、无历史轮次） | 未开始 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm`（混合检索） | 未开始 |
 | 后续 | 孤立文件清理任务 | 未开始 |
@@ -895,6 +904,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | AI 演示入口证据（FD-0019-B） | ✅ 已执行 | **① 离线自测**（无 Key、无模型调用、不发任何网络请求、不引入新依赖）：**PASS 52 / FAIL 0**。覆盖：资产诊断/事件研判请求字段正确且 `topK`/`minScore` 省略；中文/引号/换行/反斜杠/制表符经 `ConvertTo-Json` 序列化后**逐字往返**；请求体为无 BOM 的 UTF-8（字节前缀非 `EF BB BF`）；完整证据（三路命中）、部分证据（知识 `FAILED`+`DISABLED`、资产/监控 `FOUND`）与无证据降级（`grounded=false`、引用为空）三种形状都通过契约校验并如实展示；`FAILED`（带 `failure`）与 `NOT_FOUND`（带 `source`）保持区别、`FAILED` 缺 `failure` 判为契约错误；非 JSON / 缺 `requestId` / `grounded` 是字符串 / `usedEvidenceIds` 不是数组 / 缺 `asset` 或 `monitoring` / `outcome` 或 `status` 枚举越界 / 研判缺 `executionPath` 或 `knowledge` 全部按契约错误拒绝；400→展示 `code`/`detail`、404→提示可能未启用 AI 但**不断言唯一原因**、502→展示 `AI_PROVIDER_ERROR` 与 `requestId` 且明确不自动重试、连接被拒/超时/本地化中文异常文本 → Transport（**不回显原始异常文本**）、200 但非 JSON → NonJson、200 但字段缺失 → Contract；未传 `-InvokeModel` 时 `Get-FlowDeskDemoPlan` 的 `WillSend=$false`（POST 次数 0），传入后为 `$true`；目标地址固定 `http://127.0.0.1:8080/...`；预览与真实调用使用**同一份**请求体；含 `Remove-Item`/`$(...)`/反引号的问题与答案逐字往返并原样进入展示行，**哨兵文件未被创建**（命令文本不执行）；`-RequestTimeoutSec` 0/601 被拒、90 通过，非法场景名返回空。**② 自测抓到并修掉一个真实缺陷**：知识侧 `FAILED` 时「FAILED/DISABLED 不得改写成 NOT_FOUND」的提示没有出现 —— 根因是 `@(@('knowledge','status')) + $sideStates` 会把内层数组**展开**成两个字符串，循环里 `$pair[0]` 拿到的是单个字符；改为显式 `ArrayList` 构造后修复。**③ CLI 实测**：*预览模式*（服务未启动、无 Key）→ 两场景都展示固定地址、序列化后的请求体与费用提示，输出「已发送 POST 次数：0」，退出码 **0**；*参数越界*（`-RequestTimeoutSec` 0 与 601、空 `-AssetId`、空 `-Question`）→ 退出码 **7** 且「未发送任何请求」；*端到端 404*（以 Basic 模式启动，AI 端点未注册 → **必然没有模型调用**）：两场景各发送 **1 次** POST → `Http404` + 服务端 `ENDPOINT_NOT_FOUND` → 退出码 **3**；*端到端传输失败*（服务未启动）：发送 1 次 POST → `Transport`（连接失败，不回显异常原文）→ 退出码 **4**；随后 `test-local` **23 项全 PASS**、`stop-local` 3 个进程正常关闭、端口释放、退出码 0。**④ 调用次数证据**：预览 0 次；带 `-InvokeModel` 的两条实机用例各 1 次 POST，且都因 404 / 连接失败**到不了模型** —— 本轮**没有产生任何模型调用**，`LIVE_SMOKE` 仍为 `NOT_RUN`。**⑤ 构建**：本轮只改脚本、自测与文档 → **未重跑全量 Maven**（历史构建证据沿用 R1 的 `06baf1a`：BUILD SUCCESS、2203 项 / 0 失败 / 26 跳过）。**未验证项**：真实 DeepSeek（本任务不授权调用付费模型）；400 / 502 / 超时路径仅离线覆盖，实机只验证了 404 与传输失败两条；Embedding 关闭 → 知识来源不可用，事件研判只能使用 MCP 演示证据（**不是完整 RAG 实机验收**）；没有前端页面，浏览器打开根地址仍不是产品界面；只在 Windows PowerShell 5.1 上验证 |
 | 演示收口证据（FD-0019-B-R1） | ✅ 已执行 | **① 响应校验按现有 HTTP DTO 逐字段补齐**，离线自测 **PASS 76 / FAIL 0**：新增 **22 条** asset/monitoring 契约用例（asset FOUND 缺 `assetType`/`status`/`source` 被拒、`source=demo` 小写被拒、`source=REAL` 被接受；monitoring FOUND 缺 `observedAt`、`observedAt` 不可解析、`health=degraded` 小写、CPU=150、CPU 是字符串、告警数为负、缺告警数都被拒；asset/monitoring NOT_FOUND 缺 `source` 或 `assetId` 被拒；`failure` 不属于该来源枚举被拒）与 **9 条** knowledge/executionPath 用例（缺 `executionPath`、缺 `knowledge`、`status=empty` 小写、FOUND 缺 `retrieval`、缺 `citations`、引用缺 `citationId`、`failure` 不属于 KnowledgeFailure 被拒；NOT_FOUND + 空 citations 被接受；`executionPath` 含空白项被拒）；另覆盖 `requestId`/`answer` 纯空白、`grounded` 与引用集合矛盾（true+空 / false+非空）、`usedEvidenceIds` 含空白项或非字符串（逐项检查）。**② 校验抓到并修掉四个真实缺陷**：knowledge 分支被误加了 `source` 要求（knowledge DTO 没有 source）；NOT_FOUND 的 `assetId` 要求被误套到 knowledge；`retrieval` 缺失时把 `$null` 传给了强制参数（终止性错误）；以及**空数组是 falsy** —— `-not $list` 会把 `[]` 误判成「缺失」（改为 `$null -eq` 判断）。**③ 修正了不符合真实 DTO 的测试夹具**：C16–C21 原来用字符串替换拼 JSON，拼出了非法 JSON；改为直接传值构造。**④ 发送次数从计划断言升级为实测计数**：`Invoke-FlowDeskDemoSend` 是唯一发送入口并在其上计数（生产脚本仍不开放任意远程地址，目标地址只能来自固定本机基址）；离线替身证据：预览/计划阶段计数 **0**、显式调用 **1**、失败后**不重试**（队列里第二个成功响应没有被消费，返回仍是 502 并按 Http502 报告）；子进程实测：预览输出「已发送 POST 次数：**0**」退出码 0，Basic 模式（AI 端点未注册 → 必然无模型调用）下 `-InvokeModel` 输出「已发送 POST 次数：**1**」→ `Http404` + `ENDPOINT_NOT_FOUND` → 退出码 **3**；服务未启动时输出「已发送 POST 次数：**1**」→ Transport（连接失败）→ 退出码 **4**。**⑤ 预览提示不再自动拼命令**：删除了只带 `-Scenario` 的自动拼接命令（会丢掉用户其它参数），改为提示「**保留刚才命令里的所有参数，在原命令末尾追加 -InvokeModel**」；子进程回归确认自定义 `-AssetId`/`-Question`/`-RequestTimeoutSec` 逐字出现在预览里、POST 次数 0、退出码 0，参数越界退出码 7。**⑥ 502 文案改中性**：「AI 诊断/研判处理失败（服务端返回 AI_PROVIDER_ERROR）」，不再写成「上游模型调用失败」；保留稳定错误码与 requestId，明确不自动重试。**⑦ 命令文本不执行的证据改为可成立的形式**：先创建**测试自有**哨兵文件，把删除它的命令作为问题与答案文本，经请求构造、契约校验与展示之后断言文件**仍然存在**；清理只删测试自有资源。**⑧ 新发现并记录的宿主限制**：PowerShell 5.1 向子进程传**含英文双引号**的参数时，引号会在进入脚本之前被命令行解析吃掉（与本脚本无关，脚本对收到内容一律按数据转义）；已在 `docs/ai-demo.md` 注明并给出替代做法，自定义参数回归改用不含英文双引号的问题（引号的 JSON 转义由 A4 用例覆盖）。**⑨ 构建**：本轮只改演示脚本、自测与文档 → **未重跑全量 Maven**（历史证据沿用 R1 的 `06baf1a`：BUILD SUCCESS、2203 项 / 0 失败 / 26 跳过）；**未调用任何付费模型**。**未验证项**：真实 DeepSeek 仍为 `NOT_RUN`（不授权调用付费模型）；400 / 502 / 超时仅离线覆盖，实机验证了 404 与传输失败；Embedding 关闭 → 知识来源不可用（**不是完整 RAG 实机验收**）；无前端页面；只在 Windows PowerShell 5.1 上验证 |
 | pgvector 集成测试验收证据（FD-0020-B） | ✅ 已执行 | **① 基线复现（修复前）**：本机 Docker Desktop 就绪后定向执行两个类 → `Tests run: 26, Failures: 0, Errors: 1, Skipped: 0`，唯一失败是 `aDatabaseFailureIsMappedToASafeRetrievalFailure:245 ? KnowledgeDomain 查询向量长度必须等于描述符声明的维度` —— 原用例构造 3 维向量，而 `KnowledgeQueryEmbedding` 的构造期不变量要求「长度恰好等于描述符维度」，异常发生在**被测代码之外**（lambda 之前），因此它证明的不是「数据库失败被安全映射」。**② 修复（只改测试）**：查询向量改为**合法 1024 维**（复用同一个 `query(similarity(1.0))` 构造），失败由**测试范围内的真实数据库状态**制造 —— `ALTER TABLE knowledge_document_chunk_embeddings RENAME TO …_offline` 让适配器那条 `SELECT` 在真实 PostgreSQL 上以 `undefined_table` 失败，`finally` 里改回；断言保留 `KNOWLEDGE_RETRIEVAL_FAILURE`，并新增 `hasCauseInstanceOf(DataAccessException.class)` 证明根因是**数据库访问失败**而不是输入校验；前后各加一次**正向对照**（合法查询正常返回 1 条），证明失败确实来自数据库状态。**③ 顺带修掉一个真实的不确定用例**：`breaksTiesByDocumentIdThenChunkIndex` 用随机 UUID 却硬编码「第一个文档在前」，而 tie-break 第一键是 `document_id ASC`（见 `KnowledgeRetrievalSql.SELECT_MATCHES`）——修复前的第二轮实测即因此失败（实际返回顺序恰好符合契约排序，说明是夹具不确定而非实现问题）；夹具改为**固定 UUID**（`…a1` / `…b2`），断言保持严格的 `containsExactly`。**④ 验收（命令与结果）**：`mvnw.cmd -f D:\FlowDesk\pom.xml -pl flowdesk-infrastructure -am -Dtest=JdbcKnowledgeDocumentEmbeddingStorePostgresTests,JdbcKnowledgeVectorSearchAdapterPostgresTests -Dsurefire.failIfNoSpecifiedTests=false test` → **连跑两轮均为 `Tests run: 26, Failures: 0, Errors: 0, Skipped: 0` + BUILD SUCCESS（退出码 0）**；分类报告：索引写入 15 / 0 / 0 / 0、相似度检索 11 / 0 / 0 / 0（surefire XML 亦为 `tests=15 failures=0 errors=0 skipped=0` 与 `tests=11 failures=0 errors=0 skipped=0`）。**⑤ 回归**：`-pl flowdesk-infrastructure -am test`（整个模块）→ **684 项 / 0 失败 / 0 错误 / 1 项跳过** + BUILD SUCCESS，唯一跳过项是 `LocalFileSystemKnowledgeContentReaderTest` 的符号链接用例（既有、与 Docker 无关）。**⑥ 边界**：本轮只改测试，未改生产逻辑、未改依赖；验证对象是「真实 PostgreSQL 16 + pgvector 0.8.6 容器上的行为」，**应用以 `postgres` profile 连接外部数据库的端到端联调仍未执行**；未调用任何付费模型。**未验证项**：外部数据库端到端联调（`POSTGRES_LIVE` 的该部分）仍未执行；真实 DeepSeek / DashScope 仍为 `NOT_RUN` |
+| 本地 PostgreSQL/pgvector 联调证据（FD-0020-C） | ✅ 已执行 | **① 交付物**：`compose.postgres.yml`（最小：单服务 + 单命名卷；`image: pgvector/pgvector:0.8.6-pg16`；`ports: 127.0.0.1:5433:5432`；`volumes: flowdesk-pgdata:/var/lib/postgresql/data`；`POSTGRES_PASSWORD: ${FLOWDESK_DB_PASSWORD:?...}`）+ `docs/postgres-local.md`。**密码只从本机环境变量读取**：`FLOWDESK_DB_PASSWORD`（缺失时 compose 直接报错退出，不会用空密码把库跑起来），仓库与报告中不出现密码值。**② 项目隔离**：文件内 `name: flowdesk`，所有命令都带 `-p flowdesk`；文档明确「**禁止 `down -v`**」（会连命名卷一起删）与「只操作本项目、不做全局 prune」。**③ 启动**：`docker compose -p flowdesk -f compose.postgres.yml up -d` → `UP_EXIT=0`，`flowdesk-pgdata` 卷与 `flowdesk_default` 网络创建，容器 **healthy**，端口绑定实测 `127.0.0.1:5433->5432/tcp`（仅回环）。**④ 主服务以 `postgres` profile 连该库**（现有 JAR，显式关闭 AI / Embedding / MCP）：启动日志 `Database: jdbc:postgresql://127.0.0.1:5433/flowdesk (PostgreSQL 16.15)` → **Migrating V1…V6** → `Successfully applied 6 migrations to schema "public", now at version v6`；`/actuator/health` = **UP**。**⑤ 库对象实测**（容器内 psql，走本地 socket、不需要也不会打印密码）：`flyway_schema_history` 六行 `1..6 | success=true`；`pg_extension` → `vector|0.8.6`；`to_regclass('public.knowledge_document_chunk_embeddings')` 存在且 `embedding` 列类型为 `vector`；索引含 `idx_knowledge_document_chunk_embeddings_hnsw ... USING hnsw (embedding vector_cosine_ops)`。**⑥ 持久化验收**：`POST /api/v1/tickets` → **201** + `Location` + `ETag`；`GET` → **200**；**重启主服务**后（第二次启动日志 `Current version of schema "public": 6` / `up to date. No migration necessary`）`GET` 仍 **200**（`status=NEW version=0`），库内 `COUNT(*)=1` 且 `title`/`description` 的 UTF-8 布尔比较为 `true|true`；随后 `docker compose -p flowdesk ... restart`（`RESTART_EXIT=0`，容器 `StartedAt` 由 `10:32:40` 变为 `10:35:54`，**真实重启**）→ 健康恢复 healthy → 行仍在（`COUNT(*)=1`、`UTF8_MATCH=true`）→ `GET` 仍 **200**，命名卷 `flowdesk-pgdata` 保留。**⑦ 过程中的两次修正（如实记录）**：其一，最初用 `docker desktop start` 未能拉起引擎（进程未起、命令挂住），改为启动 Docker Desktop 应用后 `docker desktop status` 显示 `running`、`mode: linux`；其二，第一次 `compose restart` **失败（退出码 1）**，原因是该 shell 未设置 `FLOWDESK_DB_PASSWORD`（compose 对所有子命令都会插值整份文件）→ 容器**并未重启**，因此该轮「重启后仍可读」**不作数**，设置变量后重做并以上文 `StartedAt` 变化为准。**⑧ 边界**：本流程 AI / Embedding / MCP 显式关闭 → **真实 DeepSeek / DashScope 仍未验证**（零付费调用）；未改任何生产 Java 逻辑，未改 Basic 启动脚本。**未验证项**：真实模型与真实向量服务（`LIVE_SMOKE` / `DASHSCOPE_LIVE` = `NOT_RUN`）；向量化端到端（索引写入 + 相似度检索走真实上游）仍未执行 |
 | PostgreSQL / pgvector（Testcontainers） | ✅ **POSTGRESQL_PGVECTOR_IT = RUN** | 本机已安装并运行 Docker Desktop（CLI 29.8.0，daemon `OSTYPE=linux`）。两个 Testcontainers 集成测试类（镜像固定 `pgvector/pgvector:0.8.6-pg16`）**定向执行：26 运行 / 26 通过 / 0 跳过**（15 条索引写入 + 11 条相似度检索），连跑两轮结果一致；`flowdesk-infrastructure` 模块全量亦为 **684 项 / 0 失败 / 1 项既有跳过**（该跳过项是符号链接用例，与 Docker 无关）。**边界**：这验证的是「真实 PostgreSQL 16 + pgvector 0.8.6 容器上的写入、索引与相似度检索行为」，**不是**「应用以 `postgres` profile 连接外部数据库的端到端联调」——后者仍未执行 |
 | 真实 DashScope Embedding | ⚠️ **DASHSCOPE_LIVE=NOT_RUN** | 无 DASHSCOPE_API_KEY，**未对真实向量服务发起过任何请求**；全部自动化测试都不访问真实上游 |
 | 真实 DeepSeek | ⚠️ **LIVE_SMOKE=NOT_RUN** | 无 `DEEPSEEK_API_KEY`，**未对真实模型发起过任何请求** |
@@ -1434,9 +1444,13 @@ CREATE INDEX … USING hnsw (embedding vector_cosine_ops);
 5. **依赖库日志被整体关闭**：`DashScopeEmbeddingModel` 的 logger 是 `OFF`，
    因此该类自己的诊断信息（含上游错误细节）不会出现在日志里；
    替代品是我们适配器里「只记失败码 + 异常类名」的一条 ERROR，原始异常仍作为 cause 保留在服务端；
-6. **真实上游与真实数据库**：`DASHSCOPE_LIVE=NOT_RUN`、`POSTGRESQL_PGVECTOR_IT=NOT_RUN`
-   （本机没有 Key、没有 PostgreSQL 与 Docker），自动化测试全部使用替身或 H2；
+6. **真实上游与真实数据库（这一条写的是当时的验证状态）**：当时 `DASHSCOPE_LIVE=NOT_RUN`、
+   `POSTGRESQL_PGVECTOR_IT=NOT_RUN`（本机没有 Key、没有 PostgreSQL 与 Docker），自动化测试全部使用替身或 H2；
    pgvector 相关断言由 Testcontainers 测试覆盖，无 Docker 时跳过。
+   **现行结果**：Docker 就绪后两个 Testcontainers 集成测试类已跑通（**26 运行 / 26 通过 / 0 跳过**，
+   见第十四章「pgvector 集成测试验收证据」，FD-0020-B，提交 `1418771`），并且主服务已用本地容器库
+   完成 `postgres` profile 联调（FD-0020-C，见第十章的 `POSTGRES_LIVE` 行与 `docs/postgres-local.md`）。
+   `DASHSCOPE_LIVE` 仍为 `NOT_RUN`（未对真实向量服务发起过请求）。
 
 ### 17.8 FD-0010-R1 与 FD-0010-R2：缺口的修复
 
@@ -1631,8 +1645,12 @@ flowdesk:
 5. **HNSW + 过滤是后过滤**：带过滤条件的索引扫描可能返回少于实际匹配数的行
    （`iterative scan` / 调高 `ef_search` 未启用，也未做规模压测）；
 6. **没有分页**：单次最多 `max-top-k` 条，不提供游标翻页；
-7. **真实上游与真实数据库**：`DASHSCOPE_LIVE=NOT_RUN`、`POSTGRESQL_PGVECTOR_IT=NOT_RUN`
-   （本机没有 Key、没有 PostgreSQL 与 Docker），pgvector 断言由 Testcontainers 覆盖，无 Docker 时跳过。
+7. **真实上游与真实数据库（这一条写的是当时的验证状态）**：当时 `DASHSCOPE_LIVE=NOT_RUN`、
+   `POSTGRESQL_PGVECTOR_IT=NOT_RUN`（本机没有 Key、没有 PostgreSQL 与 Docker），
+   pgvector 断言由 Testcontainers 覆盖，无 Docker 时跳过。
+   **现行结果**：Docker 就绪后 pgvector 集成测试已跑通（**26/26 通过、0 跳过**）且 `POSTGRES_LIVE=RUN`
+   （本地容器 + `postgres` profile 联调，见第十章与 `docs/postgres-local.md`）；
+   `DASHSCOPE_LIVE` 仍为 `NOT_RUN`。
 
 ### 18.7 FD-0011-R1：四项契约修订
 

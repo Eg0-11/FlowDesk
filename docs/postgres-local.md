@@ -1,0 +1,157 @@
+# 本地 PostgreSQL + pgvector 联调（FD-0020-C）
+
+用 `compose.postgres.yml` 在本机跑一个**只绑回环地址**的 PostgreSQL 16 + pgvector 0.8.6，
+让主服务以 `postgres` profile 连真实数据库做联调。镜像与两个 Testcontainers 集成测试
+使用的一致（`pgvector/pgvector:0.8.6-pg16`），因此容器上的行为与集成测试的验证对象相同。
+
+> 这里只解决「有一台属于本项目的本地数据库」。**真实 DeepSeek / DashScope 仍未验证**
+> （见文末边界），向量化开关在本流程中保持关闭。
+
+---
+
+## 1. 前置
+
+| 项 | 要求 |
+| --- | --- |
+| Docker | Docker Desktop 已安装且**引擎已启动**（`docker info` 能返回 `OSTYPE=linux`） |
+| JDK | 17（示例用 `C:\Users\ll189\.jdks\jdk-17.0.20.1+1`） |
+| 主服务 JAR | 已构建：`flowdesk-bootstrap/target/flowdesk-bootstrap-0.1.0-SNAPSHOT.jar` |
+| 端口 | 只用 `127.0.0.1:5433`（避开默认 5432，不占用、不冲突已有数据库） |
+
+## 2. 数据库密码：只放本机环境变量
+
+密码**不写入仓库、不写入文档、不出现在任何报告里**。compose 文件用
+`${FLOWDESK_DB_PASSWORD:?...}` 读取它：变量缺失时 compose **直接报错退出**，
+不会用空密码或默认密码把库跑起来。
+
+```powershell
+# PowerShell：设置用户级环境变量（一次即可，之后每个新 shell 都能读到）
+$env:FLOWDESK_DB_PASSWORD = '<你的密码>'
+[Environment]::SetEnvironmentVariable('FLOWDESK_DB_PASSWORD', $env:FLOWDESK_DB_PASSWORD, 'User')
+
+# 或者：bash
+# export FLOWDESK_DB_PASSWORD='<你的密码>'
+```
+
+> **注意**：compose 对所有子命令（包括 `restart`、`stop`）都会先插值整个文件，
+> 所以**每条 compose 命令都必须在设置了该变量的 shell 里执行**，否则报
+> `required variable FLOWDESK_DB_PASSWORD is missing a value`。
+> 新开的终端若读不到该变量，先执行
+> `$env:FLOWDESK_DB_PASSWORD = [Environment]::GetEnvironmentVariable('FLOWDESK_DB_PASSWORD','User')`。
+
+首次执行本流程时，密码由操作者在本机生成并写入上述环境变量；**换了密码又复用旧数据卷会导致连不上**
+（PostgreSQL 只在数据目录为空时用环境变量初始化密码），此时要么用回原密码，要么新建卷。
+
+## 3. 启停（全部限定在 `flowdesk` 项目范围内）
+
+```powershell
+# 启动（后台）
+docker compose -p flowdesk -f D:\FlowDesk\compose.postgres.yml up -d
+
+# 看状态与本机端口绑定（应显示 127.0.0.1:5433->5432/tcp）
+docker compose -p flowdesk -f D:\FlowDesk\compose.postgres.yml ps
+
+# 等健康
+docker inspect --format '{{.State.Health.Status}}' flowdesk-postgres    # -> healthy
+
+# 日志
+docker compose -p flowdesk -f D:\FlowDesk\compose.postgres.yml logs --tail 50
+
+# 重启（保留数据卷）—— 用于验证持久化
+docker compose -p flowdesk -f D:\FlowDesk\compose.postgres.yml restart
+
+# 停止（保留容器与数据卷）
+docker compose -p flowdesk -f D:\FlowDesk\compose.postgres.yml stop
+# 或移除容器但**保留命名卷**
+docker compose -p flowdesk -f D:\FlowDesk\compose.postgres.yml down
+```
+
+### 三条硬约束（请勿违反）
+
+1. **不要用 `down -v`**：`-v` 会连命名卷 `flowdesk-pgdata` 一起删掉，等于删库。要清数据请显式
+   `docker volume rm flowdesk-pgdata`（并清楚自己在做什么）。
+2. **只操作本项目**：所有命令都带 `-p flowdesk`（文件里也写了 `name: flowdesk`），
+   compose 只会碰本项目自己的容器/网络/卷；**不要**执行 `docker system prune`、
+   `docker volume prune`、`docker rm -f $(docker ps -aq)` 之类的全局清理。
+3. **端口只绑回环**：`127.0.0.1:5433:5432`，不对局域网暴露；如果 5433 也被占用，
+   改 compose 里的宿主端口并同步改 `FLOWDESK_DB_URL`。
+
+## 4. 用主服务连它（现有 JAR + postgres profile）
+
+主服务用 `postgres` profile 读取三个环境变量；本流程**显式关闭** AI、Embedding 与 MCP 客户端
+（不需要任何模型 Key，也不去连 MCP 服务）。
+
+```powershell
+$env:JAVA_HOME = 'C:\Users\ll189\.jdks\jdk-17.0.20.1+1'
+$env:FLOWDESK_DB_URL      = 'jdbc:postgresql://127.0.0.1:5433/flowdesk'
+$env:FLOWDESK_DB_USERNAME = 'flowdesk'
+$env:FLOWDESK_DB_PASSWORD = [Environment]::GetEnvironmentVariable('FLOWDESK_DB_PASSWORD','User')
+
+& "$env:JAVA_HOME\bin\java.exe" -jar D:\FlowDesk\flowdesk-bootstrap\target\flowdesk-bootstrap-0.1.0-SNAPSHOT.jar `
+    --spring.profiles.active=postgres `
+    --server.port=8080 --server.address=127.0.0.1 `
+    --flowdesk.ai.enabled=false `
+    --flowdesk.knowledge.embedding.enabled=false `
+    --flowdesk.mcp.client.enabled=false
+```
+
+- `--server.port` / `--server.address` 显式给出：命令行参数优先级最高，宿主机注入的
+  `SERVER__PORT` / `SERVER__HOST` 覆盖不了它。
+- 启动时会自动执行 Flyway：`db/migration`（V1–V5）+ `db/postgresql-migration`（V6，建 pgvector 扩展与向量表）。
+- 健康检查：`Invoke-RestMethod http://127.0.0.1:8080/actuator/health`（应为 `UP`）。
+
+## 5. 验收脚本（可复制执行）
+
+```powershell
+# 1) 迁移历史（V1..V6，success=true）
+docker exec flowdesk-postgres psql -U flowdesk -d flowdesk -tAc `
+  "SELECT installed_rank||'|'||version||'|'||description||'|'||success FROM flyway_schema_history ORDER BY installed_rank;"
+
+# 2) pgvector 扩展
+docker exec flowdesk-postgres psql -U flowdesk -d flowdesk -tAc `
+  "SELECT extname||'|'||extversion FROM pg_extension WHERE extname='vector';"      # -> vector|0.8.6
+
+# 3) 向量表与 HNSW 索引
+docker exec flowdesk-postgres psql -U flowdesk -d flowdesk -tAc `
+  "SELECT indexname||'|'||indexdef FROM pg_indexes WHERE tablename='knowledge_document_chunk_embeddings';"
+#  期望包含：USING hnsw (embedding vector_cosine_ops)
+
+# 4) 创建工单（201 + Location + ETag）
+$body = '{"title":"联调验收","description":"验证持久化","category":"SOFTWARE","priority":"P3","requesterId":"u-verify-1"}'
+$bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($body)
+$r = Invoke-WebRequest -Uri 'http://127.0.0.1:8080/api/v1/tickets' -Method POST `
+     -ContentType 'application/json' -Body $bytes -UseBasicParsing
+$id = ([string]$r.Headers['Location']).Split('/')[-1]
+"create=$([int]$r.StatusCode) id=$id"
+
+# 5) 读回（200）
+(Invoke-WebRequest -Uri "http://127.0.0.1:8080/api/v1/tickets/$id" -UseBasicParsing).StatusCode
+
+# 6) 重启主服务后再读（200，数据仍在）
+#    重启数据库容器后再读（200，数据仍在）
+docker compose -p flowdesk -f D:\FlowDesk\compose.postgres.yml restart
+(Invoke-WebRequest -Uri "http://127.0.0.1:8080/api/v1/tickets/$id" -UseBasicParsing).StatusCode
+```
+
+> `psql` 走容器内**本地 socket**（镜像的 `pg_hba.conf` 对 local 是 trust），
+> 因此这些命令**不需要、也不会打印**数据库密码；不要在命令行里传 `PGPASSWORD`。
+
+## 6. 常见问题
+
+| 现象 | 原因与处理 |
+| --- | --- |
+| `required variable FLOWDESK_DB_PASSWORD is missing a value` | 当前 shell 没有该变量（见第 2 节） |
+| `docker compose` 报连不上 docker API | Docker Desktop 引擎没启动；先 `docker desktop start` 或打开 Docker Desktop |
+| 应用启动失败 `Connection refused` | 容器没起来或端口不是 5433；`compose ps` 看绑定，`docker inspect ... Health` 看健康 |
+| 应用启动失败 `password authentication failed` | 复用了旧数据卷但换了密码（见第 2 节末尾） |
+| Flyway 报 V6 失败 `extension "vector" is not available` | 用的不是 pgvector 镜像；必须用 `pgvector/pgvector:0.8.6-pg16` |
+| 想彻底重来 | `docker compose -p flowdesk -f D:\FlowDesk\compose.postgres.yml down` 然后 `docker volume rm flowdesk-pgdata`（**会删数据**，确认后再执行） |
+
+## 7. 边界（本流程**不**验证什么）
+
+- **真实 DeepSeek / DashScope 仍未验证**：本流程把 `flowdesk.ai.enabled` 与
+  `flowdesk.knowledge.embedding.enabled` 都设为 `false`，没有任何模型/向量服务调用。
+- 因此事件研判/资产诊断的 AI 端点不注册（404），知识向量化链路没有跑通 ——
+  这里验证的是「真实 PostgreSQL + pgvector 上的迁移、表结构、索引与工单持久化」。
+- 本流程与 `scripts/start-local.ps1`（Basic/DeepSeek 模式，内存 H2）**互不影响**：
+  那条路径继续用 H2，不读这些环境变量。
