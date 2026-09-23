@@ -4,7 +4,8 @@
 
 .DESCRIPTION
     对 scripts/flowdesk-local-common.ps1 里「只读的判定函数」做反例测试：
-    目标 JAR 路径校验、Java 启动目标识别（按 Windows 引号/转义规则切分命令行）、
+    目标 JAR 路径校验、命令行切分（Windows 引号/转义规则）、
+    Java 启动目标识别的**最小白名单**（只认 `java.exe -jar <JAR> <应用参数…>`）、
     运行记录形状校验、进程身份核验，以及「无法确认」与「确认进程不存在」的分类。
 
     **本脚本是只读的**：
@@ -84,65 +85,96 @@ $verdict = Test-FlowDeskServiceJarPath -Service $assetService -JarPath $shapeOkP
 Assert-FlowDesk 'A12 形状合法但当前不存在的路径仍被接受（不要求文件存在）' $verdict.Ok $verdict.Reason
 
 # =====================================================================================
-# B. Java 启动目标的识别（按 Windows 引号规则切分命令行，不做整条命令行的正则搜索）
+# B. Java 启动目标识别（最小白名单：只认 java.exe -jar <JAR> <应用参数…>）
 # =====================================================================================
-Write-FlowDeskStep 'B. 识别 Java 的实际启动目标（按 Windows 引号/转义规则切分命令行）'
+Write-FlowDeskStep 'B0. 命令行切分本身（Windows 引号/转义规则）'
+
+# 这些直接测切分器：它必须按 CommandLineToArgvW 的语义工作，否则连白名单都判不准。
+$split = ConvertTo-FlowDeskArgumentList -CommandLine '"C:\jdk\bin\java.exe" -jar "D:\Flow Desk\a.jar" --server.port=8091'
+Assert-FlowDesk 'B0a 路径里的反斜杠必须原样保留（反斜杠后面不是引号时不减半）' `
+    (($split.Arguments[2] -eq 'D:\Flow Desk\a.jar')) ("切分结果：" + ($split.Arguments -join ' | '))
+
+$split = ConvertTo-FlowDeskArgumentList -CommandLine '"C:\a\b\\" x'
+Assert-FlowDesk 'B0b 2 个反斜杠 + 引号 → 1 个反斜杠并把引号当定界符' `
+    ($split.Arguments[0] -eq 'C:\a\b\') ("切分结果：" + ($split.Arguments -join ' | '))
+
+$split = ConvertTo-FlowDeskArgumentList -CommandLine 'x "a""b" y'
+Assert-FlowDesk 'B0c 引号内的 "" 表示一个字面量引号' `
+    ($split.Arguments[1] -eq 'a"b') ("切分结果：" + ($split.Arguments -join ' | '))
+
+$split = ConvertTo-FlowDeskArgumentList -CommandLine 'x "未闭合'
+Assert-FlowDesk 'B0d 引号不成对时切分器明确失败' (-not $split.Ok) $split.Reason
+
+Write-FlowDeskStep 'B. 启动目标白名单：只认 java.exe -jar <JAR> 这一种形式'
+
+# ---- 正向：本脚本实际生成的命令 ----
+$cmd = '"C:\jdk\bin\java.exe" -jar "' + $assetJar + '" --server.port=8091 --server.address=127.0.0.1'
+$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
+Assert-FlowDesk 'B1 正向：本脚本实际生成的命令被识别，且后面应用参数里的参数不影响判定' `
+    ($target.Ok -and $target.Jar -eq $assetJar) "Ok=$($target.Ok) Jar='$($target.Jar)'"
 
 $cmd = '"C:\Program Files\Java\jdk-17\bin\java.exe" -jar "D:\Flow Desk\my app.jar" --server.port=8091'
 $target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
-Assert-FlowDesk 'B1 含空格路径的 -jar 目标被完整识别（引号切分正确）' `
+Assert-FlowDesk 'B2 正向：含空格路径被完整识别（引号切分正确）' `
     ($target.Ok -and $target.Jar -eq 'D:\Flow Desk\my app.jar') "Ok=$($target.Ok) Jar='$($target.Jar)'"
 
-$cmd = '"C:\jdk\bin\java.exe" -Dflowdesk.note="-jar C:\fake\fake.jar" -jar "' + $assetJar + '" --server.port=8091'
+$cmd = '"C:\jdk\bin\java.exe" -jar "' + $assetJar + '"'
 $target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
-Assert-FlowDesk 'B2 引号内 -D 属性值里的 -jar 不被当成启动目标' `
+Assert-FlowDesk 'B3 正向：只有三个参数（无应用参数）时也被识别' `
     ($target.Ok -and $target.Jar -eq $assetJar) "Ok=$($target.Ok) Jar='$($target.Jar)'"
 
-$cmd = '"C:\jdk\bin\java.exe" -jar "D:\somewhere\else\other.jar"'
+# ---- 反向：白名单之外的启动形式，一律无法确认（拒绝） ----
+$cmd = '"C:\jdk\bin\java.exe" --module=mymod/com.example.Main -jar "' + $assetJar + '"'
 $target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
-$ownership = Test-FlowDeskServiceJarPath -Service $assetService -JarPath $target.Jar
-Assert-FlowDesk 'B3 实际启动别的 JAR：被识别出来，并由服务归属检查拒绝' `
-    ($target.Ok -and -not $ownership.Ok) "识别='$($target.Jar)'；归属检查：$($ownership.Reason)"
+Assert-FlowDesk 'B4 拒绝：--module=<模块/主类> 后附带 -jar' (-not $target.Ok) $target.Reason
 
-$cmd = '"C:\jdk\bin\java.exe" -cp app.jar com.example.Main -jar something.jar'
+$cmd = '"C:\jdk\bin\java.exe" -m mymod/com.example.Main -jar "' + $assetJar + '"'
 $target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
-Assert-FlowDesk 'B4 主类启动后应用参数里的 -jar 不被当成启动目标（明确拒绝）' `
-    (-not $target.Ok) $target.Reason
+Assert-FlowDesk 'B5 拒绝：-m <模块/主类> 模块启动' (-not $target.Ok) $target.Reason
 
-$cmd = '"C:\jdk\bin\java.exe" -cp "D:\libs\a b.jar" com.example.Main'
+$cmd = '"C:\jdk\bin\java.exe" --module mymod/com.example.Main'
 $target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
-Assert-FlowDesk 'B5 -cp 的值（含空格）被跳过，识别到主类后拒绝' `
-    ((-not $target.Ok) -and ($target.Reason -like '*主类*')) $target.Reason
+Assert-FlowDesk 'B6 拒绝：--module <模块/主类> 模块启动' (-not $target.Ok) $target.Reason
+
+$cmd = '"C:\jdk\bin\java.exe" -cp app.jar com.example.Main -jar "' + $assetJar + '"'
+$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
+Assert-FlowDesk 'B7 拒绝：主类启动后附带 -jar（不得把后面的 JAR 当成启动目标）' `
+    ((-not $target.Ok) -and ($target.Jar -eq $null)) $target.Reason
+
+$cmd = '"C:\jdk\bin\java.exe" com.example.Main -jar "' + $assetJar + '"'
+$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
+Assert-FlowDesk 'B8 拒绝：裸主类启动后附带 -jar' (-not $target.Ok) $target.Reason
+
+$cmd = '"C:\jdk\bin\java.exe" "' + $assetJar + '" --server.port=8091'
+$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
+Assert-FlowDesk 'B9 拒绝：裸 JAR 路径（不再视为等价 -jar）' (-not $target.Ok) $target.Reason
+
+$cmd = '"C:\jdk\bin\java.exe" -Dflowdesk.note="-jar C:\fake\fake.jar" -jar "' + $assetJar + '"'
+$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
+Assert-FlowDesk 'B10 拒绝：引号内伪造的 -jar（第一个参数不是 -jar 即无法确认）' `
+    ((-not $target.Ok) -and ($target.Jar -eq $null)) $target.Reason
+
+$cmd = '"C:\jdk\bin\java.exe" -JAR "' + $assetJar + '"'
+$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
+Assert-FlowDesk 'B11 拒绝：-JAR（大小写变体，必须区分大小写）' (-not $target.Ok) $target.Reason
 
 $target = Resolve-FlowDeskJavaLaunchTarget -CommandLine '"C:\jdk\bin\java.exe" -jar'
-Assert-FlowDesk 'B6 -jar 后面没有参数时拒绝' (-not $target.Ok) $target.Reason
+Assert-FlowDesk 'B12 拒绝：-jar 后面缺路径' (-not $target.Ok) $target.Reason
 
-$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine '"C:\jdk\bin\java.exe" --version'
-Assert-FlowDesk 'B7 命令行里没有启动目标时拒绝' (-not $target.Ok) $target.Reason
+$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine '"C:\jdk\bin\java.exe" -jar ""'
+Assert-FlowDesk 'B13 拒绝：-jar 后面是空路径' (-not $target.Ok) $target.Reason
 
-$cmd = '"C:\jdk\bin\java.exe" -Xmx256m "' + $assetJar + '" --server.port=8091'
+$cmd = '"C:\jdk\bin\java.exe" -Xmx256m -jar "' + $assetJar + '"'
 $target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
-Assert-FlowDesk 'B8 启动目标直接写成 JAR 路径（等价 -jar）时被识别' `
-    ($target.Ok -and $target.Jar -eq $assetJar) "Jar='$($target.Jar)'"
-
-$cmd = '"C:\jdk\bin\java.exe" -jar "' + $assetJar + '" --server.port=8091 --server.address=127.0.0.1'
-$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
-Assert-FlowDesk 'B9 正向对照：本脚本自己使用的形式被正确识别' `
-    ($target.Ok -and $target.Jar -eq $assetJar) "Jar='$($target.Jar)'"
+Assert-FlowDesk 'B14 拒绝：-jar 前面有任何 JVM 选项（不再跳过选项去找启动目标）' `
+    (-not $target.Ok) $target.Reason
 
 $cmd = '"C:\jdk\bin\java.exe" -jar "D:\dir\" --server.port=8091'
 $target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
-Assert-FlowDesk 'B10 病态转义（路径以反斜杠吞掉闭合引号）被拒绝，不猜' `
-    (-not $target.Ok) $target.Reason
+Assert-FlowDesk 'B15 拒绝：引号不成对（路径以反斜杠吞掉闭合引号）' (-not $target.Ok) $target.Reason
 
-$cmd = '"C:\jdk\bin\java.exe" -Dnote="unclosed -jar ' + $assetJar
-$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
-Assert-FlowDesk 'B11 引号不成对时拒绝核验（不猜）' (-not $target.Ok) $target.Reason
-
-$cmd = '"C:\jdk\bin\java.exe" -Dnote="a""b" -jar "' + $assetJar + '"'
-$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine $cmd
-Assert-FlowDesk 'B12 引号内 "" 表示字面量引号（不影响后续 -jar 识别）' `
-    ($target.Ok -and $target.Jar -eq $assetJar) "Jar='$($target.Jar)'"
+$target = Resolve-FlowDeskJavaLaunchTarget -CommandLine '"C:\jdk\bin\java.exe" --version'
+Assert-FlowDesk 'B16 拒绝：根本没有启动目标' (-not $target.Ok) $target.Reason
 
 # =====================================================================================
 # C. 运行记录形状

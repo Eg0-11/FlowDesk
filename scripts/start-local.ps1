@@ -114,16 +114,9 @@ Write-FlowDeskStep '2/6 检查是否已经有一套运行实例（并检查旧�
 $existing = Read-FlowDeskState
 $classification = Split-FlowDeskRecordsByVerdict -State $existing
 
-if ($classification.Live.Count -gt 0) {
-    Write-FlowDeskWarn "检测到已有 $($classification.Live.Count) 个由本脚本启动且仍在运行的进程，不会启动第二套："
-    foreach ($item in $classification.Live) {
-        $record = $item.Record
-        Write-FlowDeskInfo "  $($record.name)  PID=$($record.pid)  端口=$($record.port)  模式=$($existing.mode)  $($item.Verdict.Reason)"
-    }
-    Write-FlowDeskInfo '如需重启：先执行 scripts\stop-local.ps1，再运行本脚本。'
-    exit 0
-}
-
+# 顺序很重要：**先**处理无法判定的条目。
+# 混合记录里如果既有活进程又有损坏条目，必须先报出损坏条目（退出码 8）并停止 ——
+# 否则会被「已有一套在运行」提前截断成退出码 0，把问题提示整段跳过。
 if ($classification.Unjudgeable.Count -gt 0) {
     # 无法判定的旧记录必须先由人处理：既不能终止（身份不明），也不能当成「已经不存在」丢掉。
     # 因此这里**不启动任何服务**，也**不覆盖**运行记录 —— 否则这些线索就没了。
@@ -136,6 +129,16 @@ if ($classification.Unjudgeable.Count -gt 0) {
     Write-FlowDeskInfo "运行记录：$global:FlowDeskStatePath"
     Write-FlowDeskInfo '人工确认后处理：确认这些进程确实不在，就删除该记录文件；否则请先手动处理这些进程。'
     exit 8
+}
+
+if ($classification.Live.Count -gt 0) {
+    Write-FlowDeskWarn "检测到已有 $($classification.Live.Count) 个由本脚本启动且仍在运行的进程，不会启动第二套："
+    foreach ($item in $classification.Live) {
+        $record = $item.Record
+        Write-FlowDeskInfo "  $($record.name)  PID=$($record.pid)  端口=$($record.port)  模式=$($existing.mode)  $($item.Verdict.Reason)"
+    }
+    Write-FlowDeskInfo '如需重启：先执行 scripts\stop-local.ps1，再运行本脚本。'
+    exit 0
 }
 
 if ($classification.Stale.Count -gt 0) {

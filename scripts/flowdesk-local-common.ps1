@@ -681,37 +681,28 @@ function ConvertTo-FlowDeskArgumentList([string]$CommandLine) {
 }
 
 <#
-    Java 启动期「需要单独一个值」的选项：识别启动目标时必须跳过它们的值，
-    否则那个值会被误当成主类。
+    识别 Java 的启动目标 —— **最小白名单**。
 
-    （{@code -D}、{@code -X}、{@code -XX:}、{@code --add-opens=} 这类都是自带 {@code =} 的单 token，
-    不需要在这里列。）
-#>
-$global:FlowDeskJavaValueOptions = @(
-    '-cp', '-classpath', '--class-path',
-    '-p', '--module-path', '--upgrade-module-path',
-    '--add-modules', '--limit-modules', '--patch-module',
-    '--source', '--module-source-path',
-    '-splash'
-)
+    <p>本脚本只会生成一种启动形式（见 {@code Start-FlowDeskServiceProcess}）：</p>
 
-<#
-    从命令行里识别 Java 的**实际启动目标**。
+    <pre>java.exe -jar "&lt;本服务 JAR 完整路径&gt;" &lt;应用参数…&gt;</pre>
 
-    做法：先按 Windows 规则切成参数表，再从第二个参数开始扫描「JVM 选项 → 启动目标」：
-      · 遇到独立的 {@code -jar}：它后面那个参数就是启动目标；
-      · 遇到 {@code -cp}/{@code -classpath}/{@code -p}/... 这类带值的选项：跳过它的值；
-      · 其它以 {@code -} 开头的 token 视为 JVM 选项，继续；
-      · 遇到不以 {@code -} 开头的 token：那是主类 / 模块 / 源文件，或者是直接写成
-        {@code xxx.jar} 的启动目标（等价于 {@code -jar}）。
+    <p>因此这里只接受这一种形式：
+      · 按 Windows 的引号/转义规则切分成功；
+      · 可执行程序后面的**第一个**参数**精确**等于 {@code -jar}（区分大小写）；
+      · 紧随其后有非空的 JAR 路径。</p>
 
-    这样一来：
-      · 引号内或被引号包住的 {@code -D} 属性值里的 {@code -jar} **不会**被当成启动目标；
-      · 主类（或 JAR）**之后**的应用参数里的 {@code -jar} **不会**被当成启动目标；
-      · 只要启动目标不是 JAR（例如是主类），或者无法可靠解析，就**明确拒绝**，绝不猜。
+    <p>其余一切启动形式（前面带任何 JVM 选项、{@code -m}/{@code --module} 模块启动、
+    主类启动、裸 JAR 路径、{@code -JAR} 之类的大小写变体）一律**无法确认**，
+    由调用方拒绝终止 ——
+    不做「跳过若干 JVM 选项再去找启动目标」这种通用解析，也不猜。</p>
+
+    <p>把识别范围钉死在「我们自己会生成的那一种」，比实现一个通用 Java launcher 安全得多：
+    任何我们没生成过的形式只会被**拒绝**（终止不了），而不会被误认成我们的进程。
+    以后确需 JVM 参数时，再另行明确支持范围。</p>
 
     @param CommandLine 进程命令行
-    @return [pscustomobject] @{ Ok; Jar; Reason }；Ok=$false 表示无法确定启动目标
+    @return [pscustomobject] @{ Ok; Jar; Reason }；Ok=$false 表示无法确认启动目标
 #>
 function Resolve-FlowDeskJavaLaunchTarget([string]$CommandLine) {
     if (-not $CommandLine) {
@@ -724,37 +715,28 @@ function Resolve-FlowDeskJavaLaunchTarget([string]$CommandLine) {
     }
 
     $arguments = @($split.Arguments)
-    if ($arguments.Count -lt 2) {
-        return [pscustomobject]@{ Ok = $false; Jar = $null; Reason = "命令行参数不足，无法识别启动目标：$CommandLine" }
+    if ($arguments.Count -lt 3) {
+        return [pscustomobject]@{
+            Ok        = $false
+            Jar       = $null
+            Reason    = "参数数量不足，不是 `java -jar <JAR>` 形式：$CommandLine"
+        }
     }
 
-    for ($index = 1; $index -lt $arguments.Count; $index++) {
-        $token = $arguments[$index]
-
-        if ($token -eq '-jar') {
-            if (($index + 1) -ge $arguments.Count) {
-                return [pscustomobject]@{ Ok = $false; Jar = $null; Reason = '-jar 后面没有参数，无法识别启动目标' }
-            }
-            return [pscustomobject]@{ Ok = $true; Jar = $arguments[$index + 1]; Reason = '启动目标是 -jar 后面的参数' }
+    if ($arguments[1] -cne '-jar') {
+        return [pscustomobject]@{
+            Ok     = $false
+            Jar    = $null
+            Reason = "可执行程序后面的第一个参数不是 -jar（实际为 '" + $arguments[1] + "'），不属于本脚本会生成的启动形式"
         }
-
-        if ($global:FlowDeskJavaValueOptions -contains $token) {
-            $index++
-            continue
-        }
-
-        if ($token.StartsWith('-')) {
-            continue
-        }
-
-        if ($token -like '*.jar') {
-            return [pscustomobject]@{ Ok = $true; Jar = $token; Reason = '启动目标直接写成 JAR 路径' }
-        }
-
-        return [pscustomobject]@{ Ok = $false; Jar = $null; Reason = "启动目标是主类（$token）而不是 JAR，无法核验为目标 JAR 启动" }
     }
 
-    return [pscustomobject]@{ Ok = $false; Jar = $null; Reason = '命令行里没有找到启动目标' }
+    $jar = $arguments[2]
+    if (-not $jar -or -not $jar.Trim()) {
+        return [pscustomobject]@{ Ok = $false; Jar = $null; Reason = '-jar 后面的 JAR 路径为空' }
+    }
+
+    return [pscustomobject]@{ Ok = $true; Jar = $jar; Reason = '启动形式是 java -jar <JAR>，在白名单内' }
 }
 
 <#
