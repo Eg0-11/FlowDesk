@@ -82,23 +82,48 @@ docker compose -p flowdesk -f D:\FlowDesk\compose.postgres.yml down
 （不需要任何模型 Key，也不去连 MCP 服务）。
 
 ```powershell
+$ErrorActionPreference = 'Stop'
 $env:JAVA_HOME = 'C:\Users\ll189\.jdks\jdk-17.0.20.1+1'
 $env:FLOWDESK_DB_URL      = 'jdbc:postgresql://127.0.0.1:5433/flowdesk'
 $env:FLOWDESK_DB_USERNAME = 'flowdesk'
 $env:FLOWDESK_DB_PASSWORD = [Environment]::GetEnvironmentVariable('FLOWDESK_DB_PASSWORD','User')
 
-& "$env:JAVA_HOME\bin\java.exe" -jar D:\FlowDesk\flowdesk-bootstrap\target\flowdesk-bootstrap-0.1.0-SNAPSHOT.jar `
-    --spring.profiles.active=postgres `
-    --server.port=8080 --server.address=127.0.0.1 `
-    --flowdesk.ai.enabled=false `
-    --flowdesk.knowledge.embedding.enabled=false `
-    --flowdesk.mcp.client.enabled=false
+# 本机进程环境里存在 Path/PATH、HTTP_PROXY/http_proxy 等**仅大小写不同**的重复变量，
+# PowerShell 5.1 的 Start-Process 会因此报「字典中的关键字」而失败 —— 先折叠成单一拼写
+# （只影响本 shell 与它启动的子进程，不改用户/系统环境变量）。
+$vars = [System.Environment]::GetEnvironmentVariables()
+foreach ($g in ($vars.Keys | Group-Object { $_.ToString().ToLowerInvariant() } | Where-Object { $_.Count -gt 1 })) {
+    $names = @($g.Group | ForEach-Object { $_.ToString() })
+    $canonical = ($names | Where-Object { $_ -ceq $_.ToUpperInvariant() } | Select-Object -First 1)
+    if (-not $canonical) { $canonical = $names[0] }
+    $value = $vars[$canonical]
+    foreach ($n in $names) { [System.Environment]::SetEnvironmentVariable($n, $null) }
+    [System.Environment]::SetEnvironmentVariable($canonical, $value)
+}
+
+$jar = 'D:\FlowDesk\flowdesk-bootstrap\target\flowdesk-bootstrap-0.1.0-SNAPSHOT.jar'
+$proc = Start-Process -FilePath "$env:JAVA_HOME\bin\java.exe" -PassThru -WindowStyle Hidden `
+    -RedirectStandardOutput "$env:TEMP\flowdesk-main.out.log" `
+    -RedirectStandardError  "$env:TEMP\flowdesk-main.err.log" `
+    -ArgumentList @('-jar', $jar,
+        '--spring.profiles.active=postgres',
+        '--server.port=8080', '--server.address=127.0.0.1',
+        '--flowdesk.ai.enabled=false',
+        '--flowdesk.knowledge.embedding.enabled=false',
+        '--flowdesk.mcp.client.enabled=false')
+
+# 记录**本次启动的身份**（PID + 启动时间 + JAR）。§5.1 只会终止与这份记录一致、
+# 且命令行确实是本服务的进程；记录缺失或不一致时该步骤**停止并报告**，不猜、不盲杀。
+@{ pid = $proc.Id; startTime = $proc.StartTime.ToString('o'); jar = $jar } |
+    ConvertTo-Json | Set-Content -LiteralPath "$env:TEMP\flowdesk-main.identity.json" -Encoding UTF8
+Write-Host "已启动主服务：PID=$($proc.Id)，身份记录写入 $env:TEMP\flowdesk-main.identity.json"
 ```
 
 - `--server.port` / `--server.address` 显式给出：命令行参数优先级最高，宿主机注入的
   `SERVER__PORT` / `SERVER__HOST` 覆盖不了它。
 - 启动时会自动执行 Flyway：`db/migration`（V1–V5）+ `db/postgresql-migration`（V6，建 pgvector 扩展与向量表）。
 - 健康检查：`Invoke-RestMethod http://127.0.0.1:8080/actuator/health`（应为 `UP`）。
+- 日志在 `%TEMP%\flowdesk-main.out.log`（`Start-Process` 重定向，不再往终端刷屏）。
 
 ## 5. 验收脚本（可复制执行）
 
@@ -135,69 +160,150 @@ $id = ([string]$r.Headers['Location']).Split('/')[-1]
 
 ### 5.1 重启主服务后复读（可执行步骤）
 
+**安全前提**：这一步会终止一个进程，因此**只终止能核实的那个进程**。四条判据必须**同时**成立：
+① PID 与 §4 写下的身份记录一致；② 进程名是 `java.exe`/`javaw.exe`；③ 命令行指向本仓库的
+`flowdesk-bootstrap-*.jar`；④ 命令行带 `spring.profiles.active=…postgres`。
+任一条不满足就**打印证据并失败退出（exit 1）**，绝不终止无法核实的进程；身份记录缺失同样直接停止。
+
 ```powershell
-# 0) 新开的终端要先恢复环境变量（每个 shell 都要单独设置）
-$env:JAVA_HOME           = 'C:\Users\ll189\.jdks\jdk-17.0.20.1+1'
-$env:FLOWDESK_DB_URL      = 'jdbc:postgresql://127.0.0.1:5433/flowdesk'
-$env:FLOWDESK_DB_USERNAME = 'flowdesk'
-$env:FLOWDESK_DB_PASSWORD = [Environment]::GetEnvironmentVariable('FLOWDESK_DB_PASSWORD','User')
+$ErrorActionPreference = 'Stop'
 $id = '<第 4 步返回的工单 id>'
+$identityFile = "$env:TEMP\flowdesk-main.identity.json"
 
-# 1) 停止主服务：按「谁在监听 8080」定位 PID，只停那一个 java 进程
-$owner = (Get-NetTCPConnection -State Listen -LocalPort 8080 -ErrorAction SilentlyContinue).OwningProcess
-if ($owner) { Stop-Process -Id $owner -Force }
-# 等端口真正释放
-while (Get-NetTCPConnection -State Listen -LocalPort 8080 -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 1 }
+# ---------- 1) 核实「8080 的持有者」确实是 §4 启动的那个主服务 ----------
+if (-not (Test-Path -LiteralPath $identityFile)) {
+    Write-Host "[停止] 找不到身份记录 $identityFile —— 无法证明 8080 的持有者是不是本流程启动的主服务。" -ForegroundColor Red
+    Write-Host '        请用 §4 的命令启动（它会写入身份记录），或人工确认该进程后再处理；本步骤不做任何终止。'
+    exit 1
+}
+$record = Get-Content -LiteralPath $identityFile -Raw | ConvertFrom-Json
 
-# 2) 用第 4 节那条 java 命令**重新启动**主服务（另开一个窗口或后台任务）
+$conn = Get-NetTCPConnection -State Listen -LocalPort 8080 -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $conn) {
+    Write-Host '8080 上没有监听进程：主服务已停止，跳过第 1 步。'
+} else {
+    $ownerPid = [int]$conn.OwningProcess
+    $proc     = Get-CimInstance Win32_Process -Filter "ProcessId=$ownerPid"
+    $cmd      = [string]$proc.CommandLine
 
-# 3) 等主服务健康（UP）再继续
+    $isJavaProcess = ($proc.Name -ieq 'java.exe') -or ($proc.Name -ieq 'javaw.exe')
+    $isOurJar      = [bool]($cmd -match 'flowdesk-bootstrap-[^"\s]*\.jar')
+    $isPgProfile   = [bool]($cmd -match 'spring\.profiles\.active=[^"\s]*postgres')
+    $matchesRecord = ([int]$record.pid -eq $ownerPid) -and ($cmd -like "*$($record.jar)*")
+
+    if (-not ($isJavaProcess -and $isOurJar -and $isPgProfile -and $matchesRecord)) {
+        Write-Host "[停止] 8080 的持有者是 PID=$ownerPid（$($proc.Name)），但它**不是本次启动的 FlowDesk 主服务**，不做任何终止：" -ForegroundColor Red
+        Write-Host "        java 进程=$isJavaProcess；本仓库 JAR=$isOurJar；postgres profile=$isPgProfile；与身份记录一致=$matchesRecord"
+        Write-Host "        实际命令行：$cmd"
+        Write-Host '        请人工确认这是什么进程；本步骤不会强制结束无法核实的进程。'
+        exit 1
+    }
+
+    Stop-Process -Id $ownerPid -Force
+    Write-Host "已核实并停止本次启动的主服务：PID=$ownerPid"
+}
+
+# ---------- 2) 等端口释放：最多 30 秒，超时即失败退出 ----------
+$deadline = (Get-Date).AddSeconds(30)
+while (Get-NetTCPConnection -State Listen -LocalPort 8080 -ErrorAction SilentlyContinue) {
+    if ((Get-Date) -gt $deadline) {
+        Write-Host '[失败] 等待 8080 释放超时（30 秒）：主服务可能没停下来，请查日志后重试。' -ForegroundColor Red
+        exit 1
+    }
+    Start-Sleep -Milliseconds 500
+}
+Write-Host '8080 已释放。'
+
+# ---------- 3) 重新启动主服务（与 §4 相同的命令） ----------
+#     若 Start-Process 报「字典中的关键字」冲突，先执行 §4 代码块里的折叠片段再跑这一段。
+$jar = 'D:\FlowDesk\flowdesk-bootstrap\target\flowdesk-bootstrap-0.1.0-SNAPSHOT.jar'
+$env:FLOWDESK_DB_PASSWORD = [Environment]::GetEnvironmentVariable('FLOWDESK_DB_PASSWORD','User')
+$proc = Start-Process -FilePath "$env:JAVA_HOME\bin\java.exe" -PassThru -WindowStyle Hidden `
+    -RedirectStandardOutput "$env:TEMP\flowdesk-main.out.log" `
+    -RedirectStandardError  "$env:TEMP\flowdesk-main.err.log" `
+    -ArgumentList @('-jar', $jar, '--spring.profiles.active=postgres',
+        '--server.port=8080', '--server.address=127.0.0.1',
+        '--flowdesk.ai.enabled=false', '--flowdesk.knowledge.embedding.enabled=false',
+        '--flowdesk.mcp.client.enabled=false')
+@{ pid = $proc.Id; startTime = $proc.StartTime.ToString('o'); jar = $jar } |
+    ConvertTo-Json | Set-Content -LiteralPath $identityFile -Encoding UTF8
+Write-Host "已重启主服务：PID=$($proc.Id)"
+
+# ---------- 4) 等主服务 UP：最多 120 秒，超时即失败退出 ----------
+$deadline = (Get-Date).AddSeconds(120)
 $h = ''
 while ($h -ne 'UP') {
+    if ((Get-Date) -gt $deadline) {
+        Write-Host '[失败] 等待主服务健康（UP）超时（120 秒）；看 %TEMP%\flowdesk-main.out.log 定位原因。' -ForegroundColor Red
+        exit 1
+    }
     try { $h = (Invoke-RestMethod 'http://127.0.0.1:8080/actuator/health' -TimeoutSec 3).status } catch { $h = '' }
     if ($h -ne 'UP') { Start-Sleep -Seconds 2 }
 }
+Write-Host '主服务已 UP。'
 
-# 4) 复读同一张工单：应为 200
-(Invoke-WebRequest -Uri "http://127.0.0.1:8080/api/v1/tickets/$id" -UseBasicParsing).StatusCode
+# ---------- 5) 复读同一张工单：期望 200 ----------
+$r = Invoke-WebRequest -Uri "http://127.0.0.1:8080/api/v1/tickets/$id" -UseBasicParsing -TimeoutSec 15
+Write-Host ("复读状态码=" + [int]$r.StatusCode + "（期望 200）")
 
-# 5) 顺手确认迁移没有重跑（第二次启动应看到）
-#    Current version of schema "public": 6
-#    Schema "public" is up to date. No migration necessary.
+# ---------- 6) 确认迁移没有重跑（第二次启动的日志里应出现） ----------
+Select-String -LiteralPath "$env:TEMP\flowdesk-main.out.log" -Pattern 'Current version of schema|No migration necessary' |
+    ForEach-Object { $_.Line.Trim() }
 ```
 
-> 只停**自己启动的那个** java 进程（靠 8080 的持有者 PID 定位）；不要按名字批量结束 java，
-> 否则会误伤其它服务。若你是从某个会话/工具里启动的 JVM，注意关闭该会话可能连带结束它。
+> 不要按进程名批量结束 java（会误伤其它服务），也不要跳过第 1 步的核实直接 `Stop-Process`。
 
 ### 5.2 重启数据库容器后复读（先等 healthy，再读）
 
 ```powershell
-# 0) 每条 compose 命令都要求 shell 里有 FLOWDESK_DB_PASSWORD
+$ErrorActionPreference = 'Stop'
 $env:FLOWDESK_DB_PASSWORD = [Environment]::GetEnvironmentVariable('FLOWDESK_DB_PASSWORD','User')
 $id = '<第 4 步返回的工单 id>'
 
-# 1) 重启数据库容器（保留命名卷；**不要**用 down -v）
+# ---------- 1) 重启数据库容器（保留命名卷；**不要**用 down -v） ----------
 docker compose -p flowdesk -f D:\FlowDesk\compose.postgres.yml restart
+if ($LASTEXITCODE -ne 0) { Write-Host '[失败] compose restart 退出码非 0' -ForegroundColor Red; exit 1 }
 
-# 2) **等数据库 healthy**（关键：容器进程起来 ≠ 数据库可接受连接）
+# ---------- 2) 等数据库 healthy：最多 120 秒，超时即失败退出 ----------
+#     关键：容器进程起来 ≠ 数据库可接受连接；必须等 healthcheck 通过再读。
+$deadline = (Get-Date).AddSeconds(120)
 $health = ''
 while ($health -ne 'healthy') {
+    if ((Get-Date) -gt $deadline) {
+        Write-Host "[失败] 等待数据库 healthy 超时（120 秒），当前状态=$health；用 compose logs 定位原因。" -ForegroundColor Red
+        exit 1
+    }
     $health = (docker inspect --format '{{.State.Health.Status}}' flowdesk-postgres).Trim()
     if ($health -ne 'healthy') { Start-Sleep -Seconds 2 }
 }
+Write-Host '数据库已 healthy。'
 
-# 3) 只读确认数据仍在（不需要密码）
-docker exec flowdesk-postgres psql -U flowdesk -d flowdesk -tAc `
-  "SELECT COUNT(*) FROM tickets WHERE id = '$id';"          # -> 1
+# ---------- 3) 只读确认数据仍在（走容器内本地 socket，不需要密码） ----------
+$count = (docker exec flowdesk-postgres psql -U flowdesk -d flowdesk -tAc "SELECT COUNT(*) FROM tickets WHERE id = '$id';").Trim()
+Write-Host "库内行数=$count（期望 1）"
+if ($count -ne '1') { Write-Host '[失败] 重启后库内数据与预期不一致' -ForegroundColor Red; exit 1 }
 
-# 4) 再经 HTTP 读同一张工单：应为 200
-#    连接池需要重连，若**第一次**请求遇到连接类错误，重试一次即可（此时数据库已 healthy）
-(Invoke-WebRequest -Uri "http://127.0.0.1:8080/api/v1/tickets/$id" -UseBasicParsing).StatusCode
+# ---------- 4) 再经 HTTP 读同一张工单：期望 200 ----------
+#     连接池需要重连：第一次若遇到连接类错误，等 2 秒重试**一次**（最多一次，不做无限重试）。
+$status = 0
+foreach ($attempt in 1..2) {
+    try {
+        $status = [int](Invoke-WebRequest -Uri "http://127.0.0.1:8080/api/v1/tickets/$id" -UseBasicParsing -TimeoutSec 15).StatusCode
+        break
+    } catch {
+        Write-Host "第 $attempt 次请求失败：$($_.Exception.Message)"
+        if ($attempt -lt 2) { Start-Sleep -Seconds 2 }
+    }
+}
+Write-Host "复读状态码=$status（期望 200）"
+if ($status -ne 200) { Write-Host '[失败] 重启数据库容器后读不到该工单' -ForegroundColor Red; exit 1 }
 ```
 
 > 顺序很重要：**先等到 healthy 再读**。容器刚 `restart` 时进程已存在但 `pg_isready` 还没通过，
 > 这时请求会失败——那不是数据丢失，也不该被记成「重启后读不到」。
 > 真实验收中该顺序的实测结果为：容器 `StartedAt` 变化（真实重启）→ healthy → `COUNT(*)=1` → HTTP **200**。
+> 两个等待循环都带**明确超时**（端口释放 30 秒、主服务 UP 120 秒、数据库 healthy 120 秒），
+> 超时即以非零退出码失败并提示看哪个日志，不会无限等下去。
 
 ## 6. 常见问题
 
