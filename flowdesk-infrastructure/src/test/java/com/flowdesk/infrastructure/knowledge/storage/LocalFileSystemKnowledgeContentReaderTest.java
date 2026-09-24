@@ -14,18 +14,26 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * 原始内容读取端口测试（FD-0009）。
+ * 原始内容读取端口测试（FD-0009；符号链接安全边界收口见 FD-0020-F）。
  *
  * <p>读取是解析的第一步，也是唯一会把「存储内部坐标」变成数据的地方，
  * 因此这里重点验证：读到的就是当初写进去的字节、路径逃逸/符号链接/缺失对象一律拒绝、
  * 失败信息不含真实路径。</p>
+ *
+ * <p><b>符号链接用例的前提核实（FD-0020-F）</b>：实测个别 Windows 环境下
+ * {@code Files.createSymbolicLink} 返回成功，但落盘的是一个 0 字节普通文件
+ * （{@code fsutil reparsepoint query} 报「不是一个重分析点」）。
+ * 因此符号链接用例在构造后必须核实实际创建的对象确实是符号链接，
+ * 否则<b>如实跳过</b>——不能把「读到了一个普通文件」当成「拒绝了符号链接」。</p>
  */
 class LocalFileSystemKnowledgeContentReaderTest {
 
@@ -111,18 +119,22 @@ class LocalFileSystemKnowledgeContentReaderTest {
 
         Path documentsRoot = this.root.resolve("documents");
         Files.createDirectories(documentsRoot);
-        Path link = documentsRoot.resolve("kdoc-link");
-
-        try {
-            Files.createSymbolicLink(link, outside);
-        }
-        catch (IOException | UnsupportedOperationException | SecurityException ex) {
-            // Windows 上创建符号链接需要特权：无法构造该场景时跳过，而不是假装通过了测试
-            assumeTrue(false, "当前环境不支持创建符号链接，跳过");
-            return;
-        }
+        this.createSymlinkOrSkip(documentsRoot.resolve("kdoc-link"), outside);
 
         assertApplicationError(() -> this.store.openStream("kdoc-link"),
+                KnowledgeApplicationErrorCode.DOCUMENT_CONTENT_UNREADABLE);
+    }
+
+    @Test
+    void aSymlinkWithAnAbsoluteTargetOutsideTheStorageRootIsNotFollowed() throws IOException {
+        Path outside = this.tempDirectory.resolve("absolute-secret.txt");
+        Files.writeString(outside, "ABSOLUTE-OUTSIDE-SECRET", StandardCharsets.UTF_8);
+
+        Path documentsRoot = this.root.resolve("documents");
+        Files.createDirectories(documentsRoot);
+        this.createSymlinkOrSkip(documentsRoot.resolve("kdoc-abs-link"), outside.toAbsolutePath());
+
+        assertApplicationError(() -> this.store.openStream("kdoc-abs-link"),
                 KnowledgeApplicationErrorCode.DOCUMENT_CONTENT_UNREADABLE);
     }
 
@@ -160,5 +172,31 @@ class LocalFileSystemKnowledgeContentReaderTest {
                 .isInstanceOf(KnowledgeApplicationException.class)
                 .extracting(thrown -> ((KnowledgeApplicationException) thrown).errorCode())
                 .isEqualTo(expected);
+    }
+
+    /**
+     * 构造符号链接场景：创建之后<b>必须核实实际创建出来的对象</b>，
+     * 不能只凭 {@link Files#createSymbolicLink} 返回成功就认定场景已构造（FD-0020-F）。
+     *
+     * <p>实测有个别 Windows 环境下该方法<b>返回成功</b>，但落盘的是一个 0 字节普通文件 ——
+     * Win32 权威核查 {@code fsutil reparsepoint query} 报「不是一个重分析点」（错误 4390），
+     * JDK 的 NOFOLLOW 属性也报 {@code isSymbolicLink=false}。此时符号链接场景根本不存在，
+     * 测试无法覆盖，只能<b>如实跳过</b>，而不是把「读了个普通文件」当成「拒绝符号链接」通过。</p>
+     */
+    private Path createSymlinkOrSkip(Path link, Path target) throws IOException {
+        try {
+            Files.createSymbolicLink(link, target);
+        }
+        catch (IOException | UnsupportedOperationException | SecurityException ex) {
+            // Windows 上创建符号链接需要特权：无法构造该场景时跳过，而不是假装通过了测试
+            assumeTrue(false, "当前环境不支持创建符号链接（" + ex.getClass().getSimpleName() + "），跳过");
+        }
+        BasicFileAttributes attributes =
+                Files.readAttributes(link, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        assumeTrue(attributes.isSymbolicLink(),
+                "createSymbolicLink 返回成功，但实际创建的对象不是符号链接（NOFOLLOW 属性 isSymbolicLink=false，"
+                        + "isRegularFile=" + attributes.isRegularFile() + "，size=" + attributes.size()
+                        + "）：平台无法构造符号链接场景，跳过");
+        return link;
     }
 }

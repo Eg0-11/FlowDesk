@@ -186,9 +186,18 @@ public final class LocalFileSystemKnowledgeContentStore
                 throw new KnowledgeApplicationException(
                         KnowledgeApplicationErrorCode.DOCUMENT_CONTENT_UNREADABLE, "原始内容不可读");
             }
-            return Files.newInputStream(target, StandardOpenOption.READ);
+            // 打开动作本身也不跟随符号链接：打开前的检查与真正的 open 之间存在 TOCTOU 窗口，
+            // 而且个别平台会把符号链接误报成普通文件（FD-0020-F 实测）。NOFOLLOW 让 open
+            // 落在链接对象本身而不是目标内容；当前文件系统无法保证这一点时（提供方抛出
+            // UnsupportedOperationException，或 open 以 ELOOP 等 IOException 失败）一律按
+            // 「原始内容不可读」拒绝 —— 绝不退化为跟随链接。
+            return Files.newInputStream(target, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS);
         }
         catch (IOException ex) {
+            throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.DOCUMENT_CONTENT_UNREADABLE,
+                    "原始内容不可读", ex);
+        }
+        catch (UnsupportedOperationException ex) {
             throw new KnowledgeApplicationException(KnowledgeApplicationErrorCode.DOCUMENT_CONTENT_UNREADABLE,
                     "原始内容不可读", ex);
         }
