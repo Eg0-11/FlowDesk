@@ -1,6 +1,6 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0020-F —— 收口知识文件读取的符号链接安全边界（open 时 NOFOLLOW + 测试核实实际创建对象）（已完成）**
+> **当前阶段：FD-0021 —— 主服务只监听本机回环（启动期闸门 + 真实启动测试）（已完成）**
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
@@ -115,7 +115,11 @@
 > 游标分页、PostgreSQL 全文检索与 pg_trgm、真实资产/监控数据源、
 > 把远端能力注册为模型工具（需要单独的权限与审计设计）、
 > 图上的并行节点/循环/人工审批、
-> 鉴权与前端（**当前没有前端页面**：浏览器打开主服务根地址不等于打开产品界面）。
+> 鉴权与前端（**当前没有前端页面**：浏览器打开主服务根地址不等于打开产品界面；
+> **主服务当前没有鉴权**，因此启动期强制只监听**本机回环**：`server.address` 只接受字面量回环
+> （`127.0.0.0/8` 或 `::1`），用命令行或环境变量把它覆盖成 `0.0.0.0`、`::`、局域网/公网地址
+> 或主机名（含 `localhost`）都会在**创建 Web 服务器之前**失败 —— 见 FD-0021；
+> **将来若要远程访问，必须先单独设计鉴权与授权**，本阶段不提供任何远程暴露方式）。
 
 ## 一、项目简介
 
@@ -880,6 +884,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0020-F | **收口知识文件读取的符号链接安全边界**：①先做平台取证 —— 本机 `Files.createSymbolicLink` 返回成功但落盘的是 0 字节普通文件（Win32 权威核查：`LinkType` 为空、`fsutil reparsepoint query` 报错误 4390「不是一个重分析点」；沙箱内外一致；非 JDK 误判），即该平台**无法构造真实符号链接场景**；②修复 `openStream`：除打开前检查外，把**打开动作本身**也改为 `LinkOption.NOFOLLOW_LINKS`（收口 TOCTOU 窗口），文件系统无法保证「打开不跟随」时按 `DOCUMENT_CONTENT_UNREADABLE` 拒绝，**绝不退化为跟随**；③测试重构为「先核实实际创建的对象是符号链接（NOFOLLOW 属性），否则如实跳过」，并新增「绝对路径指向存储根外」用例；④全仓 `clean test` / `clean package`（**不排除任何测试**）均 **BUILD SUCCESS**：infrastructure **685 项 / 0 失败 / 28 跳过**（26 Testcontainers 因 Docker 未运行 + 2 符号链接用例因平台无法构造场景），区分「通过」与「因权限跳过」 | ✅ 已完成 |
 | FD-0020-G | **补 Linux/容器环境的真实符号链接拒绝测试 + 部署约束**：①相对/绝对两个链接用例改为**真正不同的目标写法**（相对目标以链接所在目录为基准 `../../` 出根；绝对目标直接指向根外）；②在可创建真实符号链接的 Linux 容器（`maven:3.9-eclipse-temurin-17`，源码复制进容器自身文件系统）中执行拒绝测试：**`Tests run: 11, Failures: 0, Errors: 0, Skipped: 0`** —— 两个符号链接用例**真实执行（非跳过）且通过**，BUILD SUCCESS；③Windows 本机全仓 `clean test` / `clean package`（无排除）均 **BUILD SUCCESS**（reader 类 `11 项 / 0 失败 / 2 项平台跳过`），通过与跳过如实区分；④评估「`documents/` 或其上级被替换为链接」的读取边界：**「上级目录不可被替换」是必须落实的部署前提、不是代码已经解决的边界**，部署约束与残留风险已写入第十五章边界表；真实「最终文件符号链接」的拒绝测试已在 Linux 容器实测通过（`11 项 / 0 失败 / 0 跳过`） | ✅ 已完成 |
 | 后续 | 问答流式输出与会话记忆（当前为一次性完整响应、无历史轮次） | 未开始 |
+| FD-0021 | **主服务只监听本机回环（监听边界收口）**：①交付默认配置新增 `server.address: 127.0.0.1`（配 `server.port: 8080`）；②新增**最早一道闸门** `MainServiceBindingGuard`（`ApplicationEnvironmentPreparedEvent`，运行在创建 Web 服务器**之前**）校验**最终生效**的 `server.address`：只接受字面量回环（`127.0.0.0/8` 或 IPv6 回环 `::1`），`0.0.0.0`、`::`、局域网/公网地址、主机名（含 `localhost`）、空值一律拒绝，错误文案固定且不回显配置原值；命令行/环境变量等高优先级属性源同样绕不过（另有装配期第二道闸门作为兜底）；③新增真实启动测试（真实主服务上下文 + 真实 Tomcat）：默认与显式回环可启动、`::1` 可用时可启动、非法配置在创建服务器前失败且**拒绝后端口无任何监听**、非回环地址不可达、高优先级属性源无法绕过；④核对既有本地脚本与 PostgreSQL/DeepSeek 启动方式：均显式传 `--server.address=127.0.0.1` 或依赖新默认值，不受影响 | ✅ 已完成 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm`（混合检索） | 未开始 |
 | 后续 | 孤立文件清理任务 | 未开始 |
 | 后续 | Tool 体系扩展：面向工单与知识的工具注册 | 未开始 |
@@ -925,6 +930,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | PostgreSQL / pgvector（Testcontainers） | ✅ **POSTGRESQL_PGVECTOR_IT = RUN** | 本机已安装并运行 Docker Desktop（CLI 29.8.0，daemon `OSTYPE=linux`）。两个 Testcontainers 集成测试类（镜像固定 `pgvector/pgvector:0.8.6-pg16`）**定向执行：26 运行 / 26 通过 / 0 跳过**（15 条索引写入 + 11 条相似度检索），连跑两轮结果一致；`flowdesk-infrastructure` 模块全量在 FD-0020-B 时为 **684 项 / 0 失败 / 1 项跳过**（当时符号链接用例因本机无法创建符号链接而跳过）。**现行结果（FD-0020-F）**：模块全量为 **685 项 / 0 失败 / 28 项跳过**（+1 为 FD-0020-F 新增的绝对路径用例；28 = 26 项 Testcontainers 因 Docker 未运行 + 2 项符号链接用例因平台返回成功却未真正创建符号链接而如实跳过，见第十四章 FD-0020-F 行）。**边界**：这验证的是「真实 PostgreSQL 16 + pgvector 0.8.6 容器上的写入、索引与相似度检索行为」。~~「应用以 `postgres` profile 连接外部数据库的端到端联调」仍未执行~~ —— **该表述已过时**：这条链路已由 **FD-0020-C** 完成（同一容器库、Flyway V1–V6、工单 201 → 重启主服务 200 → 重启数据库容器 200），见第十章 `POSTGRES_LIVE` 行与本表 FD-0020-C 行。**仍未验证**：DashScope **重排**模型（`RERANK_LIVE = NOT_RUN`）；DeepSeek 已由 FD-0020-E 走通（见下） |
 | 真实 DashScope Embedding | ✅ **DASHSCOPE_LIVE=RUN** | 真实 DashScope 调用与整条索引/检索链路已跑通（FD-0020-D）：以 `postgres,dashscope-embedding` 两个 profile 连本地容器库，用一份任务自有的短 TXT 走完「上传 **201** → 解析 **200**（`PARSED`，1 切片）→ 索引 **200**（`INDEXED`，`chunkCount=1`、`provider=dashscope`、`model=text-embedding-v4`、`dimensions=1024`）→ 检索 **200**」；库内实测声明维度与实际维度均为 **1024**、切片数=向量数=**1**、切片摘要与向量行摘要逐一对应（join 命中 1）、切片内含文档唯一标记；检索返回的 **K1** 引用其 `documentId`/`documentVersion=4`/`chunkIndex=0`/`chunkSha256` 全部指向本次上传的文档与切片（`score≈0.6031`，`rankingMode=VECTOR_SIMILARITY`）。**付费调用规模：两次 Embedding 业务操作**（1 次文档批次 + 1 次查询），无脚本循环或重试；**未独立统计底层 HTTP 尝试次数** —— 证据只到「两次业务操作均成功、日志无 WARN/ERROR、耗时 0.6s / 0.2s」，SDK 侧允许有界重试（见第十四章）。**边界**：只上传 1 份文档、只做 1 次检索；AI 对话 / MCP / Rerank 全程关闭；未做规模与并发压测。详见第十四章 FD-0020-D 行 |
 | 真实 DeepSeek | ✅ **LIVE_SMOKE=RUN（合成知识 + 演示 MCP 的单次冒烟）** | FD-0020-E：主服务以 `postgres,dashscope-embedding,deepseek` 启动、**开启 MCP 客户端**、关闭 Rerank，两个 MCP 以 demo 模式分别监听 `127.0.0.1:8091`/`8092`；先确认三个服务健康与 MCP 演示查询（`AST-900001`）正常，再**只发一次** `POST /api/v1/ai/incident-triage` → **200**（3.6 s）：`knowledge` **FOUND**（`K1` 指向 FD-0020-D 已索引文档：`documentId=6ee2e1b8…`、`version=4`、`chunkIndex=0`、`chunkSha256` 与库内逐字一致、`score≈0.7097`）、`asset`/`monitoring` 均 **FOUND** 且 `source=DEMO`（SERVER / IN_SERVICE / DEGRADED / CPU 92%）、`executionPath` 与三来源调用相符、`grounded=true`、`usedEvidenceIds=[K1,A1,M1]` 与答案引用自洽；**人工复核**：答案明确写出「NB-2200 的失联处置流程面向边缘路由器，与服务器资产类型不匹配，其电源、上行链路、固件版本及台账编号等步骤均无对应证据支持」，**没有**把路由器流程无条件套用到服务器。MCP 侧实测各被调用 **1 次**（`asset_get` 216 ms、`monitoring_snapshot_get` 74 ms），主服务日志 0 个 ERROR/WARN、不含任何 Key。**注意口径**：这是「**合成知识 + 演示 MCP**」的单次冒烟，**不是**真实企业系统联调 —— `MCP_LIVE`（真实企业资产/监控系统）与 `RERANK_LIVE`（真实重排）**仍未通过**；底层 HTTP 尝试次数未独立统计。**本轮发现的启动缺陷**（`flowdesk.mcp.client.sdk-log-level: OFF` 被 YAML 解析成布尔）**已由 FD-0020-E-R1 修复**（yml 改为带引号 + 新增加载交付配置的启动回归测试）；当时的冒烟使用了**临时命令行覆盖**（`--flowdesk.mcp.client.sdk-log-level=OFF`），历史记录保留不改，详见第十四章 FD-0020-E 行 |
+| 主服务监听边界（FD-0021） | ✅ 已执行 | **①交付默认**：`application.yml` 增加 `server.address: 127.0.0.1`（与 `server.port: 8080`）。**②最早闸门**：`MainServiceBindingGuard` 监听 `ApplicationEnvironmentPreparedEvent`，在**上下文创建之前**校验**最终生效**的 `server.address`：只接受字面量回环（完整四段 `127.0.0.0/8` 或 IPv6 回环 `::1` 的完整写法），拒绝 `0.0.0.0`、`::`（通配 IPv6）、`192.168.x`/`10.x`/`203.0.113.7`/`2001:db8::1`、主机名（`example.com`、`my-host.local`、`localhost`）、空白与 `0127.0.0.1` 这类含糊写法；错误文案**固定**（用 `hasMessage` 与常量逐字断言）且**不回显配置原值**（对不在示例内的取值断言 `hasMessageNotContaining`）；装配期第二道闸门 `MainServiceBindingConfiguration` 共享同一判定作为兜底。**③真实启动测试**（真实 `FlowDeskApplication` 上下文 + 真实 Tomcat，随机端口，`10 项 / 0 失败 / 0 跳过`）：交付默认确实绑定 `127.0.0.1` 且**回环上真的在监听**、**同一端口在本机非回环地址上不可达**、显式 `127.0.0.1` 可启动、**`::1` 实测可启动**（该平台支持 IPv6 回环）、`0.0.0.0` 在环境准备阶段被拒且**拒绝后端口无任何监听**（异常不是 `ApplicationContextException`，说明 Web 服务器根本没被创建）、`::` 与全部非法取值被拒、模拟环境变量（更高优先级的属性源）**无法绕过**闸门。**④既有启动方式核对**：`scripts/start-local.ps1`（主服务与两个 MCP 都显式 `--server.address=127.0.0.1`）、`docs/postgres-local.md` 的 PostgreSQL 联调命令、DeepSeek 模式与文档示例**均显式传回环地址或依赖新默认值**，不受影响。**⑤边界（重要）**：主服务**没有鉴权** —— 只监听回环不等于「已授权」，本机任何进程都能调用；**将来若要远程访问，必须先单独设计鉴权与授权**，本阶段不提供任何远程暴露方式 |
 
 > **本文档只宣称已实际执行过的验证。** pgvector 的两个集成测试类已在真实
 > PostgreSQL 16 + pgvector 0.8.6 容器上跑通（26/26），应用已在同一容器库上完成

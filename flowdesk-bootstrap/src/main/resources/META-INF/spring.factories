@@ -1,0 +1,6 @@
+# 应用监听器（FD-0021）。
+#
+# 主服务必须在**创建 Web 服务器之前**就拒绝非回环的 server.address：
+# 普通单例 Bean 的装配发生在 Tomcat 绑定端口之后，因此那里校验已经太晚。
+org.springframework.context.ApplicationListener=\
+com.flowdesk.bootstrap.web.MainServiceBindingGuard

@@ -55,6 +55,12 @@ spring:
         transcription: none
 
 server:
+  # 主服务只监听本机回环（FD-0021）。这不是「默认值而已」：
+  # server.address 必须是字面量回环地址（127.0.0.0/8 或 IPv6 回环 ::1），
+  # 用命令行/环境变量把它覆盖成 0.0.0.0、::、局域网/公网地址或主机名，
+  # 都会在**创建 Web 服务器之前**失败（见 MainServiceBindingGuard），不留绕过路径。
+  # 目前主服务没有鉴权、只供本机演示；远程访问必须先单独设计鉴权与授权。
+  address: 127.0.0.1
   port: 8080
 
 management:

@@ -65,7 +65,13 @@ powershell -ExecutionPolicy Bypass -File scripts\start-local.ps1 -JdkHome 'C:\..
 | --- | --- | --- |
 | 资产 MCP | `http://127.0.0.1:8091`（MCP 端点 `/mcp`） | `--server.address=127.0.0.1 --flowdesk.asset.directory.mode=demo` |
 | 监控 MCP | `http://127.0.0.1:8092`（MCP 端点 `/mcp`） | `--server.address=127.0.0.1 --flowdesk.monitoring.source.mode=demo` |
-| 主服务 | `http://127.0.0.1:8080` | `--flowdesk.ai.enabled=false --flowdesk.knowledge.embedding.enabled=false` |
+| 主服务 | `http://127.0.0.1:8080` | `--server.address=127.0.0.1 --flowdesk.ai.enabled=false --flowdesk.knowledge.embedding.enabled=false` |
+
+> **监听边界（FD-0021）**：主服务只允许监听**本机回环**。`application.yml` 的
+> `server.address: 127.0.0.1` 只是默认值，真正的边界是启动期闸门：把 `server.address`
+> 覆盖成 `0.0.0.0`、`::`、局域网/公网地址或主机名（含 `localhost`）都会在**创建 Web 服务器之前**
+> 失败，命令行与环境变量都绕不过去。主服务**当前没有鉴权**，只供本机演示；将来要远程访问，
+> 必须先单独设计鉴权与授权。
 
 `-McpClient` 可显式打开主服务的 MCP 客户端开关，并把它指向上面两个回环服务：
 
