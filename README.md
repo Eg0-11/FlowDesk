@@ -1,6 +1,7 @@
 # FlowDesk 企业智能工单与知识运营平台
 
-> **当前阶段：FD-0021 —— 主服务只监听本机回环（启动期闸门 + 真实启动测试）（已完成）**
+> **当前阶段：FD-0022-A —— 完整演示手册 [`docs/full-demo.md`](docs/full-demo.md) 已完成（免费离线路径 + 完整三路证据路径）**
+> **本轮是文档与离线验证**：手册**没有重跑付费链路**，其中路径 B 的响应字段引用 **FD-0020-E** 的历史证据（详见第十四章）。
 > 已完成：Maven 多模块骨架与版本基线（FD-0001）、DeepSeek 接入与工具调用闭环（FD-0002）、
 > 工单领域状态机（FD-0003）、工单应用用例与乐观并发契约（FD-0004）、
 > JDBC 持久化适配器 + Flyway 迁移 + Spring 装配（FD-0005）、
@@ -895,6 +896,7 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | FD-0020-F | **收口知识文件读取的符号链接安全边界**：①先做平台取证 —— 本机 `Files.createSymbolicLink` 返回成功但落盘的是 0 字节普通文件（Win32 权威核查：`LinkType` 为空、`fsutil reparsepoint query` 报错误 4390「不是一个重分析点」；沙箱内外一致；非 JDK 误判），即该平台**无法构造真实符号链接场景**；②修复 `openStream`：除打开前检查外，把**打开动作本身**也改为 `LinkOption.NOFOLLOW_LINKS`（收口 TOCTOU 窗口），文件系统无法保证「打开不跟随」时按 `DOCUMENT_CONTENT_UNREADABLE` 拒绝，**绝不退化为跟随**；③测试重构为「先核实实际创建的对象是符号链接（NOFOLLOW 属性），否则如实跳过」，并新增「绝对路径指向存储根外」用例；④全仓 `clean test` / `clean package`（**不排除任何测试**）均 **BUILD SUCCESS**：infrastructure **685 项 / 0 失败 / 28 跳过**（26 Testcontainers 因 Docker 未运行 + 2 符号链接用例因平台无法构造场景），区分「通过」与「因权限跳过」 | ✅ 已完成 |
 | FD-0020-G | **补 Linux/容器环境的真实符号链接拒绝测试 + 部署约束**：①相对/绝对两个链接用例改为**真正不同的目标写法**（相对目标以链接所在目录为基准 `../../` 出根；绝对目标直接指向根外）；②在可创建真实符号链接的 Linux 容器（`maven:3.9-eclipse-temurin-17`，源码复制进容器自身文件系统）中执行拒绝测试：**`Tests run: 11, Failures: 0, Errors: 0, Skipped: 0`** —— 两个符号链接用例**真实执行（非跳过）且通过**，BUILD SUCCESS；③Windows 本机全仓 `clean test` / `clean package`（无排除）均 **BUILD SUCCESS**（reader 类 `11 项 / 0 失败 / 2 项平台跳过`），通过与跳过如实区分；④评估「`documents/` 或其上级被替换为链接」的读取边界：**「上级目录不可被替换」是必须落实的部署前提、不是代码已经解决的边界**，部署约束与残留风险已写入第十五章边界表；真实「最终文件符号链接」的拒绝测试已在 Linux 容器实测通过（`11 项 / 0 失败 / 0 跳过`） | ✅ 已完成 |
 | 后续 | 问答流式输出与会话记忆（当前为一次性完整响应、无历史轮次） | 未开始 |
+| FD-0022-A | **完整演示手册 + 虚构样例知识文档**：①**两条路径分清** —— **A 免费离线**（现有 `start-local`/`test-local`/`stop-local`，并说明 Basic 模式 AI 接口为何 404、`-Mode deepseek` 仍关闭 Embedding 因此**不是**完整 RAG）、**B 完整三路证据**（PostgreSQL/pgvector + DashScope Embedding + DeepSeek + 两个 demo MCP，覆盖构建 → 启动 → 上传样例 → 解析 → 索引 → 一次事件研判，逐字段写出验收要点）；②新增 `docs/samples/fictional-kb-sample.md`（明确标注**虚构、无敏感信息**，唯一标记 `FLOWDESK-DEMO-KB-2200`）；③**每一步标注是否可能产生供应商费用**，付费动作必须显式分别执行、无自动重试与循环；④**R1–R3 修正**：删掉「在免费步骤里跑 `test-local`」（它会调用 `knowledge/search`，在路径 B 下既可能计费又会误报）、修正「上传响应带 `ETag`」（实际只有解析/索引带）、`usedEvidenceIds` 按**首次出现顺序**（不保证恒为 `[K1,A1,M1]`）、样例命中改为**有条件预期**（复用卷 + `topK=1` 不保证排第一，不清卷、不盲目重发付费请求）、口令只报存在性；⑤**请求传输实测**：PowerShell 5.1 内联参数会吃掉 JSON 双引号（实测 163/175 字节）→ 改用 **UTF-8 无 BOM 文件 + `--data-binary`**，`If-Match` 用 `Invoke-WebRequest` 传（实测字面量与动态值都原样送达）；⑥**索引前置四重校验**：解析响应必须 `200`、`documentId` 等于当前文档、`status=PARSED`、`version` 有效，且发解析请求前先清空上一次的残留响应（本地模拟 7 个用例：坏输入一律**不发**索引请求） | ✅ 已完成（**文档 + 离线自测 + 本地合成端点验证**） |
 | FD-0021 | **主服务只监听本机回环（监听边界收口）**：①交付默认配置新增 `server.address: 127.0.0.1`（配 `server.port: 8080`）；②新增**最早一道闸门** `MainServiceBindingGuard`（`ApplicationEnvironmentPreparedEvent`，运行在创建 Web 服务器**之前**）校验**最终生效**的 `server.address`：只接受字面量回环（`127.0.0.0/8` 或 IPv6 回环 `::1`），`0.0.0.0`、`::`、局域网/公网地址、主机名（含 `localhost`）、空值一律拒绝，错误文案固定且不回显配置原值；命令行/环境变量等高优先级属性源同样绕不过（另有装配期第二道闸门作为兜底）；③新增真实启动测试（真实主服务上下文 + 真实 Tomcat）：默认与显式回环可启动、`::1` 可用时可启动、非法配置在创建服务器前失败且**拒绝后端口无任何监听**、非回环地址不可达、高优先级属性源无法绕过；④核对既有本地脚本与 PostgreSQL/DeepSeek 启动方式：均显式传 `--server.address=127.0.0.1` 或依赖新默认值，不受影响 | ✅ 已完成 |
 | 后续 | 游标/keyset 分页；PostgreSQL 全文检索与 `pg_trgm`（混合检索） | 未开始 |
 | 后续 | 孤立文件清理任务 | 未开始 |
@@ -943,6 +945,8 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 | 真实 DeepSeek | ✅ **LIVE_SMOKE=RUN（合成知识 + 演示 MCP 的单次冒烟）** | FD-0020-E：主服务以 `postgres,dashscope-embedding,deepseek` 启动、**开启 MCP 客户端**、关闭 Rerank，两个 MCP 以 demo 模式分别监听 `127.0.0.1:8091`/`8092`；先确认三个服务健康与 MCP 演示查询（`AST-900001`）正常，再**只发一次** `POST /api/v1/ai/incident-triage` → **200**（3.6 s）：`knowledge` **FOUND**（`K1` 指向 FD-0020-D 已索引文档：`documentId=6ee2e1b8…`、`version=4`、`chunkIndex=0`、`chunkSha256` 与库内逐字一致、`score≈0.7097`）、`asset`/`monitoring` 均 **FOUND** 且 `source=DEMO`（SERVER / IN_SERVICE / DEGRADED / CPU 92%）、`executionPath` 与三来源调用相符、`grounded=true`、`usedEvidenceIds=[K1,A1,M1]` 与答案引用自洽；**人工复核**：答案明确写出「NB-2200 的失联处置流程面向边缘路由器，与服务器资产类型不匹配，其电源、上行链路、固件版本及台账编号等步骤均无对应证据支持」，**没有**把路由器流程无条件套用到服务器。MCP 侧实测各被调用 **1 次**（`asset_get` 216 ms、`monitoring_snapshot_get` 74 ms），主服务日志 0 个 ERROR/WARN、不含任何 Key。**注意口径**：这是「**合成知识 + 演示 MCP**」的单次冒烟，**不是**真实企业系统联调 —— `MCP_LIVE`（真实企业资产/监控系统）与 `RERANK_LIVE`（真实重排）**仍未通过**；底层 HTTP 尝试次数未独立统计。**本轮发现的启动缺陷**（`flowdesk.mcp.client.sdk-log-level: OFF` 被 YAML 解析成布尔）**已由 FD-0020-E-R1 修复**（yml 改为带引号 + 新增加载交付配置的启动回归测试）；当时的冒烟使用了**临时命令行覆盖**（`--flowdesk.mcp.client.sdk-log-level=OFF`），历史记录保留不改，详见第十四章 FD-0020-E 行 |
 | 主服务监听边界（FD-0021） | ✅ 已执行 | **①交付默认**：`application.yml` 增加 `server.address: 127.0.0.1`（与 `server.port: 8080`）。**②最早闸门**：`MainServiceBindingGuard` 监听 `ApplicationEnvironmentPreparedEvent`，在**上下文创建之前**校验**最终生效**的 `server.address`：只接受字面量回环（完整四段 `127.0.0.0/8` 或 IPv6 回环 `::1` 的完整写法），拒绝 `0.0.0.0`、`::`（通配 IPv6）、`192.168.x`/`10.x`/`203.0.113.7`/`2001:db8::1`、主机名（`example.com`、`my-host.local`、`localhost`）、空白与 `0127.0.0.1` 这类含糊写法；错误文案**固定**（用 `hasMessage` 与常量逐字断言）且**不回显配置原值**（对不在示例内的取值断言 `hasMessageNotContaining`）；装配期第二道闸门 `MainServiceBindingConfiguration` 共享同一判定作为兜底。**③真实启动测试**（真实 `FlowDeskApplication` 上下文 + 真实 Tomcat，随机端口，`10 项 / 0 失败 / 0 跳过`）：交付默认确实绑定 `127.0.0.1` 且**回环上真的在监听**、**同一端口在本机非回环地址上不可达**、显式 `127.0.0.1` 可启动、**`::1` 实测可启动**（该平台支持 IPv6 回环）、`0.0.0.0` 在环境准备阶段被拒且**拒绝后端口无任何监听**（异常不是 `ApplicationContextException`，说明 Web 服务器根本没被创建）、`::` 与全部非法取值被拒、模拟环境变量（更高优先级的属性源）**无法绕过**闸门。**④既有启动方式核对**：`scripts/start-local.ps1`（主服务与两个 MCP 都显式 `--server.address=127.0.0.1`）、`docs/postgres-local.md` 的 PostgreSQL 联调命令、DeepSeek 模式与文档示例**均显式传回环地址或依赖新默认值**，不受影响。**⑤边界（重要）**：主服务**没有鉴权** —— 只监听回环不等于「已授权」，本机任何进程都能调用；**将来若要远程访问，必须先单独设计鉴权与授权**，本阶段不提供任何远程暴露方式 |
 
+| 完整演示手册（FD-0022-A） | 📄 **仅文档 + 离线验证（未重跑付费链路）** | 交付 `docs/full-demo.md` 与虚构样例 `docs/samples/fictional-kb-sample.md`；两条路径（免费离线 / 完整三路证据）与逐步费用标注见第十三章 FD-0022-A 行。**这一类验证只到**：静态核对（接口路径、`If-Match` 的 428/412、状态枚举、版本递增语义）、手册中 19 个 PowerShell 片段的语法解析（0 错误）、仓库离线自测 `scripts/self-test-local.ps1`（PASS 61 / FAIL 0 / SKIP 1）、以及**本地合成端点**上的请求传输与闸门逻辑验证（内联 JSON 丢双引号 vs 文件传字节一致；`If-Match` 原样送达；索引闸门 7 个用例坏输入不发请求）。**没有**发起任何 DashScope / DeepSeek 调用，**没有**运行路径 B 的检索与研判 —— 路径 B 的响应字段引用 **FD-0020-E** 的历史证据（见本表 FD-0020-E 行与第十三章 FD-0020-E 行）。**边界**：手册是操作与验收口径，不是新的联调证据 |
+
 > **本文档只宣称已实际执行过的验证。** pgvector 的两个集成测试类已在真实
 > PostgreSQL 16 + pgvector 0.8.6 容器上跑通（26/26），应用已在同一容器库上完成
 > `postgres` profile 的端到端联调（Flyway V1–V6；工单 **201** → **重启主服务**后 **200** →
@@ -953,6 +957,13 @@ curl.exe -X POST "http://localhost:8080/api/v1/tickets/$id/assign" `
 > 「**合成知识 + 演示 MCP 的单次冒烟**」，见第十四章 FD-0020-E 行）。
 > **仍未对真实上游发起过请求的上游**：DashScope **重排**模型（`RERANK_LIVE = NOT_RUN`）；
 > 另外 `MCP_LIVE`（真实企业资产/监控系统）也**未**验证 —— FD-0020-E 用的是本仓库的两个 demo MCP 服务。
+>
+> **口径区分（请照实引用）**：上面这些是**此前的真实上游单次验证** ——
+> `FD-0020-D` 是**真实 Embedding**、`FD-0020-E` 是**真实 DeepSeek**（各一次，均为「单次」而非压测）。
+> **`FD-0022-A` 只做文档、离线自测与本地合成端点验证**：它**没有**重跑付费链路，
+> 手册里路径 B 的字段来自 FD-0020-E 的**历史**证据，引用时不要写成「本次实测」。
+> **项目当前仍无网页前端、无鉴权**，主服务与两个 MCP 只监听本机回环，**只供本机演示**；
+> 将来若要远程访问，必须先单独设计鉴权与授权。
 
 > Spring AI Alibaba 的 BOM 已在根 pom 中导入并锁定版本；FD-0018-A 起实际使用其中的
 > `spring-ai-alibaba-graph-core`（`StateGraph`/`CompiledGraph`），版本仍由 BOM 管理，
