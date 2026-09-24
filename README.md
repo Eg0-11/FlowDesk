@@ -120,6 +120,12 @@
 > （`127.0.0.0/8` 或 `::1`），用命令行或环境变量把它覆盖成 `0.0.0.0`、`::`、局域网/公网地址
 > 或主机名（含 `localhost`）都会在**创建 Web 服务器之前**失败 —— 见 FD-0021；
 > **将来若要远程访问，必须先单独设计鉴权与授权**，本阶段不提供任何远程暴露方式）。
+>
+> **想自己跑一遍？** 见 **[`docs/full-demo.md`](docs/full-demo.md)**（完整演示手册）：
+> 两条路径 —— **A 免费离线**（只用现有脚本，不收费）与 **B 完整三路证据**
+> （PostgreSQL/pgvector + DashScope Embedding + DeepSeek + 两个 demo MCP）；
+> 每一步都标注**是否可能产生供应商费用**，并写清验收该看哪些字段（`knowledge FOUND/K1`、
+> `asset`/`monitoring FOUND` 且 `source=DEMO`、`grounded`/`usedEvidenceIds`/`executionPath`）。
 
 ## 一、项目简介
 
@@ -243,8 +249,13 @@ java -jar flowdesk-mcp-monitoring/target/flowdesk-mcp-monitoring-0.1.0-SNAPSHOT.
 `.local-run/state.json`（被 Git 忽略）。停止与检查见
 [`docs/local-run.md`](docs/local-run.md)。
 
-配置约定：三个 `application.yml` 只声明应用名、端口，并只暴露 `health`、`info` 两个 Actuator 端点；
-不写入任何密码、Token 或 API Key 字面量。DeepSeek 相关配置集中在
+**要从零走完整演示（含上传样例、解析、索引与一次事件研判），直接看
+[`docs/full-demo.md`](docs/full-demo.md)** —— 它把「免费离线路径」与「完整三路证据路径」
+分开写，并逐步标注是否可能产生供应商费用。
+
+配置约定：三个 `application.yml` 只声明应用名、端口与**只监听本机回环的 `server.address`**
+（`127.0.0.1`；非回环取值会在创建 Web 服务器前被拒绝，见 FD-0021），并只暴露 `health`、`info`
+两个 Actuator 端点；不写入任何密码、Token 或 API Key 字面量。DeepSeek 相关配置集中在
 `flowdesk-bootstrap/src/main/resources/application-deepseek.yml`，其中的 Key 只引用环境变量
 `${DEEPSEEK_API_KEY}`，默认 profile 下完全不会被激活。
 
