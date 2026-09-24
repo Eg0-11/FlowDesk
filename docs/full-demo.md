@@ -275,11 +275,22 @@ ETag 语法的一部分）。PowerShell 5.1 把内联参数交给原生 `curl.ex
 （实测 `-H 'If-Match: "0"'` 送达后变成 `If-Match: 0`），所以这里不拼命令行。
 
 ```powershell
+# 先清空：上一次尝试可能留下过一个「成功」的 $parse，先作废它，
+# 否则旧窗口里的成功响应会替本次失败放行（B7 的闸门也会再查一遍）。
+$parse = $null
 $id = '<B5 返回的 id>'
 # 这里的版本号取 B5 响应里的 version（刚上传的文档是 0），双引号必须保留
-$parse = Invoke-WebRequest -Uri "http://127.0.0.1:8080/api/v1/knowledge/documents/$id/parse" -Method POST -Headers @{ 'If-Match' = '"0"' } -UseBasicParsing
-$parse.StatusCode
-$parse.Content
+try {
+    $parse = Invoke-WebRequest -Uri "http://127.0.0.1:8080/api/v1/knowledge/documents/$id/parse" -Method POST -Headers @{ 'If-Match' = '"0"' } -UseBasicParsing
+}
+catch {
+    Write-Host 'B6 请求失败：本次流程到此停止 —— 不要执行 B7（索引可能产生供应商费用）'
+    Write-Host ('失败原因：' + $_.Exception.Message)
+}
+if ($null -ne $parse) {
+    $parse.StatusCode
+    $parse.Content
+}
 ```
 
 **预期**：`200`；响应体字段 `documentId`、`title`、`status=PARSED`、`version`、`chunkCount`（≥1）、`parsedAt`；
@@ -291,32 +302,63 @@ $parse.Content
 `KnowledgeParseApiIntegrationTest` 也断言解析后版本为 `2L`。
 
 `If-Match` 必须与**当前**版本一致：缺失得到 `428`，陈旧得到 `412` —— 这不是故障，是**乐观锁**在起作用。
-如果 B6 拿到的不是 `200`，**不要**继续 B7（原因见下）。
 
 ### B7 索引（**可能产生供应商费用：DashScope Embedding，1 次文档批次**）
 
-> **① 先确认 B6 是 `200`，再执行本步**：B7 是本手册第一个付费动作。下面的脚本把这件事写成显式闸门。
-> **② 版本号从 B6 的成功响应里读出来，动态拼 `If-Match`**，**不要**写死成 `"1"`
+> **① 四重闸门全过才发索引**：B6 拿到 `200`、响应的 `documentId` **就是当前这份文档**、
+> `status=PARSED`、`version` 是**有效**版本号。任何一条不满足都**不发**索引请求。
+> 这样「上次成功、本次失败」以及「响应其实属于另一个文档」都不会误放行。
+> **② 不重新输入 ID**：下面用的就是 B6 里那个 `$id`；**B7 里不要再粘贴一个 ID**
+> —— 否则校验的可能是另一份文档。
+> **③ 版本号从响应里读，动态拼 `If-Match`**，**不要**写死成 `"1"`
 > （解析成功后 `"1"` 已经是**陈旧**版本，会得到 **412**；`KnowledgeIndexWebTests` 里那条
 > `staleIfMatchIsRejectedWith412AndNoSideEffects` 正是用 `"1"` 演示这件事）。
-> **③** 索引同样由「领取 +1、完成 +1」两次更新构成，最终版本**以响应为准**（从解析后的 `2` 出发通常是 `4`）。
-> **④** B6、B7 要在**同一个 PowerShell 窗口**里执行，B7 会用到 B6 留下的变量。
+> **④** 索引同样由「领取 +1、完成 +1」两次更新构成，最终版本**以响应为准**（从解析后的 `2` 出发通常是 `4`）。
+> **⑤** B6、B7 要在**同一个 PowerShell 窗口**里执行，B7 会用到 B6 留下的 `$id` 与 `$parse`。
 
 ```powershell
-# --- 付费前的闸门：B6 必须是 200 ---
-if (-not $parse -or $parse.StatusCode -ne 200) {
-    Write-Host 'B6 未成功（没有 200）：不要执行 B7 —— 索引可能产生供应商费用'
-    return
+# --- 付费前的闸门：四项都过，才允许发出索引请求 ---
+$parsed = $null
+if ($null -ne $parse -and $parse.StatusCode -eq 200) {
+    try { $parsed = $parse.Content | ConvertFrom-Json } catch { $parsed = $null }
 }
-$id = '<B5 返回的 id>'
-$version = ($parse.Content | ConvertFrom-Json).version    # 解析成功后的版本，新文档通常是 2
-$etag = '"' + $version + '"'                              # 保留双引号：If-Match 的值形如 "2"
-Write-Host "解析后版本 = $version；索引将携带 If-Match: $etag"
+$version = $null
+if ($null -ne $parsed) {
+    try { $version = [long]$parsed.version } catch { $version = $null }
+}
 
-# --- 闸门通过，才执行这个可能计费的调用；只执行一次 ---
-$index = Invoke-WebRequest -Uri "http://127.0.0.1:8080/api/v1/knowledge/documents/$id/index" -Method POST -Headers @{ 'If-Match' = $etag } -UseBasicParsing
-$index.StatusCode
-$index.Content
+$problems = @()
+if ($null -eq $parse -or $parse.StatusCode -ne 200) {
+    $problems += 'B6 没有拿到 200（或本次 B6 请求失败）'
+}
+elseif ($null -eq $parsed) {
+    $problems += 'B6 的响应体不是合法 JSON'
+}
+else {
+    if ("$($parsed.documentId)" -ne "$id") {
+        $problems += ('响应对应的文档不是当前这份：响应 documentId=' + $parsed.documentId + '，当前 $id=' + $id)
+    }
+    if ("$($parsed.status)" -ne 'PARSED') {
+        $problems += ('解析响应的 status 不是 PARSED：实际 ' + $parsed.status)
+    }
+    if ($null -eq $version -or $version -le 0) {
+        $problems += '解析响应的 version 不是有效版本号'
+    }
+}
+
+if ($problems.Count -gt 0) {
+    Write-Host '不满足索引前置条件，已停止：不要执行索引（它可能产生供应商费用）：'
+    $problems | ForEach-Object { Write-Host (' - ' + $_) }
+}
+else {
+    $etag = '"' + $version + '"'
+    Write-Host "解析后版本 = $version；索引将携带 If-Match: $etag（只执行一次）"
+
+    # --- 闸门通过，才执行这个可能计费的调用 ---
+    $index = Invoke-WebRequest -Uri "http://127.0.0.1:8080/api/v1/knowledge/documents/$id/index" -Method POST -Headers @{ 'If-Match' = $etag } -UseBasicParsing
+    $index.StatusCode
+    $index.Content
+}
 ```
 
 **预期**：`200`；字段 `documentId`、`title`、`status=INDEXED`、`version`、`chunkCount`、
