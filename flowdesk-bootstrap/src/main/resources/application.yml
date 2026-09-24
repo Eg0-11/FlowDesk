@@ -91,7 +91,10 @@ flowdesk:
       #   允许值：OFF / ERROR / WARN / INFO / DEBUG / TRACE（其它值启动失败）；
       #   排障时临时打开的风险见 README 二十三.5：会把远端原文与内部细节写进日志。
       # 本项目自己的固定元数据查询日志（mcp query completed …）不受这个开关影响。
-      sdk-log-level: OFF
+      # 必须带引号：裸标量 OFF 会被 YAML 解析成布尔 false，绑定到 String 字段得到 "false"，
+      # 启用 MCP 客户端时装配失败（FD-0020-E 实测，回归测试见
+      # McpClientSdkLogLevelStartupRegressionTest）。
+      sdk-log-level: "OFF"
 
   knowledge:
     upload:
