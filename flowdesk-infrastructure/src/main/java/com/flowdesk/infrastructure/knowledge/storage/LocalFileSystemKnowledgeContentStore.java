@@ -194,11 +194,14 @@ public final class LocalFileSystemKnowledgeContentStore
                 throw new KnowledgeApplicationException(
                         KnowledgeApplicationErrorCode.DOCUMENT_CONTENT_UNREADABLE, "原始内容不可读");
             }
-            // 打开动作本身也不跟随符号链接：打开前的检查与真正的 open 之间存在 TOCTOU 窗口；
-            // 而且 FD-0020-F 取证发现，个别环境下 createSymbolicLink 返回成功、落盘对象却不是链接
-            // （Win32 权威核查：fsutil reparsepoint query 报「不是一个重分析点」）—— 这类对象
-            // 过不了「按符号链接识别」的防线，因此必须在 open 这一步再拦一道。NOFOLLOW 让 open
-            // 落在链接对象本身而不是目标内容；当前文件系统无法保证这一点时（提供方抛出
+            // 打开动作本身也带 NOFOLLOW：打开前的检查与真正的 open 之间存在 TOCTOU 窗口，
+            // NOFOLLOW 的实际作用是防止真正的「最终文件符号链接」在打开时被跟随 ——
+            // 包括检查与打开之间被换入链接的情况。
+            // 说明：FD-0020-F 取证发现，本机 createSymbolicLink 返回成功、落盘的却是一个
+            // 0 字节普通文件（fsutil reparsepoint query 报「不是一个重分析点」）—— 它不是
+            // 符号链接，NOFOLLOW 不会拒绝普通文件，也不存在「跟随它读到外部内容」的问题；
+            // 真正的符号链接拒绝场景已在 Linux 容器实测通过（FD-0020-G，Tests run: 11,
+            // Skipped: 0）。当前文件系统无法保证「打开不跟随」时（提供方抛出
             // UnsupportedOperationException，或 open 以 ELOOP 等 IOException 失败）一律按
             // 「原始内容不可读」拒绝 —— 绝不退化为跟随链接。
             return Files.newInputStream(target, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS);
