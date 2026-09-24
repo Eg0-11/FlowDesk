@@ -167,9 +167,12 @@ public final class LocalFileSystemKnowledgeContentStore
      * （提供方不支持该选项、open 以 ELOOP 等失败），都只抛出稳定错误码
      * {@code DOCUMENT_CONTENT_UNREADABLE}，<b>不</b>包含真实路径，也<b>绝不</b>退化为跟随。</p>
      *
-     * <p><b>边界</b>：这里防御的是<b>内容键驱动</b>的逃逸；存储目录树本身（如 {@code documents/}
-     * 或其上级）被本地写权限攻击者替换成链接不在本内容键威胁模型内 —— 那依赖部署侧保证
-     * 只有服务进程账户可写存储树（部署约束与残留风险见 README 第十五章）。</p>
+     * <p><b>边界</b>：这里防御的是<b>内容键驱动</b>的逃逸；指向存储根之外的最终文件符号链接
+     * 会被拒绝，该拒绝测试已在可创建真实符号链接的 Linux 容器中实测通过
+     * （{@code Tests run: 11, Failures: 0, Errors: 0, Skipped: 0}，FD-0020-G）。
+     * 但「{@code documents/} 或其上级不可被替换成链接」是<b>必须落实的部署前提</b>，
+     * <b>不是代码已经解决的边界</b> —— 它依赖部署侧保证只有服务进程账户可写存储树
+     * （部署约束与残留风险见 README 第十五章）。</p>
      *
      * @param contentKey 服务端生成的内容键
      * @return 内容输入流，由调用方关闭
