@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>FlowDesk 本机演示入口</title>
+    <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="page-header">
+    <h1>FlowDesk 本机演示入口</h1>
+    <p class="notice">
+        这是供<b>本机演示</b>用的最小网页入口：主服务只监听 <code>127.0.0.1</code>，
+        <b>没有鉴权</b>，不要用于远程访问或生产环境。
+    </p>
+    <nav class="page-nav">
+        <a href="#home">首页</a>
+        <a href="#status">服务状态</a>
+        <a href="#tickets">工单列表</a>
+        <span class="nav-todo">后续页面：知识库 / AI 研判（尚未实现）</span>
+    </nav>
+</header>
+
+<main>
+    <section id="home">
+        <h2>首页</h2>
+        <p>本页由主服务同源提供，页面里的所有接口请求都使用相对路径（<code>/api/v1/...</code>）。</p>
+        <ul>
+            <li>页面加载时<b>只</b>请求服务自身的健康端点，<b>不</b>调用索引、检索或 AI 接口，因此不产生任何模型费用。</li>
+            <li>工单列表按需加载（点下面的按钮），走 <code>GET /api/v1/tickets</code>。</li>
+            <li>当前阶段只提供首页、导航、服务状态与工单列表入口；知识库与 AI 研判页面尚未实现。</li>
+        </ul>
+    </section>
+
+    <section id="status">
+        <h2>服务状态</h2>
+        <p>主服务自身健康：<span id="health-main" class="pending">检查中…</span></p>
+        <p class="hint">
+            两个 MCP 服务（默认 <code>127.0.0.1:8091</code> / <code>127.0.0.1:8092</code>）是独立的本地进程，
+            对浏览器而言属于跨源，本页<b>不</b>探测它们；需要核对时请用 <code>scripts/test-local.ps1</code>
+            或直接 curl 它们的 <code>/actuator/health</code>。
+        </p>
+    </section>
+
+    <section id="tickets">
+        <h2>工单列表</h2>
+        <p>
+            <button id="load-tickets" type="button">加载最近工单</button>
+            <span id="tickets-meta" class="hint"></span>
+        </p>
+        <div id="tickets-error" class="error" hidden></div>
+        <table id="tickets-table" hidden>
+            <thead>
+            <tr>
+                <th>编号</th>
+                <th>标题</th>
+                <th>状态</th>
+                <th>优先级</th>
+                <th>提交人</th>
+            </tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+    </section>
+</main>
+
+<footer class="page-footer">
+    <p class="hint">FlowDesk · 本机回环演示 · 无鉴权 · 无前端框架与外部依赖</p>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

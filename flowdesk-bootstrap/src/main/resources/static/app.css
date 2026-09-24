@@ -1,0 +1,154 @@
+/* FlowDesk 本机演示入口样式：浅色、无外部依赖。 */
+:root {
+    --ink: #1f2328;
+    --muted: #59636e;
+    --line: #d8dee4;
+    --bg: #ffffff;
+    --panel: #f6f8fa;
+    --ok: #1a7f37;
+    --warn: #9a6700;
+    --failed: #cf222e;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    padding: 0 20px 40px;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+}
+
+.page-header {
+    padding: 24px 0 8px;
+    border-bottom: 1px solid var(--line);
+}
+
+h1 {
+    margin: 0 0 8px;
+    font-size: 24px;
+}
+
+h2 {
+    margin: 0 0 10px;
+    font-size: 18px;
+}
+
+.notice {
+    margin: 0 0 14px;
+    padding: 10px 12px;
+    background: var(--panel);
+    border-left: 3px solid var(--line);
+    color: var(--muted);
+}
+
+.page-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    align-items: center;
+    padding-bottom: 6px;
+}
+
+.page-nav a {
+    color: #0969da;
+    text-decoration: none;
+}
+
+.page-nav a:hover {
+    text-decoration: underline;
+}
+
+.nav-todo {
+    color: var(--muted);
+    font-size: 13px;
+}
+
+main section {
+    padding: 22px 0;
+    border-bottom: 1px solid var(--line);
+}
+
+code {
+    padding: 1px 5px;
+    background: var(--panel);
+    border-radius: 4px;
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 13px;
+}
+
+button {
+    padding: 6px 14px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--panel);
+    color: var(--ink);
+    font-size: 14px;
+    cursor: pointer;
+}
+
+button:hover {
+    background: #eef1f4;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 12px;
+}
+
+th,
+td {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--line);
+    text-align: left;
+    font-size: 14px;
+    vertical-align: top;
+    word-break: break-word;
+}
+
+th {
+    background: var(--panel);
+    font-weight: 600;
+}
+
+.hint {
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.ok {
+    color: var(--ok);
+    font-weight: 600;
+}
+
+.warn {
+    color: var(--warn);
+    font-weight: 600;
+}
+
+.pending {
+    color: var(--muted);
+}
+
+.failed {
+    color: var(--failed);
+    font-weight: 600;
+}
+
+.error {
+    margin-top: 10px;
+    padding: 10px 12px;
+    background: #fff5f5;
+    border-left: 3px solid var(--failed);
+    color: var(--failed);
+    font-size: 13px;
+    word-break: break-all;
+}
+
+.page-footer {
+    padding-top: 18px;
+}
