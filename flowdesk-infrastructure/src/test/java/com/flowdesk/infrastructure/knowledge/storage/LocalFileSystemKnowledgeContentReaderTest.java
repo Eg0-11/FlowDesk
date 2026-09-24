@@ -113,13 +113,16 @@ class LocalFileSystemKnowledgeContentReaderTest {
     }
 
     @Test
-    void symbolicLinksAreNotFollowed() throws IOException {
+    void aSymlinkWithARelativeTargetOutsideTheStorageRootIsNotFollowed() throws IOException {
         Path outside = this.tempDirectory.resolve("secret-target.txt");
         Files.writeString(outside, "OUTSIDE-SECRET", StandardCharsets.UTF_8);
 
         Path documentsRoot = this.root.resolve("documents");
         Files.createDirectories(documentsRoot);
-        this.createSymlinkOrSkip(documentsRoot.resolve("kdoc-link"), outside);
+        // 相对目标：以链接所在目录（<root>/documents）为基准向上两级，落在存储根之外 ——
+        // 与绝对路径用例使用的是两种不同的链接写法。
+        this.createSymlinkOrSkip(documentsRoot.resolve("kdoc-link"),
+                Path.of("..", "..", "secret-target.txt"));
 
         assertApplicationError(() -> this.store.openStream("kdoc-link"),
                 KnowledgeApplicationErrorCode.DOCUMENT_CONTENT_UNREADABLE);

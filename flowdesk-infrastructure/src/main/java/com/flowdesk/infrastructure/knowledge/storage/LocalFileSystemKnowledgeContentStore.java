@@ -161,10 +161,15 @@ public final class LocalFileSystemKnowledgeContentStore
      * <p>读写两个端口由同一个适配器实现是<b>有意</b>的：它们共享同一套路径安全解析
      * （字符集白名单 + 必须仍在存储根目录内），拆成两个类只会把这段安全逻辑复制两份。</p>
      *
-     * <p>只读取<b>普通文件</b>且<b>不跟随符号链接</b>：{@code isRegularFile(..., NOFOLLOW_LINKS)}
-     * 对符号链接返回 {@code false}，因此指向根目录之外（甚至指向 {@code /etc/passwd}）的链接
-     * 在这里就被拒绝，而不是等到读出来才发现。异常只携带稳定错误码，
-     * <b>不</b>包含真实路径。</p>
+     * <p>只读取<b>普通文件</b>且<b>不跟随符号链接</b>：打开前用 {@code isRegularFile(..., NOFOLLOW_LINKS)}
+     * 拒绝符号链接与目录；真正 open 时同样带 {@code NOFOLLOW_LINKS}，把「检查之后、打开之前」的
+     * TOCTOU 窗口也收掉（FD-0020-F）。任一检查失败、或当前文件系统无法保证「打开不跟随」
+     * （提供方不支持该选项、open 以 ELOOP 等失败），都只抛出稳定错误码
+     * {@code DOCUMENT_CONTENT_UNREADABLE}，<b>不</b>包含真实路径，也<b>绝不</b>退化为跟随。</p>
+     *
+     * <p><b>边界</b>：这里防御的是<b>内容键驱动</b>的逃逸；存储目录树本身（如 {@code documents/}
+     * 或其上级）被本地写权限攻击者替换成链接不在本内容键威胁模型内 —— 那依赖部署侧保证
+     * 只有服务进程账户可写存储树（部署约束与残留风险见 README 第十五章）。</p>
      *
      * @param contentKey 服务端生成的内容键
      * @return 内容输入流，由调用方关闭
@@ -186,8 +191,10 @@ public final class LocalFileSystemKnowledgeContentStore
                 throw new KnowledgeApplicationException(
                         KnowledgeApplicationErrorCode.DOCUMENT_CONTENT_UNREADABLE, "原始内容不可读");
             }
-            // 打开动作本身也不跟随符号链接：打开前的检查与真正的 open 之间存在 TOCTOU 窗口，
-            // 而且个别平台会把符号链接误报成普通文件（FD-0020-F 实测）。NOFOLLOW 让 open
+            // 打开动作本身也不跟随符号链接：打开前的检查与真正的 open 之间存在 TOCTOU 窗口；
+            // 而且 FD-0020-F 取证发现，个别环境下 createSymbolicLink 返回成功、落盘对象却不是链接
+            // （Win32 权威核查：fsutil reparsepoint query 报「不是一个重分析点」）—— 这类对象
+            // 过不了「按符号链接识别」的防线，因此必须在 open 这一步再拦一道。NOFOLLOW 让 open
             // 落在链接对象本身而不是目标内容；当前文件系统无法保证这一点时（提供方抛出
             // UnsupportedOperationException，或 open 以 ELOOP 等 IOException 失败）一律按
             // 「原始内容不可读」拒绝 —— 绝不退化为跟随链接。
