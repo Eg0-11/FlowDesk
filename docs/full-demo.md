@@ -270,39 +270,61 @@ $resp
 
 ### B6 解析（不产生费用；本地 Tika，不调用模型）
 
-**这一步用 `Invoke-WebRequest`，并把 `If-Match` 写成带双引号的字面量**：
-PowerShell 5.1 把内联参数交给原生 `curl.exe` 时会吃掉参数里的双引号，而 `If-Match` 的值
-**必须**是带引号的版本号（`"0"`）；实测拼接出来的写法可能送不到服务端，所以这里用字面量。
+**这一步用 `Invoke-WebRequest`**：`If-Match` 的值**必须**是带双引号的版本号（`"0"` 这种形式，引号是
+ETag 语法的一部分）。PowerShell 5.1 把内联参数交给原生 `curl.exe` 时会吃掉参数里的双引号
+（实测 `-H 'If-Match: "0"'` 送达后变成 `If-Match: 0`），所以这里不拼命令行。
 
 ```powershell
 $id = '<B5 返回的 id>'
-# 注意这里保留双引号：值就是 "0"（引号是 ETag 语法的一部分）
-$resp = Invoke-WebRequest -Uri "http://127.0.0.1:8080/api/v1/knowledge/documents/$id/parse" -Method POST -Headers @{ 'If-Match' = '"0"' } -UseBasicParsing
-$resp.StatusCode
-$resp.Content
+# 这里的版本号取 B5 响应里的 version（刚上传的文档是 0），双引号必须保留
+$parse = Invoke-WebRequest -Uri "http://127.0.0.1:8080/api/v1/knowledge/documents/$id/parse" -Method POST -Headers @{ 'If-Match' = '"0"' } -UseBasicParsing
+$parse.StatusCode
+$parse.Content
 ```
 
-**预期**：`200`；响应体字段 `documentId`、`title`、`status=PARSED`、`version`（已 +1）、
-`chunkCount`（≥1）、`parsedAt`，并且**响应带 `ETag`**（内容是新版本号）。
+**预期**：`200`；响应体字段 `documentId`、`title`、`status=PARSED`、`version`、`chunkCount`（≥1）、`parsedAt`；
+响应带 `ETag`。
 
-`If-Match` 必须与当前版本一致：缺失会得到 `428`，陈旧会得到 `412` —— 这不是故障，是**乐观锁**在起作用。
-（若你的文档版本已经不是 `0`，把上面字面量里的 `0` 换成当前版本号，**保留双引号**。）
+**关于版本号（别写成「只加 1」）**：解析是**两次**更新 —— 先**领取**（`UPLOADED`/`PARSE_FAILED` → `PARSING`，版本 +1），
+完成后再置为 `PARSED`（版本再 +1）。所以刚上传的文档（`version=0`）**解析成功后通常是 `2`**。
+这一点有现成测试兜着：`KnowledgeDocumentParsingServiceTest` 的断言就写着「领取 +1、完成 +1」= `2L`，
+`KnowledgeParseApiIntegrationTest` 也断言解析后版本为 `2L`。
+
+`If-Match` 必须与**当前**版本一致：缺失得到 `428`，陈旧得到 `412` —— 这不是故障，是**乐观锁**在起作用。
+如果 B6 拿到的不是 `200`，**不要**继续 B7（原因见下）。
 
 ### B7 索引（**可能产生供应商费用：DashScope Embedding，1 次文档批次**）
 
-> 这是本手册第一个**付费动作**。只执行一次；失败就停下看错误码，不要循环重试。
+> **① 先确认 B6 是 `200`，再执行本步**：B7 是本手册第一个付费动作。下面的脚本把这件事写成显式闸门。
+> **② 版本号从 B6 的成功响应里读出来，动态拼 `If-Match`**，**不要**写死成 `"1"`
+> （解析成功后 `"1"` 已经是**陈旧**版本，会得到 **412**；`KnowledgeIndexWebTests` 里那条
+> `staleIfMatchIsRejectedWith412AndNoSideEffects` 正是用 `"1"` 演示这件事）。
+> **③** 索引同样由「领取 +1、完成 +1」两次更新构成，最终版本**以响应为准**（从解析后的 `2` 出发通常是 `4`）。
+> **④** B6、B7 要在**同一个 PowerShell 窗口**里执行，B7 会用到 B6 留下的变量。
 
 ```powershell
+# --- 付费前的闸门：B6 必须是 200 ---
+if (-not $parse -or $parse.StatusCode -ne 200) {
+    Write-Host 'B6 未成功（没有 200）：不要执行 B7 —— 索引可能产生供应商费用'
+    return
+}
 $id = '<B5 返回的 id>'
-# 版本号换成 B6 响应里的 version，保留双引号
-$resp = Invoke-WebRequest -Uri "http://127.0.0.1:8080/api/v1/knowledge/documents/$id/index" -Method POST -Headers @{ 'If-Match' = '"1"' } -UseBasicParsing
-$resp.StatusCode
-$resp.Content
+$version = ($parse.Content | ConvertFrom-Json).version    # 解析成功后的版本，新文档通常是 2
+$etag = '"' + $version + '"'                              # 保留双引号：If-Match 的值形如 "2"
+Write-Host "解析后版本 = $version；索引将携带 If-Match: $etag"
+
+# --- 闸门通过，才执行这个可能计费的调用；只执行一次 ---
+$index = Invoke-WebRequest -Uri "http://127.0.0.1:8080/api/v1/knowledge/documents/$id/index" -Method POST -Headers @{ 'If-Match' = $etag } -UseBasicParsing
+$index.StatusCode
+$index.Content
 ```
 
 **预期**：`200`；字段 `documentId`、`title`、`status=INDEXED`、`version`、`chunkCount`、
 `embeddingProvider=dashscope`、`embeddingModel=text-embedding-v4`、`embeddingDimensions=1024`、`indexedAt`；
 响应同样带 `ETag`。
+
+（`ConvertFrom-Json` 只需要读 `version` 这个数字：PowerShell 5.1 显示响应内容时会按 Latin-1 解码、
+中文会乱码，但那只是**显示**问题，JSON 解析与 `version` 取值不受影响。）
 
 ### B8 可选：一次检索（**可能产生供应商费用：1 次查询 Embedding**）
 
@@ -361,7 +383,7 @@ Get-Content -LiteralPath $respPath -Raw -Encoding UTF8
 | `requestId` | 有值 | 本次请求的标识 |
 | `knowledge.status` | `FOUND` | 知识路确实检索到了切片（**不保证**检索到的就是本样例，见下） |
 | `knowledge.retrieval.citations[0].documentId` | 期望等于 B5 的 `id` | 指向你上传的那份文档；若指向**别的** `documentId`，说明库里已有更相近的切片（见下面的条件说明） |
-| 该引用的 `documentVersion` | 与 B7 返回的版本一致（通常 = B7 的 `version`） | 引用的是**当前版本** |
+| 该引用的 `documentVersion` | 与 B7 返回的版本一致（解析后通常 `2`、索引后通常 `4`；以 B7 响应为准） | 引用的是**当前版本**（FD-0020-E 的历史证据里就是 `4`） |
 | 该引用的 `chunkSha256` | 一段**独立**的摘要 | 它是**切片内容**的摘要，与 B5 里的 `sha256`（**整份文件**摘要）**不是一回事**；B7 不返回切片摘要，所以不要拿它去和 B5/B7 对齐 |
 | 该引用的 `content` | 命中本样例时应含 `FLOWDESK-DEMO-KB-2200` | 命中本样例的判据 |
 | `asset.outcome` | `FOUND` | 资产路查询成功 |
