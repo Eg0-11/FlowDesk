@@ -180,7 +180,17 @@ docker volume ls | Select-String 'flowdesk-pgdata'                     # 卷仍�
 ```powershell
 $env:FLOWDESK_DB_URL = 'jdbc:postgresql://127.0.0.1:5433/flowdesk'
 $env:FLOWDESK_DB_USERNAME = 'flowdesk'
-$env:FLOWDESK_DB_PASSWORD = [Environment]::GetEnvironmentVariable('FLOWDESK_DB_PASSWORD', 'User')
+# 口令：先看**当前进程**里是否已经有值；只有为空时才回退到 User 级。
+# 绝不用 User 级无条件覆盖进程级（进程级可能已经正确设置，而 User 级是空的），也绝不打印口令。
+if ([string]::IsNullOrWhiteSpace($env:FLOWDESK_DB_PASSWORD)) {
+    $fromUser = [Environment]::GetEnvironmentVariable('FLOWDESK_DB_PASSWORD', 'User')
+    if ([string]::IsNullOrWhiteSpace($fromUser)) {
+        Write-Host 'FLOWDESK_DB_PASSWORD 缺失：请先在当前会话里设置它，再重跑本步（不会显示口令）'
+        return
+    }
+    $env:FLOWDESK_DB_PASSWORD = $fromUser
+}
+Write-Host 'FLOWDESK_DB_PASSWORD = PRESENT'   # 只报存在性；值不打印、不保存、不写进任何报告
 & 'C:\Users\me\.jdks\jdk-17.0.20.1+1\bin\java.exe' -jar 'D:\FlowDesk\flowdesk-bootstrap\target\flowdesk-bootstrap-0.1.0-SNAPSHOT.jar' --spring.profiles.active=postgres,dashscope-embedding,deepseek --server.port=8080 --server.address=127.0.0.1 --flowdesk.ai.enabled=true --flowdesk.mcp.client.enabled=true --flowdesk.mcp.client.asset.base-url=http://127.0.0.1:8091 --flowdesk.mcp.client.monitoring.base-url=http://127.0.0.1:8092 --flowdesk.knowledge.rerank.enabled=false
 ```
 
@@ -190,7 +200,7 @@ $env:FLOWDESK_DB_PASSWORD = [Environment]::GetEnvironmentVariable('FLOWDESK_DB_P
 - **Rerank 保持关闭**；
 - `DASHSCOPE_API_KEY` / `DEEPSEEK_API_KEY` 从进程环境继承（不写进命令行）。
 
-### B4 健康检查与演示查询（不产生费用，**不调用模型**）
+### B4 健康检查（不产生费用，**不调用模型**）
 
 ```powershell
 # 三个健康端点（期望都是 UP）
@@ -205,10 +215,39 @@ foreach ($port in 8080, 8091, 8092) {
 }
 ```
 
-资产/监控的 **demo 数据**可以在研判响应里直接看到（`source=DEMO`）；如果希望单独确认 MCP
-协议可用，可以按 B6 的预期字段核对 `asset`/`monitoring` 两段返回，或者运行路径 A 里的
-`test-local.ps1`（它从 `.local-run/state.json` 读取模式，可用 `-Mode basic` / `-Mode deepseek`
-显式指定；该脚本不会启动服务，只检查已经在运行的实例）。
+> **不要在这一步运行 `scripts\test-local.ps1`。** 它最后一项检查会 `POST /api/v1/knowledge/search`，
+> 并期望 Embedding **关闭**时的 `503 KNOWLEDGE_EMBEDDING_DISABLED`（那是 Basic 模式的前提）。
+> 路径 B 已经打开了 Embedding：这一步**既可能触发一次计费**，又会因为拿到非 503 而**误报 FAIL**。
+> 路径 B 的检查只用下面的**零模型调用**方式。
+
+**想单独确认两个 demo MCP 的协议可用（依然不调用任何模型）**：下面的片段直接对 MCP 端点做
+`initialize` → `initialized` → `tools/list` 之外的 `tools/call`，并打印工具返回的演示 JSON；
+它**不经过主服务**，也不触发任何模型调用：
+
+```powershell
+foreach ($target in @(
+        @{ url = 'http://127.0.0.1:8091/mcp'; tool = 'asset_get' },
+        @{ url = 'http://127.0.0.1:8092/mcp'; tool = 'monitoring_snapshot_get' })) {
+
+    $headers = @{ 'Content-Type' = 'application/json'; 'Accept' = 'application/json, text/event-stream' }
+    $initBody = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"full-demo","version":"1.0.0"}}}'
+    $init = Invoke-WebRequest -Uri $target.url -Method POST -Headers $headers -Body ([Text.Encoding]::UTF8.GetBytes($initBody)) -UseBasicParsing
+    $session = [string]$init.Headers['Mcp-Session-Id']
+    $headers['Mcp-Session-Id'] = $session
+
+    $initialized = '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    Invoke-WebRequest -Uri $target.url -Method POST -Headers $headers -Body ([Text.Encoding]::UTF8.GetBytes($initialized)) -UseBasicParsing | Out-Null
+
+    $callBody = '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"' + $target.tool + '","arguments":{"assetId":"AST-900001"}}}'
+    $call = Invoke-WebRequest -Uri $target.url -Method POST -Headers $headers -Body ([Text.Encoding]::UTF8.GetBytes($callBody)) -UseBasicParsing
+    Write-Host ($target.tool + ' -> ' + $call.Content)
+
+    Invoke-WebRequest -Uri $target.url -Method DELETE -Headers @{ 'Mcp-Session-Id' = $session } -UseBasicParsing | Out-Null
+}
+```
+
+**预期**：两条 `tools/call` 都返回 200，打印出的 JSON 里带 `"source":"DEMO"`
+（资产是 `SERVER`/`IN_SERVICE`，监控是 `DEGRADED` 等 demo 数值）——`source=DEMO` 就是「这是演示数据」的标记。
 
 到这一步为止**没有产生任何供应商费用**。
 
@@ -218,60 +257,101 @@ foreach ($port in 8080, 8091, 8092) {
 （唯一标记 `FLOWDESK-DEMO-KB-2200`，可安全上传）。
 
 ```powershell
-$resp = curl.exe -s -i -X POST 'http://127.0.0.1:8080/api/v1/knowledge/documents' -F 'title=虚构样例：NB-2200 边缘路由器失联处置' -F 'file=@docs\samples\fictional-kb-sample.md'
+$resp = curl.exe -s --noproxy '*' -i -X POST 'http://127.0.0.1:8080/api/v1/knowledge/documents' -F 'title=虚构样例：NB-2200 边缘路由器失联处置' -F 'file=@docs\samples\fictional-kb-sample.md'
 $resp
 ```
 
-**预期**：`201 Created` + `Location` 与 `ETag` 响应头；响应体字段
-`id`、`title`、`originalFilename`、`format=MARKDOWN`、`mediaType`、`sizeBytes`、`sha256`、
-`status`（`UPLOADED`）、`version=0`、`createdAt`/`updatedAt`。
+**预期**：`201 Created` + **`Location` 响应头**。
+**注意：上传响应不带 `ETag`** —— `ETag` 出现在**解析与索引**的响应里（那两步需要它配合 `If-Match`）。
+响应体字段：`id`、`title`、`originalFilename`、`format=MARKDOWN`、`mediaType`、`sizeBytes`、
+`sha256`（**整份文件**的摘要）、`status`（`UPLOADED`）、`version=0`、`createdAt`/`updatedAt`。
 
-记下三样东西，后面每一步都要用：**`id`**、**`version`**（后续 `If-Match` 用 `"<version>"`）、**`sha256`**。
+记下三样东西，后面每一步都要用：**`id`**、**`version`**（后续 `If-Match` 用 `"<version>"`）、**`sha256`**（整份文件摘要）。
 
 ### B6 解析（不产生费用；本地 Tika，不调用模型）
 
+**这一步用 `Invoke-WebRequest`，并把 `If-Match` 写成带双引号的字面量**：
+PowerShell 5.1 把内联参数交给原生 `curl.exe` 时会吃掉参数里的双引号，而 `If-Match` 的值
+**必须**是带引号的版本号（`"0"`）；实测拼接出来的写法可能送不到服务端，所以这里用字面量。
+
 ```powershell
 $id = '<B5 返回的 id>'
-$version = '<B5 返回的 version>'
-curl.exe -s -i -X POST "http://127.0.0.1:8080/api/v1/knowledge/documents/$id/parse" -H "If-Match: `"$version`""
+# 注意这里保留双引号：值就是 "0"（引号是 ETag 语法的一部分）
+$resp = Invoke-WebRequest -Uri "http://127.0.0.1:8080/api/v1/knowledge/documents/$id/parse" -Method POST -Headers @{ 'If-Match' = '"0"' } -UseBasicParsing
+$resp.StatusCode
+$resp.Content
 ```
 
-**预期**：`200 OK`；字段 `documentId`、`title`、`status=PARSED`、`version`（已 +1）、
-`chunkCount`（≥1）、`parsedAt`。
+**预期**：`200`；响应体字段 `documentId`、`title`、`status=PARSED`、`version`（已 +1）、
+`chunkCount`（≥1）、`parsedAt`，并且**响应带 `ETag`**（内容是新版本号）。
 
 `If-Match` 必须与当前版本一致：缺失会得到 `428`，陈旧会得到 `412` —— 这不是故障，是**乐观锁**在起作用。
+（若你的文档版本已经不是 `0`，把上面字面量里的 `0` 换成当前版本号，**保留双引号**。）
 
 ### B7 索引（**可能产生供应商费用：DashScope Embedding，1 次文档批次**）
 
 > 这是本手册第一个**付费动作**。只执行一次；失败就停下看错误码，不要循环重试。
 
 ```powershell
-$version = '<B6 返回的 version>'
-curl.exe -s -X POST "http://127.0.0.1:8080/api/v1/knowledge/documents/$id/index" -H "If-Match: `"$version`""
+$id = '<B5 返回的 id>'
+# 版本号换成 B6 响应里的 version，保留双引号
+$resp = Invoke-WebRequest -Uri "http://127.0.0.1:8080/api/v1/knowledge/documents/$id/index" -Method POST -Headers @{ 'If-Match' = '"1"' } -UseBasicParsing
+$resp.StatusCode
+$resp.Content
 ```
 
-**预期**：`200 OK`；字段 `documentId`、`title`、`status=INDEXED`、`version`、`chunkCount`、
-`embeddingProvider=dashscope`、`embeddingModel=text-embedding-v4`、`embeddingDimensions=1024`、`indexedAt`。
+**预期**：`200`；字段 `documentId`、`title`、`status=INDEXED`、`version`、`chunkCount`、
+`embeddingProvider=dashscope`、`embeddingModel=text-embedding-v4`、`embeddingDimensions=1024`、`indexedAt`；
+响应同样带 `ETag`。
 
 ### B8 可选：一次检索（**可能产生供应商费用：1 次查询 Embedding**）
 
 想确认「向量确实写进库并能被检索出来」时可以单独跑这一步；只跑一次。
 
+> **请求体要用「UTF-8 无 BOM 文件 + `--data-binary`」传**：PowerShell 5.1 把内联参数交给原生
+> `curl.exe` 时会**吃掉 JSON 里的双引号**（实测 `--data-raw '{"a":1}'` 送达后变成 `{a:1}`，是非法 JSON）。
+> 脚本「语法解析通过」不等于 HTTP 请求体正确，所以这里统一用文件传。
+> `--noproxy '*'` 是给设置了 `HTTP_PROXY`/`HTTPS_PROXY` 的环境用的：本地回环请求不应该走代理。
+> `-o` 把响应**原样存成文件**再按 UTF-8 读：PowerShell 5.1 直接显示响应内容时会按 Latin-1 解码，
+> 中文会变乱码（那是**显示**问题，不是数据问题）。
+
 ```powershell
-curl.exe -s -X POST 'http://127.0.0.1:8080/api/v1/knowledge/search' -H 'Content-Type: application/json' -d '{"query":"NB-2200 失联处置流程是什么","topK":1,"minScore":0.0}'
+$body = @'
+{"query":"NB-2200 失联处置流程是什么","topK":1,"minScore":0.0}
+'@
+$bodyPath = Join-Path $env:TEMP 'flowdesk-search.json'
+[System.IO.File]::WriteAllBytes($bodyPath, (New-Object System.Text.UTF8Encoding($false)).GetBytes($body))
+$respPath = Join-Path $env:TEMP 'flowdesk-search-response.json'
+curl.exe -s --noproxy '*' -o $respPath -X POST 'http://127.0.0.1:8080/api/v1/knowledge/search' -H 'Content-Type: application/json' --data-binary "@$bodyPath"
+Get-Content -LiteralPath $respPath -Raw -Encoding UTF8
 ```
 
 **预期**：`200 OK`；`provider=dashscope`、`model=text-embedding-v4`、`dimensions=1024`、`topK`、
-`rankingMode=VECTOR_SIMILARITY`，以及 `citations[0]`：`citationId`、`rank`、`documentId`（= B5 的 `id`）、
-`documentVersion`、`chunkIndex`、`chunkSha256`、`content`（**应包含** `FLOWDESK-DEMO-KB-2200`）、`score`。
+`rankingMode=VECTOR_SIMILARITY`，以及 `citations[0]`：`citationId`、`rank`、`documentId`、`documentVersion`、
+`chunkIndex`、`chunkSha256`、`content`、`score`。
+
+**关于「样例是否命中」要有条件地看**：路径 B 用的是**已有数据卷**，库里可能已经有别的文档，
+`topK=1` **不保证**本样例一定排第一。所以：
+
+- 若 `citations[0].documentId` = B5 的 `id` → 命中，接着核对该切片的 `content` 是否含 `FLOWDESK-DEMO-KB-2200`；
+- 若 `documentId` 是**别的文档** → 这不是故障，说明库里已有更相近的切片：**看返回的 `documentId` 是谁**，
+  需要本样例时把 `topK` 调大（这会多花一次查询 Embedding，仍然只发一次）或换一个更贴近样例内容的查询词；
+- **不要**为了「让它排第一」反复重发同样的付费请求，也**不要**清库/删卷。
 
 ### B9 一次事件研判（**可能产生供应商费用：1 次查询 Embedding + 1 次 DeepSeek 对话**）
 
 > 一个请求同时触发三路证据：知识检索（Embedding）+ 资产 MCP + 监控 MCP，随后一次对话生成答案。
-> **只发一次。**
+> **只发一次。** 请求体同样用「UTF-8 无 BOM 文件 + `--data-binary`」传。
 
 ```powershell
-curl.exe -s -X POST 'http://127.0.0.1:8080/api/v1/ai/incident-triage' -H 'Content-Type: application/json' --data-raw '{"assetId":"AST-900001","question":"对照知识库 FLOWDESK-DEMO-KB-2200 中 NB-2200 的失联处置流程，结合 AST-900001 的资产类型和最新监控快照，说明哪些信息有证据支持、哪些流程不能直接套用？","topK":1,"minScore":0.0}'
+$body = @'
+{"assetId":"AST-900001","question":"对照知识库 FLOWDESK-DEMO-KB-2200 中 NB-2200 的失联处置流程，结合 AST-900001 的资产类型和最新监控快照，说明哪些信息有证据支持、哪些流程不能直接套用？","topK":1,"minScore":0.0}
+'@
+$bodyPath = Join-Path $env:TEMP 'flowdesk-triage.json'
+[System.IO.File]::WriteAllBytes($bodyPath, (New-Object System.Text.UTF8Encoding($false)).GetBytes($body))
+$respPath = Join-Path $env:TEMP 'flowdesk-triage-response.json'
+curl.exe -s --noproxy '*' -o $respPath -X POST 'http://127.0.0.1:8080/api/v1/ai/incident-triage' -H 'Content-Type: application/json' --data-binary "@$bodyPath"
+Get-Content -LiteralPath $respPath -Raw -Encoding UTF8
 ```
 
 **预期响应字段（这就是验收要看的）**：
@@ -279,16 +359,23 @@ curl.exe -s -X POST 'http://127.0.0.1:8080/api/v1/ai/incident-triage' -H 'Conten
 | 字段 | 期望 | 含义 |
 | --- | --- | --- |
 | `requestId` | 有值 | 本次请求的标识 |
-| `knowledge.status` | `FOUND` | 知识路确实检索到了切片 |
-| `knowledge.retrieval.citations[0]` | `citationId=K1`，`documentId` / `documentVersion` / `chunkIndex` / `chunkSha256` 与 B5/B7 一致，`content` 含 `FLOWDESK-DEMO-KB-2200` | **引用正确**：这段引文确实来自你上传的那份文档的同一个切片 |
+| `knowledge.status` | `FOUND` | 知识路确实检索到了切片（**不保证**检索到的就是本样例，见下） |
+| `knowledge.retrieval.citations[0].documentId` | 期望等于 B5 的 `id` | 指向你上传的那份文档；若指向**别的** `documentId`，说明库里已有更相近的切片（见下面的条件说明） |
+| 该引用的 `documentVersion` | 与 B7 返回的版本一致（通常 = B7 的 `version`） | 引用的是**当前版本** |
+| 该引用的 `chunkSha256` | 一段**独立**的摘要 | 它是**切片内容**的摘要，与 B5 里的 `sha256`（**整份文件**摘要）**不是一回事**；B7 不返回切片摘要，所以不要拿它去和 B5/B7 对齐 |
+| 该引用的 `content` | 命中本样例时应含 `FLOWDESK-DEMO-KB-2200` | 命中本样例的判据 |
 | `asset.outcome` | `FOUND` | 资产路查询成功 |
 | `asset.assetType` / `asset.status` / `asset.source` | `SERVER` / `IN_SERVICE` / **`DEMO`** | `source=DEMO` 表示这是**演示数据**，不是真实企业资产系统 |
 | `monitoring.outcome` | `FOUND` | 监控路查询成功 |
 | `monitoring.source` | **`DEMO`** | 同上；快照里的 `cpuUtilizationPercent` 等数值来自 demo 数据 |
 | `grounded` | `true` | 答案受证据约束（没有引用不存在的编号） |
-| `usedEvidenceIds` | `["K1","A1","M1"]` | 答案**实际用到**的证据编号，应与答案正文里的 `[K1][A1][M1]` 对应 |
+| `usedEvidenceIds` | 三类编号**都出现**，且**顺序与答案里首次出现的顺序一致** | 它按**首次出现顺序**去重，**不保证恒为 `["K1","A1","M1"]`**：答案先引用哪一类，哪一类就排在前面 |
 | `executionPath` | 约九步，含 `validate_asset` → `retrieve_knowledge` → `query_asset` → `query_monitoring` → … → `generate_answer` → `validate_citations` → `finish` | 能看出确实**分别**走了知识、资产、监控三路 |
-| `answer` | 带 `[K1]`/`[A1]`/`[M1]` 的中文答案 | 引用编号与 `usedEvidenceIds` 自洽 |
+| `answer` | 带 `[K1]`/`[A1]`/`[M1]` 的中文答案 | 编号集合与 `usedEvidenceIds` 一致；顺序也应对得上 |
+
+**「样例是否命中」同样要有条件地看**：复用已有卷时 `topK=1` 不保证本样例排第一。
+若 `citations[0].documentId` 不是 B5 的 `id`，**不要**重发同样的付费请求，也**不要**清库/删卷：
+先看返回的 `documentId` 是谁、`content` 讲了什么，再决定是否调整查询词或 `topK` 后**单独发一次**。
 
 **还应该人工看一眼答案的合理性**：样例文档写的是**边缘路由器**的处置流程，而 `AST-900001` 是
 **服务器**（`assetType=SERVER`）。一份「有证据且自洽」的答案应当**指出类型不匹配、不能直接套用**，
