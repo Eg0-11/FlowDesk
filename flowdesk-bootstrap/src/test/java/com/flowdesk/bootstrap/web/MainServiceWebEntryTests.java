@@ -32,7 +32,7 @@ import org.springframework.http.ResponseEntity;
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class MainServiceWebEntryTests {
 
-    private static final Pattern FETCH_CALL = Pattern.compile("fetch\\(");
+    private static final Pattern POST_MARKER = Pattern.compile("method: 'POST'");
 
     @Autowired
     private TestRestTemplate client;
@@ -92,17 +92,54 @@ class MainServiceWebEntryTests {
     }
 
     @Test
-    void theScriptContainsExactlyTwoReadOnlyRequests() {
-        Matcher matcher = FETCH_CALL.matcher(bodyOf("/app.js"));
+    void theScriptWritesOnlyThroughTheSingleCreateRequestAndNeverAtLoadTime() {
+        String script = bodyOf("/app.js");
 
-        int count = 0;
+        int posts = 0;
+        Matcher matcher = POST_MARKER.matcher(script);
         while (matcher.find()) {
-            count++;
+            posts++;
         }
+        assertThat(posts)
+                .as("脚本里只能有一处写请求：新建工单（POST）；列表与详情都是只读 GET")
+                .isEqualTo(1);
 
-        assertThat(count)
-                .as("脚本里总共只允许两个只读请求：加载时的健康检查 + 点击按钮后的工单列表；不多不少")
-                .isEqualTo(2);
+        int domReady = script.indexOf("DOMContentLoaded");
+        assertThat(domReady).as("脚本要有 DOMContentLoaded 处理器").isGreaterThan(0);
+        String loadPath = script.substring(domReady);
+        assertThat(loadPath)
+                .as("加载路径只调健康检查，不直接发任何请求、更不发写请求；其余请求都在事件处理函数里")
+                .doesNotContain("requestJson(")
+                .doesNotContain("method: 'POST'")
+                .contains("loadHealth();")
+                .contains("addEventListener('submit'");
+    }
+
+    @Test
+    void theScriptRendersEverythingAsTextInsteadOfHtml() {
+        String script = bodyOf("/app.js");
+
+        assertThat(script)
+                .as("用户输入与服务端数据只能作为文本渲染：不得出现 innerHTML / outerHTML / insertAdjacentHTML")
+                .doesNotContain("innerHTML")
+                .doesNotContain("outerHTML")
+                .doesNotContain("insertAdjacentHTML")
+                .doesNotContain("document.write");
+    }
+
+    @Test
+    void theScriptImplementsPaginationAndDoubleSubmitProtection() {
+        String script = bodyOf("/app.js");
+
+        assertThat(script)
+                .as("翻页依据服务端返回的 page / hasNext / hasPrevious")
+                .contains("hasNext")
+                .contains("hasPrevious")
+                .contains("page=");
+        assertThat(script)
+                .as("提交期间必须禁用按钮并置位标记，防止重复点击")
+                .contains("creating")
+                .contains("disabled = busy");
     }
 
     @Test

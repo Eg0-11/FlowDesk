@@ -17,6 +17,8 @@
         <a href="#home">首页</a>
         <a href="#status">服务状态</a>
         <a href="#tickets">工单列表</a>
+        <a href="#create">新建工单</a>
+        <a href="#detail">工单详情</a>
         <span class="nav-todo">后续页面：知识库 / AI 研判（尚未实现）</span>
     </nav>
 </header>
@@ -26,9 +28,9 @@
         <h2>首页</h2>
         <p>本页由主服务同源提供，页面里的所有接口请求都使用相对路径（<code>/api/v1/...</code>）。</p>
         <ul>
-            <li>页面加载时<b>只</b>请求服务自身的健康端点，<b>不</b>调用索引、检索或 AI 接口，因此不产生任何模型费用。</li>
-            <li>工单列表按需加载（点下面的按钮），走 <code>GET /api/v1/tickets</code>。</li>
-            <li>当前阶段只提供首页、导航、服务状态与工单列表入口；知识库与 AI 研判页面尚未实现。</li>
+            <li>页面加载时<b>只</b>请求服务自身的健康端点；<b>不</b>发送任何写请求，也<b>不</b>调用知识检索或 AI 接口，因此不产生任何模型费用。</li>
+            <li>工单列表、工单详情、新建工单都在你点击之后才发请求。</li>
+            <li>当前阶段提供：列表（可翻页）、单条详情、新建工单；<b>不含</b>分配、开始处理、解决、关闭等状态变更（留给下一小阶段）。</li>
         </ul>
     </section>
 
@@ -44,23 +46,70 @@
 
     <section id="tickets">
         <h2>工单列表</h2>
-        <p>
-            <button id="load-tickets" type="button">加载最近工单</button>
+        <p class="toolbar">
+            <button id="load-tickets" type="button">加载工单</button>
+            <button id="prev-page" type="button" disabled>上一页</button>
+            <button id="next-page" type="button" disabled>下一页</button>
             <span id="tickets-meta" class="hint"></span>
         </p>
+        <div id="tickets-state" class="state" hidden role="status"></div>
         <div id="tickets-error" class="error" hidden></div>
-        <table id="tickets-table" hidden>
-            <thead>
-            <tr>
-                <th>编号</th>
-                <th>标题</th>
-                <th>状态</th>
-                <th>优先级</th>
-                <th>提交人</th>
-            </tr>
-            </thead>
-            <tbody></tbody>
-        </table>
+        <div class="table-wrap">
+            <table id="tickets-table" hidden>
+                <thead>
+                <tr>
+                    <th>编号</th>
+                    <th>标题</th>
+                    <th>状态</th>
+                    <th>优先级</th>
+                    <th>提交人</th>
+                    <th>操作</th>
+                </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+    </section>
+
+    <section id="create">
+        <h2>新建工单</h2>
+        <p class="hint">字段与后端契约一致：分类与优先级使用后端的枚举值；创建成功后可以直接打开它的详情。</p>
+        <form id="create-form" autocomplete="off">
+            <div class="field">
+                <label for="create-title">标题</label>
+                <input id="create-title" name="title" type="text" maxlength="200" required>
+            </div>
+            <div class="field">
+                <label for="create-description">描述</label>
+                <textarea id="create-description" name="description" rows="3" maxlength="4000" required></textarea>
+            </div>
+            <div class="field">
+                <label for="create-category">分类</label>
+                <select id="create-category" name="category" required></select>
+            </div>
+            <div class="field">
+                <label for="create-priority">优先级</label>
+                <select id="create-priority" name="priority" required></select>
+            </div>
+            <div class="field">
+                <label for="create-requester">提交人</label>
+                <input id="create-requester" name="requesterId" type="text" maxlength="64" required>
+            </div>
+            <p class="toolbar">
+                <button id="create-submit" type="submit">创建工单</button>
+                <span id="create-state" class="hint"></span>
+            </p>
+        </form>
+        <div id="create-error" class="error" hidden></div>
+        <div id="create-result" class="panel" hidden></div>
+    </section>
+
+    <section id="detail">
+        <h2>工单详情</h2>
+        <p class="hint">点击列表里的「详情」按钮，或创建成功后的「打开详情」。</p>
+        <div id="detail-state" class="state" hidden role="status"></div>
+        <div id="detail-error" class="error" hidden></div>
+        <div id="detail-body" class="panel" hidden></div>
     </section>
 </main>
 

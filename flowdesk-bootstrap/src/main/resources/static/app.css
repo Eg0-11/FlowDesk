@@ -1,4 +1,4 @@
-/* FlowDesk 本机演示入口样式：浅色、无外部依赖。 */
+/* FlowDesk 本机演示入口样式：浅色、无外部依赖、适配窄屏。 */
 :root {
     --ink: #1f2328;
     --muted: #59636e;
@@ -90,8 +90,27 @@ button {
     cursor: pointer;
 }
 
-button:hover {
+button:hover:enabled {
     background: #eef1f4;
+}
+
+button:disabled {
+    color: var(--muted);
+    cursor: not-allowed;
+    opacity: 0.7;
+}
+
+.toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    margin: 0 0 10px;
+}
+
+.table-wrap {
+    width: 100%;
+    overflow-x: auto;
 }
 
 table {
@@ -113,6 +132,72 @@ td {
 th {
     background: var(--panel);
     font-weight: 600;
+    white-space: nowrap;
+}
+
+.field {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 10px;
+}
+
+.field label {
+    width: 84px;
+    color: var(--muted);
+    font-size: 14px;
+}
+
+.field input,
+.field textarea,
+.field select {
+    flex: 1 1 260px;
+    min-width: 0;
+    padding: 6px 8px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--ink);
+    font: inherit;
+}
+
+.panel {
+    margin-top: 10px;
+    padding: 12px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+}
+
+.detail-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 4px 0;
+    border-bottom: 1px dashed var(--line);
+}
+
+.detail-row:last-child {
+    border-bottom: none;
+}
+
+.field-name {
+    flex: 0 0 84px;
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.field-value {
+    flex: 1 1 240px;
+    min-width: 0;
+    word-break: break-word;
+}
+
+.state {
+    margin-top: 8px;
+    color: var(--muted);
+    font-size: 14px;
 }
 
 .hint {
@@ -146,9 +231,36 @@ th {
     border-left: 3px solid var(--failed);
     color: var(--failed);
     font-size: 13px;
-    word-break: break-all;
+    word-break: break-word;
 }
 
 .page-footer {
     padding-top: 18px;
+}
+
+@media (max-width: 640px) {
+    body {
+        padding: 0 12px 32px;
+        font-size: 14px;
+    }
+
+    h1 {
+        font-size: 20px;
+    }
+
+    .field label,
+    .field-name {
+        flex: 0 0 100%;
+        width: auto;
+    }
+
+    .field input,
+    .field textarea,
+    .field select {
+        flex: 1 1 100%;
+    }
+
+    .toolbar button {
+        flex: 1 1 auto;
+    }
 }
