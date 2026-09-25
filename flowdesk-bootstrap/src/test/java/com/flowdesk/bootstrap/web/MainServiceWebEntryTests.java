@@ -128,7 +128,7 @@ class MainServiceWebEntryTests {
     }
 
     @Test
-    void theScriptImplementsPaginationAndDoubleSubmitProtection() {
+    void theScriptCarriesTheGuardsTheBehaviourIsVerifiedAgainstInTheBrowser() {
         String script = bodyOf("/app.js");
 
         assertThat(script)
@@ -137,9 +137,19 @@ class MainServiceWebEntryTests {
                 .contains("hasPrevious")
                 .contains("page=");
         assertThat(script)
-                .as("提交期间必须禁用按钮并置位标记，防止重复点击")
+                .as("提交与列表加载都要有在飞标记（防重复提交 / 防止翻页期间重复导航）")
                 .contains("creating")
-                .contains("disabled = busy");
+                .contains("listLoading");
+        assertThat(script)
+                .as("过时响应要靠自增令牌丢弃，不能覆盖最新页面")
+                .contains("listToken")
+                .contains("detailToken");
+        assertThat(script)
+                .as("格式异常要有明确文案")
+                .contains("响应格式异常");
+
+        // 行为证据不在这里：畸形/空/缺字段/延迟响应的实际渲染结果由浏览器验收脚本
+        // （用 Playwright 路由注入可控响应）验证，见交付说明。
     }
 
     @Test

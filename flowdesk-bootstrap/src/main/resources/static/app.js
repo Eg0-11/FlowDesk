@@ -1,5 +1,5 @@
 /*
- * FlowDesk 本机演示入口的脚本（FD-0023-A / FD-0023-B）。
+ * FlowDesk 本机演示入口的脚本（FD-0023-A / FD-0023-B / FD-0023-B-R1）。
  *
  * 约束：
  *   - 所有请求都用**相对路径**（同源），不写死主机名与端口；
@@ -7,7 +7,11 @@
  *     （本文件里也不写出它们的路径），因此加载页面不产生任何模型费用；
  *   - 工单列表、详情、新建都在用户点击之后才发请求；新建是唯一的写请求；
  *   - 用户输入与服务端数据一律只用 textContent 渲染：不把字符串当 HTML 插入，也不使用拼接 HTML 的写法；
- *   - 分类与优先级的取值与后端枚举一致：TicketCategory / TicketPriority（不修改 API 契约）。
+ *   - 分类与优先级的取值与后端枚举一致：TicketCategory / TicketPriority（不修改 API 契约）；
+ *   - 成功响应必须是「合法 JSON + 页面必需字段齐全」才算成功：空响应、畸形 JSON、缺字段一律报
+ *     「响应格式异常」，绝不把 NaN / undefined 渲染出来，也绝不误报创建成功；
+ *   - 列表加载期间禁止重复导航（按钮禁用 + 在飞标记）；列表与详情都用自增令牌丢弃**过时响应**，
+ *     保证回来的旧响应不能覆盖最新页面。
  */
 (function () {
     'use strict';
@@ -22,6 +26,9 @@
     var PAGE_SIZE = 10;
 
     var lastPage = null;
+    var listLoading = false;
+    var listToken = 0;
+    var detailToken = 0;
     var creating = false;
 
     function element(id) {
@@ -49,6 +56,13 @@
         }
     }
 
+    function setDisabled(id, disabled) {
+        var target = element(id);
+        if (target) {
+            target.disabled = disabled;
+        }
+    }
+
     function describeFailure(result) {
         var body = result && result.body ? result.body : null;
         var parts = ['HTTP ' + (result ? result.status : '?')];
@@ -69,27 +83,68 @@
      *
      * @param url     相对路径
      * @param options fetch 选项（写请求才需要传）
-     * @returns {Promise<{status:number, ok:boolean, body:object|null, transportError:string|null}>}
+     * @returns {Promise<{status:number, body:object|null, transportError:string|null, formatProblem:string|null}>}
      */
     function requestJson(url, options) {
         return fetch(url, options)
             .then(function (response) {
                 return response.text().then(function (text) {
-                    var parsed = null;
-                    if (text) {
-                        try {
-                            parsed = JSON.parse(text);
-                        }
-                        catch (error) {
-                            parsed = { detail: '响应不是合法 JSON' };
-                        }
+                    var trimmed = text === null || text === undefined ? '' : text.trim();
+                    if (trimmed === '') {
+                        return {
+                            status: response.status,
+                            body: null,
+                            transportError: null,
+                            formatProblem: response.ok ? '服务端返回了空响应' : null
+                        };
                     }
-                    return { status: response.status, ok: response.ok, body: parsed, transportError: null };
+                    var parsed;
+                    try {
+                        parsed = JSON.parse(trimmed);
+                    }
+                    catch (error) {
+                        return {
+                            status: response.status,
+                            body: null,
+                            transportError: null,
+                            formatProblem: response.ok ? '服务端返回的不是合法 JSON' : null
+                        };
+                    }
+                    if (parsed === null || typeof parsed !== 'object') {
+                        return {
+                            status: response.status,
+                            body: null,
+                            transportError: null,
+                            formatProblem: response.ok ? '服务端返回的 JSON 不是对象' : null
+                        };
+                    }
+                    return { status: response.status, body: parsed, transportError: null, formatProblem: null };
                 });
             })
             .catch(function (error) {
-                return { status: 0, ok: false, body: null, transportError: error.message };
+                return { status: 0, body: null, transportError: error.message, formatProblem: null };
             });
+    }
+
+    function isFiniteNumber(value) {
+        return typeof value === 'number' && isFinite(value);
+    }
+
+    /**
+     * 校验成功响应里页面必需字段是否存在且类型正确。
+     *
+     * @param body     解析后的响应体
+     * @param required 字段名数组
+     * @returns {string|null} 有问题时返回「缺少字段 xxx」这类说明，否则返回 null
+     */
+    function missingField(body, required) {
+        for (var index = 0; index < required.length; index++) {
+            var name = required[index];
+            if (body[name] === undefined || body[name] === null) {
+                return '缺少字段 ' + name;
+            }
+        }
+        return null;
     }
 
     // ---------- 服务状态（页面加载时唯一会发出的请求） ----------
@@ -102,37 +157,40 @@
                     setClass('health-main', 'failed');
                     return;
                 }
-                var reported = result.body && result.body.status ? result.body.status : '(没有 status 字段)';
-                setText('health-main', 'HTTP ' + result.status + ' · ' + reported);
-                setClass('health-main', result.status === 200 && reported === 'UP' ? 'ok' : 'warn');
+                if (result.body && result.body.status) {
+                    setText('health-main', 'HTTP ' + result.status + ' · ' + result.body.status);
+                    setClass('health-main', result.status === 200 && result.body.status === 'UP' ? 'ok' : 'warn');
+                    return;
+                }
+                setText('health-main', '响应格式异常：没有 status 字段');
+                setClass('health-main', 'failed');
             });
     }
 
-    // ---------- 工单列表（点击后；只读） ----------
+    // ---------- 工单列表（点击后；只读；加载期间禁止重复导航，过时响应丢弃） ----------
 
-    function renderPageMeta(result) {
-        var body = result.body || {};
-        var shown = body.items ? body.items.length : 0;
-        setText('tickets-meta', '第 ' + (Number(body.page) + 1) + ' 页 / 共 ' + body.totalPages + ' 页，共 '
-            + body.totalElements + ' 条（本页 ' + shown + ' 条）');
-        var prev = element('prev-page');
-        var next = element('next-page');
-        if (prev) {
-            prev.disabled = !body.hasPrevious;
-        }
-        if (next) {
-            next.disabled = !body.hasNext;
-        }
-        lastPage = Number(body.page);
+    function setListBusy(busy) {
+        listLoading = busy;
+        setDisabled('load-tickets', busy);
+        setDisabled('prev-page', busy);
+        setDisabled('next-page', busy);
+    }
+
+    function renderPageMeta(body) {
+        setText('tickets-meta', '第 ' + (body.page + 1) + ' 页 / 共 ' + body.totalPages + ' 页，共 '
+            + body.totalElements + ' 条（本页 ' + body.items.length + ' 条）');
+        lastPage = body.page;
+        setDisabled('prev-page', !body.hasPrevious);
+        setDisabled('next-page', !body.hasNext);
     }
 
     function renderTicketRows(items) {
         var table = element('tickets-table');
-        var body = table ? table.querySelector('tbody') : null;
-        if (!body) {
+        var rows = table ? table.querySelector('tbody') : null;
+        if (!rows) {
             return;
         }
-        body.replaceChildren();
+        rows.replaceChildren();
         items.forEach(function (item) {
             var row = document.createElement('tr');
             [item.id, item.title, item.status, item.priority, item.requesterId].forEach(function (value) {
@@ -151,24 +209,72 @@
             });
             actions.appendChild(button);
             row.appendChild(actions);
-            body.appendChild(row);
+            rows.appendChild(row);
         });
+    }
+
+    function listPageProblem(body) {
+        var missing = missingField(body, ['items', 'page', 'size', 'totalPages', 'totalElements',
+            'hasNext', 'hasPrevious']);
+        if (missing) {
+            return missing;
+        }
+        if (!Array.isArray(body.items)) {
+            return 'items 不是数组';
+        }
+        if (!isFiniteNumber(body.page) || !isFiniteNumber(body.totalPages)
+                || !isFiniteNumber(body.totalElements) || !isFiniteNumber(body.size)) {
+            return '分页字段不是有效数字';
+        }
+        if (typeof body.hasNext !== 'boolean' || typeof body.hasPrevious !== 'boolean') {
+            return 'hasNext / hasPrevious 不是布尔值';
+        }
+        for (var index = 0; index < body.items.length; index++) {
+            var item = body.items[index];
+            if (!item || typeof item !== 'object') {
+                return 'items 里有非对象元素';
+            }
+            var itemMissing = missingField(item, ['id', 'title', 'status', 'priority', 'requesterId']);
+            if (itemMissing) {
+                return 'items[' + index + '] ' + itemMissing;
+            }
+        }
+        return null;
     }
 
     function loadTickets(page) {
         var target = typeof page === 'number' ? page : 0;
+        if (listLoading) {
+            return;
+        }
+        var token = listToken + 1;
+        listToken = token;
+
+        setListBusy(true);
         show('tickets-error', false);
         show('tickets-table', false);
         show('tickets-state', true);
         setText('tickets-state', '加载中…');
         setText('tickets-meta', '');
 
-        requestJson('/api/v1/tickets?page=' + target + '&size=' + PAGE_SIZE, { headers: { 'Accept': 'application/json' } })
+        requestJson('/api/v1/tickets?page=' + target + '&size=' + PAGE_SIZE,
+            { headers: { 'Accept': 'application/json' } })
             .then(function (result) {
+                if (token !== listToken) {
+                    // 过时响应：已经有更新的列表请求在跑或已完成，直接丢弃，不覆盖最新页面
+                    return;
+                }
+                setListBusy(false);
                 show('tickets-state', false);
+
                 if (result.transportError) {
                     show('tickets-error', true);
                     setText('tickets-error', '请求失败（服务不可达）：' + result.transportError);
+                    return;
+                }
+                if (result.status === 400 || result.status === 404) {
+                    show('tickets-error', true);
+                    setText('tickets-error', '加载工单失败：' + describeFailure(result));
                     return;
                 }
                 if (result.status !== 200) {
@@ -176,23 +282,49 @@
                     setText('tickets-error', '加载工单失败：' + describeFailure(result));
                     return;
                 }
-                var items = (result.body && result.body.items) ? result.body.items : [];
-                renderPageMeta(result);
-                if (items.length === 0) {
+                if (result.formatProblem) {
+                    show('tickets-error', true);
+                    setText('tickets-error', '加载工单失败：响应格式异常（' + result.formatProblem + '）');
+                    return;
+                }
+                var problem = listPageProblem(result.body);
+                if (problem) {
+                    show('tickets-error', true);
+                    setText('tickets-error', '加载工单失败：响应格式异常（' + problem + '）');
+                    return;
+                }
+
+                renderPageMeta(result.body);
+                if (result.body.items.length === 0) {
                     show('tickets-state', true);
-                    setText('tickets-state', Number(result.body.totalElements) === 0
+                    setText('tickets-state', result.body.totalElements === 0
                         ? '还没有任何工单（空列表）'
                         : '本页没有工单');
                     return;
                 }
-                renderTicketRows(items);
+                renderTicketRows(result.body.items);
                 show('tickets-table', true);
             });
     }
 
-    // ---------- 工单详情（点击后；只读） ----------
+    // ---------- 工单详情（点击后；只读；后点的那条胜出，旧响应不能覆盖） ----------
+
+    function detailProblem(body) {
+        var missing = missingField(body, ['id', 'title', 'description', 'category', 'priority',
+            'requesterId', 'status', 'version']);
+        if (missing) {
+            return missing;
+        }
+        if (!isFiniteNumber(body.version)) {
+            return 'version 不是有效数字';
+        }
+        return null;
+    }
 
     function openDetail(ticketId) {
+        var token = detailToken + 1;
+        detailToken = token;
+
         show('detail-error', false);
         show('detail-body', false);
         show('detail-state', true);
@@ -200,7 +332,12 @@
 
         requestJson('/api/v1/tickets/' + encodeURIComponent(ticketId), { headers: { 'Accept': 'application/json' } })
             .then(function (result) {
+                if (token !== detailToken) {
+                    // 过时响应：用户已经点了别的工单，丢弃它
+                    return;
+                }
                 show('detail-state', false);
+
                 if (result.transportError) {
                     show('detail-error', true);
                     setText('detail-error', '请求失败（服务不可达）：' + result.transportError);
@@ -214,6 +351,17 @@
                 if (result.status !== 200) {
                     show('detail-error', true);
                     setText('detail-error', '加载详情失败：' + describeFailure(result));
+                    return;
+                }
+                if (result.formatProblem) {
+                    show('detail-error', true);
+                    setText('detail-error', '加载详情失败：响应格式异常（' + result.formatProblem + '）');
+                    return;
+                }
+                var problem = detailProblem(result.body);
+                if (problem) {
+                    show('detail-error', true);
+                    setText('detail-error', '加载详情失败：响应格式异常（' + problem + '）');
                     return;
                 }
                 renderDetail(result.body);
@@ -251,6 +399,8 @@
         appendRow(box, '解决说明', ticket.resolution);
         appendRow(box, '创建时间', ticket.createdAt);
         appendRow(box, '更新时间', ticket.updatedAt);
+        appendRow(box, '解决时间', ticket.resolvedAt);
+        appendRow(box, '关闭时间', ticket.closedAt);
         appendRow(box, '版本', ticket.version);
         show('detail-body', true);
         var section = element('detail');
@@ -259,7 +409,7 @@
         }
     }
 
-    // ---------- 新建工单（唯一的写请求；防重复提交） ----------
+    // ---------- 新建工单（唯一的写请求；防重复提交；响应不合法不算成功） ----------
 
     function fillSelect(id, values) {
         var select = element(id);
@@ -277,10 +427,7 @@
 
     function setCreateBusy(busy) {
         creating = busy;
-        var button = element('create-submit');
-        if (button) {
-            button.disabled = busy;
-        }
+        setDisabled('create-submit', busy);
     }
 
     function renderCreated(ticket) {
@@ -345,14 +492,31 @@
         }).then(function (result) {
             setCreateBusy(false);
             setText('create-state', '');
+
             if (result.transportError) {
                 show('create-error', true);
                 setText('create-error', '创建失败（服务不可达）：' + result.transportError);
                 return;
             }
+            if (result.status === 400) {
+                show('create-error', true);
+                setText('create-error', '创建失败：' + describeFailure(result));
+                return;
+            }
             if (result.status !== 201) {
                 show('create-error', true);
                 setText('create-error', '创建失败：' + describeFailure(result));
+                return;
+            }
+            if (result.formatProblem) {
+                show('create-error', true);
+                setText('create-error', '创建失败：响应格式异常（' + result.formatProblem + '）');
+                return;
+            }
+            var problem = missingField(result.body, ['id', 'title', 'status']);
+            if (problem) {
+                show('create-error', true);
+                setText('create-error', '创建失败：响应格式异常（' + problem + '）');
                 return;
             }
             renderCreated(result.body);

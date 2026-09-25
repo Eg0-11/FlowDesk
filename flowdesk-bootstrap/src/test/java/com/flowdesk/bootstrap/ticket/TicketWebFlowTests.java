@@ -77,6 +77,10 @@ class TicketWebFlowTests {
                 .contains("\"status\":\"NEW\"")
                 .contains("\"category\":\"OTHER\"")
                 .contains("\"priority\":\"P3\"");
+        assertThat(detail.getBody())
+                .as("页面要展示的解决时间与关闭时间必须在响应里存在（新建的工单为 null）")
+                .contains("\"resolvedAt\"")
+                .contains("\"closedAt\"");
 
         ResponseEntity<String> missing =
                 this.client.getForEntity("/api/v1/tickets/" + UUID.randomUUID(), String.class);
