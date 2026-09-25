@@ -92,7 +92,7 @@ class MainServiceWebEntryTests {
     }
 
     @Test
-    void thePageLoadsWithExactlyTwoReadOnlyRequests() {
+    void theScriptContainsExactlyTwoReadOnlyRequests() {
         Matcher matcher = FETCH_CALL.matcher(bodyOf("/app.js"));
 
         int count = 0;
@@ -101,7 +101,7 @@ class MainServiceWebEntryTests {
         }
 
         assertThat(count)
-                .as("脚本里只允许两个只读请求：健康检查 + 按需加载的工单列表；不多不少")
+                .as("脚本里总共只允许两个只读请求：加载时的健康检查 + 点击按钮后的工单列表；不多不少")
                 .isEqualTo(2);
     }
 

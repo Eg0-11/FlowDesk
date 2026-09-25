@@ -498,7 +498,8 @@ else {
     Write-FlowDeskWarn '此模式**没有 AI 回答能力**：资产诊断与事件研判接口都是 404，'
     Write-FlowDeskWarn '不能宣称可以生成诊断或研判答案（知识检索也因 Embedding 关闭而不可用）。'
     Write-FlowDeskInfo '演示数据是虚构的（source=DEMO），不是真实企业数据源。'
-    Write-FlowDeskInfo '当前没有前端页面：浏览器打开 http://127.0.0.1:8080/ 不会打开产品界面（只会看到 404）。'
+    Write-FlowDeskInfo '主服务根地址现在返回一个最小同源网页入口（首页 / 导航 / 服务状态 / 工单列表入口，FD-0023-A）；'
+    Write-FlowDeskInfo '它**不是**产品界面，也没有鉴权，仅供本机演示。'
 }
 
 exit 0
