@@ -398,6 +398,145 @@ class MainServiceWebEntryTests {
                 .contains("服务端始终是最终校验者");
     }
 
+    /**
+     * FD-0023-D-R1：响应体读取中断必须被结构化处理，而不是变成未处理的 Promise 拒绝。
+     *
+     * <p>「拿到响应头」与「读到响应体」是两件事：连接在响应头之后被重置时，
+     * {@code fetch} 会成功、{@code response.text()} 会拒绝。若脚本不就地接住它，
+     * 整个 Promise 会拒绝，调用方没有 {@code .catch} 就既留下未处理拒绝、
+     * 又让「进行中」标记永久为真 —— 按钮再也点不动。这里断言脚本从结构上排除了这两种后果。</p>
+     */
+    @Test
+    void theKnowledgeScriptNeverLeavesAnUnhandledRejectionOrAStuckBusyState() {
+        String script = bodyOf("/knowledge.js");
+
+        assertThat(script)
+                .as("请求包装必须自成一个永不拒绝的结构：body 读取失败要表达成 bodyReadFailed 标记")
+                .contains("bodyReadFailed")
+                .contains("bodyReadFailed: true");
+        assertThat(script)
+                .as("只有 response.text() 就地被接住，才不会让整个 Promise 拒绝")
+                .contains("var readBody = response.text().then(function (text) {")
+                .contains("return { text: '', failed: true };");
+        assertThat(script)
+                .as("请求包装标注了自己的契约：永不拒绝")
+                .contains("永不拒绝");
+
+        assertThat(script)
+                .as("四条调用路径都必须挂上收尾兜底：三条写/核对路径各一次 guard，查询路径用自己的失败回调")
+                .contains("function guard(promise, onFinish, onCrash)")
+                .contains("guard(requestJson(DOCUMENTS_PATH, {")
+                .contains("guard(requestJson(DOCUMENTS_PATH + '/' + encodeURIComponent(targetId), {")
+                .contains("guard(requestJson(DOCUMENTS_PATH + '/' + encodeURIComponent(targetId) + '/parse', {")
+                .contains("查询在页面内异常终止，未能取得文档状态。请稍后重试。");
+
+        // guard 必须在使用者之前复位 busy：断言 onFinish 被调用一次且与 onCrash 并存。
+        int guardFn = script.indexOf("function guard(promise, onFinish, onCrash)");
+        assertThat(guardFn).as("guard 必须存在").isGreaterThan(0);
+        String guardBody = script.substring(guardFn, script.indexOf("// ---- 静态提示文本", guardFn));
+        assertThat(guardBody)
+                .as("guard 的两条出口都必须调用 onFinish —— 否则 busy 仍会永久为真")
+                .contains("onFinish();");
+        assertThat((guardBody.length() - guardBody.replace("onFinish();", "").length()) / "onFinish();".length())
+                .as("成功与失败两条出口都要收尾")
+                .isEqualTo(2);
+
+        assertThat(script)
+                .as("写请求（上传）读取失败必须按「结果待确认」处理，且不能把响应体当成上传成功")
+                .contains("但读取响应体失败：服务端可能已经创建了文档");
+        assertThat(script)
+                .as("解析写入读取失败必须锁住写路径，并且一个字都不提「重试」的好处")
+                .contains("但读取响应体失败，无法确认文档是否已解析成功或已进入失败状态");
+        assertThat(script)
+                .as("解析前重查读取失败同样必须停手：写请求未发送")
+                .contains("但读取响应体失败，无法取得当前版本，因此没有发送解析请求");
+        assertThat(script)
+                .as("查询读取失败也要收尾，不能把查询按钮永久禁用")
+                .contains("但读取响应体失败，无法确认该文档的当前状态。请稍后重试。");
+    }
+
+    /**
+     * FD-0023-D-R1：422 / 413 的响应体是 problem+json，必须按错误体渲染，
+     * 不得当成 {@code ParsedDocumentResponse} 渲染。
+     *
+     * <p>两类响应体都有 {@code title}/{@code status} 字段，但语义完全不同：
+     * 按解析结果渲染会把「文档无法解析」当成文档标题，并凭空显示出空的
+     * 「切片数」「解析完成时间」。</p>
+     */
+    @Test
+    void theKnowledgeScriptRendersParseFailuresAsProblemsInsteadOfParsedResults() {
+        String script = bodyOf("/knowledge.js");
+
+        assertThat(script)
+                .as("必须有一个专门的 problem 渲染函数，并且它的入参是 status + 错误体")
+                .contains("function renderParseProblem(status, problemBody)");
+        assertThat(script)
+                .as("422 / 413 分支必须走 problem 渲染，而不是 renderParseResult")
+                .contains("renderParseProblem(result.status, result.body)");
+        assertThat(script)
+                .as("problem 渲染要显式声明「这是错误响应，不是解析结果」")
+                .contains("这是错误响应，不是解析结果");
+        assertThat(script)
+                .as("problem 渲染要展示固定错误标题/说明与稳定 failureCode")
+                .contains("appendRow(box, '错误标题'")
+                .contains("appendRow(box, '错误说明'")
+                .contains("appendRow(box, '失败代码'");
+        assertThat(script)
+                .as("problem 渲染必须点明它不含切片数与解析完成时间，避免读者误以为是快照")
+                .contains("不含切片数与解析完成时间");
+
+        // 断言 422 / 413 分支附近没有 renderParseResult，防止以后被改回去。
+        int branch = script.indexOf("if (result.status === 422 || result.status === 413) {");
+        assertThat(branch).as("422 / 413 分支必须存在").isGreaterThan(0);
+        String branchBody = script.substring(branch, script.indexOf("if (result.status >= 500) {", branch));
+        assertThat(branchBody)
+                .as("422 / 413 分支里绝不能出现 renderParseResult —— 那是给 200 成功体用的")
+                .doesNotContain("renderParseResult(");
+    }
+
+    /**
+     * FD-0023-D-R1：冲突后的只读刷新不得重建可写目标。
+     *
+     * <p>刷新拿到的版本可能又被第三方改过；若把它写回 {@code currentDocument}，
+     * 就等于用「刚刷新到的版本」重新武装了写路径。刷新只应更新展示。</p>
+     */
+    @Test
+    void theKnowledgeScriptKeepsReadOnlyRefreshFromReArmingTheWritePath() {
+        String script = bodyOf("/knowledge.js");
+
+        assertThat(script)
+                .as("刷新必须走专门的只读渲染函数")
+                .contains("function renderDocumentFromRefresh(documentBody)")
+                .contains("renderDocumentFromRefresh(result.body)");
+        assertThat(script)
+                .as("只读刷新函数必须明确不写可写目标")
+                .contains("刻意不写 {@code currentDocument}")
+                .contains("写目标保持为空");
+
+        // 刷新函数体内不得出现 currentDocument 赋值。
+        int fn = script.indexOf("function renderDocumentFromRefresh(documentBody)");
+        int fnEnd = script.indexOf("// ---- 解析区", fn);
+        assertThat(fn).as("刷新函数必须存在").isGreaterThan(0);
+        assertThat(fnEnd).as("刷新函数应当有明确的结束边界").isGreaterThan(fn);
+        String fnBody = script.substring(fn, fnEnd);
+        assertThat(fnBody)
+                .as("只读刷新绝不能重建可写目标")
+                .doesNotContain("currentDocument =");
+
+        // refreshAfterConflict 的 then 回调里也不得有 currentDocument 赋值。
+        int refresh = script.indexOf("function refreshAfterConflict(targetId)");
+        int refreshEnd = script.indexOf("// ---- 事件绑定", refresh);
+        assertThat(refresh).as("refreshAfterConflict 必须存在").isGreaterThan(0);
+        assertThat(refreshEnd).isGreaterThan(refresh);
+        String refreshBody = script.substring(refresh, refreshEnd);
+        assertThat(refreshBody)
+                .as("冲突后刷新不得写 currentDocument：锁住 = 没有可写目标")
+                .doesNotContain("currentDocument =");
+        assertThat(refreshBody)
+                .as("冲突后刷新也要认读 body 失败，不能把它当成有效快照")
+                .contains("result.bodyReadFailed");
+    }
+
     @Test
     void theHealthEndpointIsUnchanged() {
         ResponseEntity<String> response = this.client.getForEntity("/actuator/health", String.class);

@@ -51,7 +51,15 @@ import org.springframework.test.web.servlet.MvcResult;
         "spring.datasource.url=jdbc:h2:mem:flowdesk_knowledge_web_flow_it"
                 + ";MODE=PostgreSQL;DB_CLOSE_DELAY=-1;DATABASE_TO_LOWER=TRUE",
         "flowdesk.knowledge.storage.root=target/knowledge-web-flow-it",
-        "flowdesk.knowledge.upload.max-size=1MB"
+        "flowdesk.knowledge.upload.max-size=1MB",
+        // FD-0023-D-R1：把「提取文本上限」压到很小，这样一份虚构的短文本就能稳定触发
+        // 413（提取文本超限 / EXTRACTED_TEXT_TOO_LARGE），而不必构造接近 1MB 的样本。
+        // 注意「提取上限必须大于 overlap」这条不变量（见 KnowledgeChunkingProperties），
+        // 因此 overlap 必须一起压低。这里**只压 overlap，不改 chunk-size**：
+        // 改 chunk-size 会改变切片数量，从而影响本类既有的切片数断言（实测 1 → 3），
+        // 那等于为了让新用例通过而改动了别的已验证行为。
+        "flowdesk.knowledge.chunking.overlap=0",
+        "flowdesk.knowledge.chunking.max-extracted-code-points=30"
 })
 @AutoConfigureMockMvc
 class KnowledgeWebFlowHttpContractTests {
@@ -326,6 +334,49 @@ class KnowledgeWebFlowHttpContractTests {
     }
 
     // ---------- ⑤ 页面「服务端是最终校验者」的凭据 ----------
+
+    /**
+     * FD-0023-D-R1：解析返回 413 时，响应体同样是 {@code application/problem+json}，
+     * 而不是 {@code ParsedDocumentResponse}。
+     *
+     * <p>页面必须按错误体渲染（固定 title/detail + {@code failureCode}）。
+     * 这里锁定服务端一侧的形状：413 的字段是
+     * {@code type/title/status/detail/instance/code/failureCode}，
+     * <b>不含</b> {@code documentId/chunkCount/parsedAt} ——
+     * 前端若把两者混为一谈，就会把「文档过大」当成文档标题，并显示出空的切片数与解析完成时间。</p>
+     *
+     * <p>本用例用一份<b>虚构的短文本文档</b>触发「提取文本超过上限」：
+     * 本类把 {@code max-extracted-code-points} 压到 30（overlap 同步压到 0），
+     * 因此一份几十字符的样本即可稳定触发，且不会撞上 {@code upload.max-size=1MB}
+     * 这道<b>上传</b>阶段的限制（两者是不同的闸门）。
+     * 不调用索引、检索、AI 或任何供应商模型。</p>
+     */
+    @Test
+    void anOversizedExtractedTextIsAProblemWithAFailureCodeAndNeverAParsedResponse() throws Exception {
+        // 虚构样例：一段普通文本，只是超过了本用例压小后的「提取文本」上限（30 code points）。
+        String smallButOverTheLine = "示例超长文本（虚构），仅用于触发提取上限：这一段一共有六十个字符左右。";
+        JsonNode uploaded = upload("示例超长文档", "over-limit.txt", "text/plain",
+                smallButOverTheLine.getBytes(StandardCharsets.UTF_8));
+        String documentId = uploaded.path("id").asText();
+
+        this.mockMvc.perform(post(BASE_PATH + "/{id}/parse", documentId)
+                        .header(HttpHeaders.IF_MATCH, quotedVersionOf(lookup(documentId))))
+                .andExpect(status().isPayloadTooLarge())
+                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.code").value("DOCUMENT_TOO_LARGE"))
+                .andExpect(jsonPath("$.failureCode").value("EXTRACTED_TEXT_TOO_LARGE"))
+                .andExpect(jsonPath("$.title").value("文档过大"))
+                .andExpect(jsonPath("$.detail").value("文档提取出的文本超过允许的最大长度"))
+                // 关键：这是错误体，不是解析结果 —— 绝不能带解析结果字段。
+                .andExpect(jsonPath("$.documentId").doesNotExist())
+                .andExpect(jsonPath("$.chunkCount").doesNotExist())
+                .andExpect(jsonPath("$.parsedAt").doesNotExist());
+
+        assertThat(statusOf(documentId))
+                .as("超限同样进入 PARSE_FAILED（而不是永久停在 PARSING）")
+                .isEqualTo("PARSE_FAILED");
+        assertThat(failureCodeOf(documentId)).isEqualTo("EXTRACTED_TEXT_TOO_LARGE");
+    }
 
     @Test
     void theServerRejectsUnsupportedFormatsRegardlessOfWhatThePageClaims() throws Exception {

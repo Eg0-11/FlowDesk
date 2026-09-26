@@ -12,6 +12,20 @@
  * 6. 解析成功响应的 ETag 必须与响应体 version 自洽；不假定解析只加 1。
  * 7. 412 / 409 / 400 / 404 分别提示；网络中断或 5xx 一律提示「结果待确认，请刷新」，不自动重试。
  * 8. 没有列表 API，因此本区如实标注「按 ID 查找」，不伪称能列出全部文档。
+ *
+ * FD-0023-D-R1 补充约束：
+ * 9. 「拿到响应头」不等于「拿到响应体」：读取 body 可能在中途失败（连接被重置、流被截断）。
+ *    这类失败必须与「请求根本没发出去」区分开，并且**永远不能**留下未处理的 Promise 拒绝或
+ *    永久「进行中」状态 —— 按钮会一直禁用，用户再也点不动。因此：
+ *    - requestJson 自己吞掉 body 读取失败，把它表达成 bodyReadFailed 标记；
+ *    - 四条调用路径（上传 / 查询 / 解析前重查 / 解析写入）都必须在两条出口上收尾；
+ *    - 写请求（上传、解析）的 body 读取失败一律按「结果待确认」处理并锁住写路径，绝不自动重试。
+ * 10. 解析返回 422 / 413 时响应体是 problem+json，不是 ParsedDocumentResponse：
+ *     必须按错误体渲染（固定 title/detail + failureCode），不得当成解析结果渲染，
+ *     否则会凭空显示出空的「切片数」「解析完成时间」，把问题体当成文档快照。
+ * 11. 刷新元数据只更新展示：冲突后重新 GET 拿到的版本可能又已被别人改动，
+ *     因此刷新路径不得重建可写目标（currentDocument 保持为空），
+ *     避免「刷新一次就又拿旧版本去写」。
  */
 (function () {
   'use strict';
@@ -149,8 +163,22 @@
   }
 
   /**
-   * 统一的请求包装：永不抛出，把结果压成一个纯数据结构，便于分支判断。
-   * 返回 { status, body, eTag, transportError, formatProblem }。
+   * 统一的请求包装：**永不拒绝**，把结果压成一个纯数据结构，便于分支判断。
+   *
+   * <p>返回 { status, body, eTag, transportError, bodyReadFailed, formatProblem }。</p>
+   *
+   * <p>三种失败各占一个字段，语义互不重叠：</p>
+   * <ul>
+   *   <li>{@code transportError} —— 连响应都没拿到（DNS/连接被拒/请求被中断）；</li>
+   *   <li>{@code bodyReadFailed} —— <b>拿到了响应头</b>（{@code status} 有效）但读 body 失败。
+   *       写请求遇到它意味着「服务端可能已经处理了，但结果读不出来」，属于典型的
+   *       「结果待确认」；把它和网络中断分开，是为了不说「请求没发出去」这种错话。</li>
+   *   <li>{@code formatProblem} —— body 读到了但格式不对（空、非 JSON、不是对象）。</li>
+   * </ul>
+   *
+   * <p>{@code response.text()} 本身也会拒绝（流被重置、内容长度不符），
+   * 这里必须就地 catch：否则整个 Promise 会拒绝，调用方若没挂 {@code .catch}
+   * 就会留下未处理的拒绝，并且「进行中」标记永远不会复位。</p>
    */
   function requestJson(url, options) {
     var settings = options || {};
@@ -160,14 +188,35 @@
     }
     return fetch(url, init).then(function (response) {
       var eTag = response.headers.get('ETag');
-      return response.text().then(function (text) {
-        if (text.length === 0) {
+      var status = response.status;
+      var ok = response.ok;
+      // 读取 body 是一段独立的、可能失败的过程，单独兜住。
+      var readBody = response.text().then(function (text) {
+        return { text: text, failed: false };
+      }, function () {
+        return { text: '', failed: true };
+      });
+      return readBody.then(function (outcome) {
+        if (outcome.failed) {
+          // 拿到了响应头但没读到响应体：既不是「没发出」，也不是「格式不对」。
           return {
-            status: response.status,
+            status: status,
             body: null,
             eTag: eTag,
             transportError: false,
-            formatProblem: response.ok ? '响应体为空，无法确认结果。' : null
+            bodyReadFailed: true,
+            formatProblem: null
+          };
+        }
+        var text = outcome.text;
+        if (text.length === 0) {
+          return {
+            status: status,
+            body: null,
+            eTag: eTag,
+            transportError: false,
+            bodyReadFailed: false,
+            formatProblem: ok ? '响应体为空，无法确认结果。' : null
           };
         }
         var parsed;
@@ -175,27 +224,30 @@
           parsed = JSON.parse(text);
         } catch (error) {
           return {
-            status: response.status,
+            status: status,
             body: null,
             eTag: eTag,
             transportError: false,
-            formatProblem: response.ok ? '响应体不是合法 JSON，无法确认结果。' : null
+            bodyReadFailed: false,
+            formatProblem: ok ? '响应体不是合法 JSON，无法确认结果。' : null
           };
         }
-        if (response.ok && (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed))) {
+        if (ok && (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed))) {
           return {
-            status: response.status,
+            status: status,
             body: null,
             eTag: eTag,
             transportError: false,
+            bodyReadFailed: false,
             formatProblem: '响应体不是 JSON 对象，无法确认结果。'
           };
         }
         return {
-          status: response.status,
+          status: status,
           body: parsed,
           eTag: eTag,
           transportError: false,
+          bodyReadFailed: false,
           formatProblem: null
         };
       });
@@ -205,8 +257,32 @@
         body: null,
         eTag: null,
         transportError: true,
+        bodyReadFailed: false,
         formatProblem: null
       };
+    });
+  }
+
+  /**
+   * 给请求结果挂一个统一的异常兜底。
+   *
+   * <p>{@link requestJson} 已经承诺不拒绝，但「不拒绝」是它的实现细节，
+   * 调用方不应该依赖它来保证状态复位：任何在 {@code .then} 里抛出的渲染异常
+   * 同样会跳过收尾逻辑，让按钮永久禁用。因此四个入口都显式挂上 {@code .catch}，
+   * 把「无论发生什么都收尾」变成结构上的保证，而不是一次性的细心。</p>
+   *
+   * @param promise   requestJson 返回的 Promise
+   * @param onFinish  无论成功失败都必须执行的收尾（复位 busy 与按钮）
+   * @param onCrash   在收尾之外还要做的提示；写请求用它与「结果待确认」对齐
+   */
+  function guard(promise, onFinish, onCrash) {
+    return promise.then(function (result) {
+      onFinish();
+      return result;
+    }, function () {
+      onFinish();
+      onCrash();
+      return null;
     });
   }
 
@@ -329,6 +405,50 @@
     renderParseArea(documentBody);
   }
 
+  /**
+   * 只更新元数据展示的刷新路径（冲突后重新拉取）。
+   *
+   * <p><b>刻意不写 {@code currentDocument}</b>：刷新拿回来的版本可能<b>又</b>被第三方改过，
+   * 一旦写进可写目标，就等于用「刚刷新到的版本」重新武装了写路径 ——
+   * 而这条刷新本身并不是用户发起的核对。因此这里只做只读展示，
+   * 写目标保持为空，用户必须重新「按 ID 查询」才会重新获得可写的目标。</p>
+   */
+  function renderDocumentFromRefresh(documentBody) {
+    var box = element('knowledge-doc-body');
+    if (!box) {
+      return;
+    }
+    box.replaceChildren();
+
+    appendRow(box, '文档 ID', documentBody.id);
+    appendRow(box, '标题', documentBody.title);
+    appendRow(box, '原始文件名', documentBody.originalFilename);
+    appendRow(box, '格式', documentBody.format);
+    appendRow(box, '媒体类型', documentBody.mediaType);
+    appendRow(box, '字节数', isFiniteNumber(documentBody.sizeBytes) ? String(documentBody.sizeBytes) : null);
+    appendRow(box, 'SHA-256', documentBody.sha256);
+    appendRow(box, '状态', labelOfStatus(documentBody.status));
+    appendRow(box, '版本', isFiniteNumber(documentBody.version) ? String(documentBody.version) : null);
+    appendRow(box, '创建时间', documentBody.createdAt);
+    appendRow(box, '更新时间', documentBody.updatedAt);
+    appendRow(box, '解析完成时间', documentBody.parsedAt);
+    appendRow(box, '索引完成时间', documentBody.indexedAt);
+    appendRow(box, '嵌入服务提供方', documentBody.embeddingProvider);
+    appendRow(box, '嵌入模型', documentBody.embeddingModel);
+
+    var note = document.createElement('p');
+    note.className = 'hint';
+    note.textContent =
+      '这是冲突后自动刷新的只读快照（不代表可写目标已重置）。' +
+      '要再次写入，请重新「按 ID 查找」以取得可写目标。';
+    box.appendChild(note);
+
+    show(element('knowledge-doc'), true);
+    // 不调用 renderParseArea：解析区的可写性由锁定状态与显式查询决定，
+    // 刷新只读快照不得改变按钮的可写语义。
+    setDisabled(element('knowledge-parse'), true);
+  }
+
   // ---- 解析区 ---------------------------------------------------------------
 
   /**
@@ -386,6 +506,50 @@
       box.replaceChildren();
       show(box, false);
     }
+  }
+
+  /**
+   * 渲染解析失败的错误体（{@code application/problem+json}）。
+   *
+   * <p><b>为什么必须单独渲染</b>：422 / 413 的响应体是 problem ——
+   * 它的字段是 {@code type/title/status/detail/instance/code/failureCode}，
+   * 而 {@code ParsedDocumentResponse} 的字段是
+   * {@code documentId/title/status/version/chunkCount/parsedAt/failureCode}。
+   * 两者都有 {@code title}、{@code status}、{@code failureCode}，字段名重叠但语义完全不同：
+   * 直接按解析结果渲染会把「文档无法解析」这个错误标题当成文档标题，
+   * 并凭空显示出空的「切片数」「解析完成时间」，把一个错误体伪装成文档快照。</p>
+   *
+   * <p>这里只展示服务端给出的<b>固定安全文案</b>（title + detail）与稳定枚举
+   * {@code failureCode}，不做任何推断与拼接。</p>
+   */
+  function renderParseProblem(status, problemBody) {
+    var box = element('knowledge-parse-result');
+    if (!box) {
+      return;
+    }
+    box.replaceChildren();
+
+    var heading = document.createElement('p');
+    heading.className = 'failed';
+    heading.textContent = '解析失败（HTTP ' + status + '）——这是错误响应，不是解析结果。';
+    box.appendChild(heading);
+
+    var body = problemBody && typeof problemBody === 'object' ? problemBody : {};
+    appendRow(box, '错误标题', typeof body.title === 'string' ? body.title : null);
+    appendRow(box, '错误说明', typeof body.detail === 'string' ? body.detail : null);
+    appendRow(box, '错误码', typeof body.code === 'string' ? body.code : null);
+    if (typeof body.failureCode === 'string' && body.failureCode.length > 0) {
+      appendRow(box, '失败代码', labelOfFailure(body.failureCode) + '（' + body.failureCode + '）');
+    }
+
+    var hint = document.createElement('p');
+    hint.className = 'hint';
+    hint.textContent =
+      '该响应是 problem+json 错误体，不含切片数与解析完成时间。' +
+      '文档通常已进入 PARSE_FAILED 状态、版本也已变化，请重新按 ID 查询后再决定下一步。';
+    box.appendChild(hint);
+
+    show(box, true);
   }
 
   // ---- 上传 ----------------------------------------------------------------
@@ -540,12 +704,30 @@
     setUploadBusy(true);
     setKnowledgeState('pending', '正在上传…');
 
-    requestJson(DOCUMENTS_PATH, {
+    guard(requestJson(DOCUMENTS_PATH, {
       method: 'POST',
       headers: { Accept: 'application/json' },
       body: form
-    }).then(function (result) {
+    }), function () {
       setUploadBusy(false);
+    }, function () {
+      setKnowledgeState('failed', '结果待确认，请刷新');
+      setKnowledgeError('上传请求在页面内异常终止，无法确认服务端是否已经创建文档。请刷新页面后按 ID 查找确认，不要直接重试。');
+    }).then(function (result) {
+      if (result === null) {
+        return; // 已由 onCrash 收尾
+      }
+
+      if (result.bodyReadFailed) {
+        // 拿到了 201 响应头但读不到响应体：文档很可能已创建，但拿不到它的 ID。
+        setKnowledgeState('failed', '结果待确认，请刷新');
+        setKnowledgeError(
+          '上传返回 HTTP ' + result.status +
+            ' 但读取响应体失败：服务端可能已经创建了文档，只是客户端没能读到结果。' +
+            '请刷新页面后按 ID 查找确认，不要直接重试（重试可能会重复创建文档）。'
+        );
+        return;
+      }
 
       if (result.transportError) {
         setKnowledgeState('failed', '结果待确认，请刷新');
@@ -646,6 +828,16 @@
       }
       setDisabled(element('knowledge-lookup-submit'), false);
 
+      // 读 body 失败：查询是只读的，没有「服务端可能已经改了」的风险，
+      // 但同样必须给出明确结果，而不是让按钮永久停在禁用态。
+      if (result.bodyReadFailed) {
+        setKnowledgeState('failed', '查询失败');
+        setKnowledgeError(
+          '查询返回 HTTP ' + result.status + ' 但读取响应体失败，无法确认该文档的当前状态。请稍后重试。'
+        );
+        return;
+      }
+
       if (result.transportError) {
         setKnowledgeState('failed', '查询失败');
         setKnowledgeError('网络中断：无法确认服务端状态。请检查本地服务是否在运行后重试。');
@@ -705,6 +897,11 @@
       };
       clearKnowledgeState();
       renderDocument(result.body);
+    }, function () {
+      // 查询在页面内异常终止：必须恢复可点状态，否则用户再也查不了。
+      setDisabled(element('knowledge-lookup-submit'), false);
+      setKnowledgeState('failed', '查询失败');
+      setKnowledgeError('查询在页面内异常终止，未能取得文档状态。请稍后重试。');
     });
   }
 
@@ -748,46 +945,55 @@
     setKnowledgeState('pending', '正在重新核对文档版本…');
 
     // 第一步：重新 GET。文档 GET 不返回 ETag，因此版本只来自响应体。
-    requestJson(DOCUMENTS_PATH + '/' + encodeURIComponent(targetId), {
+    guard(requestJson(DOCUMENTS_PATH + '/' + encodeURIComponent(targetId), {
       headers: { Accept: 'application/json' }
+    }), function () {
+      setParseBusy(false);
+    }, function () {
+      lockParse('写请求未发送：解析前的版本核对在页面内异常终止，无法确认文档当前状态。');
     }).then(function (probe) {
+      if (probe === null) {
+        return; // 已由 onCrash 收尾并锁定
+      }
+
+      if (probe.bodyReadFailed) {
+        // 核对请求是只读的，但读不到版本就无法安全构造 If-Match —— 此时**不发**写请求。
+        lockParse(
+          '写请求未发送：解析前核对返回 HTTP ' + probe.status +
+            ' 但读取响应体失败，无法取得当前版本，因此没有发送解析请求。'
+        );
+        return;
+      }
       if (probe.transportError) {
-        setParseBusy(false);
         lockParse('写请求未发送：解析前的版本核对请求网络中断，无法确认文档当前状态。');
         return;
       }
       if (probe.status === 404) {
-        setParseBusy(false);
         lockParse('写请求未发送：解析前核对时该文档已不存在（HTTP 404）。');
         return;
       }
       if (probe.status !== 200) {
-        setParseBusy(false);
         lockParse('写请求未发送：解析前核对返回 HTTP ' + probe.status + '，无法确认文档当前状态。');
         return;
       }
       if (probe.formatProblem !== null || probe.body === null) {
-        setParseBusy(false);
         lockParse('写请求未发送：解析前核对的响应体无法解析（' + probe.formatProblem + '）。');
         return;
       }
       if (missingField(probe.body, 'id') || missingField(probe.body, 'version') || missingField(probe.body, 'status')) {
-        setParseBusy(false);
         lockParse('写请求未发送：解析前核对的响应体缺少 id / version / status。');
         return;
       }
       if (String(probe.body.id).toLowerCase() !== targetId.toLowerCase()) {
-        setParseBusy(false);
         lockParse('写请求未发送：解析前核对返回的文档 ID 与目标不一致。');
         return;
       }
 
       // 漂移检查：用户看到的版本/状态若与服务端当前不一致，就刷新展示并锁定，
-      // 绝不拿陈旧版本去写。
+      // 绝不拿陈旧版本去写。刷新走 renderDocumentFromRefresh：只更新展示，
+      // 不重建可写目标（见 FD-0023-D-R1 约束 11）。
       if (probe.body.version !== displayedVersion) {
-        setParseBusy(false);
-        currentDocument = { id: probe.body.id, version: probe.body.version, status: probe.body.status };
-        renderDocument(probe.body);
+        renderDocumentFromRefresh(probe.body);
         lockParse(
           '写请求未发送：文档版本已从 ' + displayedVersion + ' 变为 ' + probe.body.version +
             '（页面已刷新为最新版本）。'
@@ -795,18 +1001,14 @@
         return;
       }
       if (probe.body.status !== displayedStatus) {
-        setParseBusy(false);
-        currentDocument = { id: probe.body.id, version: probe.body.version, status: probe.body.status };
-        renderDocument(probe.body);
+        renderDocumentFromRefresh(probe.body);
         lockParse(
           '写请求未发送：文档状态已从 ' + displayedStatus + ' 变为 ' + probe.body.status + '（页面已刷新为最新状态）。'
         );
         return;
       }
       if (PARSABLE_STATUSES.indexOf(probe.body.status) < 0) {
-        setParseBusy(false);
-        currentDocument = { id: probe.body.id, version: probe.body.version, status: probe.body.status };
-        renderDocument(probe.body);
+        renderDocumentFromRefresh(probe.body);
         lockParse('写请求未发送：当前状态 ' + probe.body.status + ' 不允许解析。');
         return;
       }
@@ -814,7 +1016,6 @@
       // 版本已核对通过：由它构造带双引号的 If-Match，绝不写死 "0"。
       var requestETag = versionTagOf(probe.body);
       if (!isStrongETag(requestETag)) {
-        setParseBusy(false);
         lockParse('写请求未发送：无法由版本号构造合法的强 ETag。');
         return;
       }
@@ -825,19 +1026,38 @@
   }
 
   function sendParseRequest(targetId, displayedStatus, requestETag) {
-    requestJson(DOCUMENTS_PATH + '/' + encodeURIComponent(targetId) + '/parse', {
+    guard(requestJson(DOCUMENTS_PATH + '/' + encodeURIComponent(targetId) + '/parse', {
       method: 'POST',
       headers: {
         Accept: 'application/json',
         'If-Match': requestETag
       }
-    }).then(function (result) {
+    }), function () {
       setParseBusy(false);
+    }, function () {
+      // 写请求在页面内异常终止：同样属于「结果待确认」，必须锁住写路径。
+      setKnowledgeState('failed', '结果待确认，请刷新');
+      lockParse('解析请求在页面内异常终止，无法确认服务端是否已经改变了文档状态。');
+    }).then(function (result) {
+      if (result === null) {
+        return; // 已由 onCrash 收尾并锁定
+      }
       handleParseResult(targetId, displayedStatus, requestETag, result);
     });
   }
 
   function handleParseResult(targetId, displayedStatus, requestETag, result) {
+    // 拿到了响应头但读不到 body：服务端**很可能已经**解析完成（或已记失败），
+    // 但客户端拿不到权威版本号。这正是「结果待确认」，必须锁住写路径且不自动重试。
+    if (result.bodyReadFailed) {
+      setKnowledgeState('failed', '结果待确认，请刷新');
+      lockParse(
+        '解析返回 HTTP ' + result.status +
+          ' 但读取响应体失败，无法确认文档是否已解析成功或已进入失败状态。'
+      );
+      return;
+    }
+
     if (result.transportError) {
       setKnowledgeState('failed', '结果待确认，请刷新');
       lockParse('解析请求网络中断，无法确认服务端是否已经改变了文档状态。');
@@ -886,18 +1106,16 @@
     }
 
     if (result.status === 422 || result.status === 413) {
-      // 解析/切片失败：文档进入 PARSE_FAILED 或超限，版本已经变化，必须刷新展示。
-      if (result.formatProblem === null && result.body !== null) {
-        setKnowledgeState('failed', '解析失败');
-        renderParseResult(result.body);
-        setKnowledgeError(
-          describeProblem(result.status, result.body) +
-            '文档可能已进入失败状态，页面显示的版本已过期，请重新查询确认。'
-        );
-      } else {
-        setKnowledgeState('failed', '解析失败');
-        setKnowledgeError(describeProblem(result.status, result.body));
+      // 解析/切片失败：响应体是 problem+json（不是 ParsedDocumentResponse），
+      // 文档已进入 PARSE_FAILED 且版本已变化，必须刷新展示。
+      setKnowledgeState('failed', '解析失败');
+      if (result.body !== null && result.formatProblem === null) {
+        renderParseProblem(result.status, result.body);
       }
+      setKnowledgeError(
+        describeProblem(result.status, result.body) +
+          '文档已进入失败状态，页面显示的版本已过期，请重新查询确认。'
+      );
       refreshAfterConflict(targetId);
       return;
     }
@@ -964,7 +1182,13 @@
     }
   }
 
-  /** 版本/状态冲突后重新拉取一次展示，让页面与真实状态对齐（只读，不改数据）。 */
+  /**
+   * 版本/状态冲突后重新拉取一次展示，让页面与真实状态对齐（只读，不改数据）。
+   *
+   * <p>这里**只更新展示**：不写 {@code currentDocument}、不碰解析区按钮。
+   * 刷新前「不得用旧版本再次写入」这条规则，靠的是「锁住时写目标为空」这个显式不变量，
+   * 而不是靠「锁定标志恰好还在」这种巧合。</p>
+   */
   function refreshAfterConflict(targetId) {
     lookupToken += 1;
     var token = lookupToken;
@@ -974,16 +1198,14 @@
       if (token !== lookupToken) {
         return;
       }
-      if (result.transportError || result.status !== 200 || result.body === null ||
+      // 读 body 失败或任何异常：保留原有错误提示，不覆盖、也不改变可写状态。
+      if (result.transportError || result.bodyReadFailed || result.status !== 200 || result.body === null ||
           missingField(result.body, 'id') || missingField(result.body, 'version') || missingField(result.body, 'status')) {
-        return; // 刷新失败时保留原有错误提示，不覆盖
+        return;
       }
-      currentDocument = {
-        id: result.body.id,
-        version: result.body.version,
-        status: result.body.status
-      };
-      renderDocument(result.body);
+      renderDocumentFromRefresh(result.body);
+    }, function () {
+      // 刷新失败不影响既有锁定与提示。
     });
   }
 
