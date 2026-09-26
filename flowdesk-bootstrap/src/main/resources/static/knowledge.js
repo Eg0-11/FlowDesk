@@ -33,11 +33,15 @@
  *     而不是靠异步回调的先后。
  * 13. 索引（FD-0023-E）只由用户显式确认触发：按钮必须在勾选「索引可能调用 DashScope
  *     Embedding 并产生费用」之后才会启用；页面加载、查询或解析成功都**不会**自动索引。
+ *     费用确认是**一次性授权**（FD-0023-E-R1）：点击「索引」发起即消耗（勾选框同步清空），
+ *     重新按 ID 查询或切换文档同样清空；已经在途的请求不读确认状态，不受勾选变化影响。
  *     确认后索引前同样重新 GET 核对 ID / 状态 / 版本，再由当前版本构造 If-Match，
  *     最多发送一次索引写请求。200 必须自洽（文档 ID 一致、状态是 INDEXED、
- *     ETag 与响应体版本一致）才承认成功；400 / 404 / 409 / 412 / 428 与 Basic 模式的
- *     503 分别提示；网络中断 / 读体失败 / 其它 5xx / 成功响应不自洽 → 锁定索引区并
- *     提示「结果待确认，请重新查询」，不自动重试。
+ *     ETag 与响应体版本一致）才承认成功；400 / 404 / 409 / 412 / 428 分别提示；
+ *     503 只有在 problem.code 明确为 KNOWLEDGE_EMBEDDING_DISABLED（Basic 模式）时才按
+ *     「索引未执行、文档未修改」的确定结果提示，其余 503（响应体非 JSON / 缺错误码 /
+ *     错误码不同）与网络中断 / 读体失败 / 其它 5xx / 成功响应不自洽一样 → 锁定索引区
+ *     并提示「结果待确认，请重新查询」，不自动重试。
  */
 (function () {
   'use strict';
@@ -96,6 +100,12 @@
   // 索引区锁定标志（FD-0023-E）：语义与解析区一致 —— 异常后锁住写路径，
   // 只有用户重新「按 ID 查询」才解锁。
   var indexLocked = false;
+
+  // 费用确认的「本次授权」标志（FD-0023-E-R1）：勾选框负责把它置位，
+  // 索引一旦发起就消耗（置回 false 并同步清空勾选框）；重新按 ID 查询
+  // 或切换文档同样清空。它不是会话级开关 —— 每发一次索引都要重新勾选。
+  // 在途请求不读它，因此发起后勾选框如何变化都不影响已在途的那一次请求。
+  var indexArmed = false;
 
   // 每次 GET 递增；用于丢弃迟到的旧响应，避免覆盖用户刚看到的新结果。
   var lookupToken = 0;
@@ -516,12 +526,25 @@
   // ---- 索引区（FD-0023-E）---------------------------------------------------
 
   /**
-   * 用户是否勾选了费用确认。索引按钮只有在勾选后才可能启用 ——
-   * 页面加载、查询或解析成功都不会（也不允许）自动索引。
+   * 本次费用确认授权是否仍然有效。授权由勾选框置位（见 setIndexConfirmation）、
+   * 由「索引发起」消耗 —— 这里读的是 indexArmed 标志而不是勾选框本身：
+   * 发起时勾选框会被程序清空，读标志才能让「发起即消耗」不依赖 DOM 同步时序。
    */
   function isIndexConfirmed() {
+    return indexArmed;
+  }
+
+  /**
+   * 费用确认的唯一写入口：同时维护授权标志与勾选框选中态，
+   * 用户勾选/取消、发起消耗、重新查询清空三条路径都走这里，
+   * 不会出现「标志与勾选框不一致」的窗口。
+   */
+  function setIndexConfirmation(confirmed) {
+    indexArmed = !!confirmed;
     var box = element('knowledge-index-confirm');
-    return !!(box && box.checked);
+    if (box) {
+      box.checked = indexArmed;
+    }
   }
 
   /**
@@ -556,7 +579,8 @@
     }
     setText(
       note,
-      '当前状态 ' + documentBody.status + '：已勾选费用确认，可以点击「索引」。' +
+      '当前状态 ' + documentBody.status + '：已确认费用，本次确认只授权一次索引' +
+        '（点击「索引」后确认即被消耗，再次索引需要重新勾选）。' +
         '索引前会重新查询核对版本，最多发送一次索引写请求。'
     );
   }
@@ -920,6 +944,9 @@
 
     // 用户显式发起查询 = 唯一解锁入口：先解锁，再看这次查询的结果。
     unlockParseArea();
+    // 重新查询 = 目标文档可能已切换：上一次的费用确认不延续到这次查询
+    // 查到的文档（FD-0023-E-R1），重新勾选后才能再发起索引。
+    setIndexConfirmation(false);
     clearDocumentView();
     clearParseResult();
     clearIndexResult();
@@ -1061,8 +1088,9 @@
   /**
    * 索引失败后的统一收口：锁定索引区，要求用户重新查询。不提供任何自动重试。
    *
-   * <p>{@code outcomeUncertain} 为 {@code false} 时（例如 Basic 模式的 503：
-   * 服务端保证请求没有执行、文档未被读取或修改），结果其实是<b>确定的</b>，
+   * <p>{@code outcomeUncertain} 为 {@code false} 时（目前只有 503 且 problem.code
+   * 明确为 KNOWLEDGE_EMBEDDING_DISABLED 的 Basic 模式拒绝：服务端保证请求没有执行、
+   * 文档未被读取或修改），结果其实是<b>确定的</b>，
    * 因此不宣称「结果未知」，只提示不自动重试。</p>
    */
   function lockIndex(message, outcomeUncertain) {
@@ -1341,10 +1369,14 @@
       return;
     }
     if (!isIndexConfirmed()) {
-      // 按钮在未勾选时本应禁用；这里再拦一次，保证不存在「没确认就发请求」的路径。
+      // 按钮在未确认时本应禁用；这里再拦一次，保证不存在「没确认就发请求」的路径。
       setKnowledgeError('索引尚未确认：请先勾选「索引可能调用 DashScope Embedding 并产生费用」。');
       return;
     }
+    // 费用确认是一次性授权（FD-0023-E-R1）：发起即消耗，勾选框同步清空。
+    // 这次已发出的请求不读确认状态，在途期间勾选框怎么变都不影响它；
+    // 之后想再索引（包括这次预检失败后重试）都必须重新勾选。
+    setIndexConfirmation(false);
     var targetId = currentDocument.id;
     var displayedVersion = currentDocument.version;
     var displayedStatus = currentDocument.status;
@@ -1520,9 +1552,12 @@
       return;
     }
 
-    // 503（Basic 模式）：Embedding 未启用。服务端保证此时不读取、不修改文档、
-    // 请求也没有执行 —— 结果是确定的，不宣称「结果未知」。
-    if (result.status === 503) {
+    // 503 只有在 problem.code 明确为 KNOWLEDGE_EMBEDDING_DISABLED（Basic 模式）时，
+    // 服务端契约才保证「不读取、不修改文档、请求也没有执行」—— 结果是确定的，
+    // 不宣称「结果未知」。其余 503（响应体非 JSON、缺错误码或错误码不同）不在这份
+    // 契约范围内，无法断定服务端做了什么，按「结果待确认」处理（落入下方 >= 500 分支）。
+    // problemCode 对 null / 非 JSON / 缺 code 的响应体一律返回空串，天然落入下一分支。
+    if (result.status === 503 && problemCode(result.body) === 'KNOWLEDGE_EMBEDDING_DISABLED') {
       setKnowledgeState('failed', '索引被拒绝');
       lockIndex(
         '索引被拒绝（HTTP 503）：Embedding 服务未启用（Basic 模式），索引请求没有执行，' +
@@ -1651,7 +1686,12 @@
     }
     var indexConfirm = element('knowledge-index-confirm');
     if (indexConfirm) {
-      indexConfirm.addEventListener('change', refreshIndexButton);
+      indexConfirm.addEventListener('change', function () {
+        // 勾选/取消先落到授权标志上（FD-0023-E-R1 的一次性授权以它为准），
+        // 再按当前状态重新评估索引按钮的可点性。
+        setIndexConfirmation(indexConfirm.checked);
+        refreshIndexButton();
+      });
     }
     renderStaticHints();
   }

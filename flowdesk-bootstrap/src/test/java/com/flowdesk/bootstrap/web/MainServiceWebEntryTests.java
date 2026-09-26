@@ -634,11 +634,15 @@ class MainServiceWebEntryTests {
     }
 
     /**
-     * FD-0023-E：手动索引必须在用户显式确认费用后、经版本核对才能发生。
+     * FD-0023-E / FD-0023-E-R1：手动索引必须在用户显式确认费用后、经版本核对才能发生。
      *
-     * <p>页面加载、查询、解析成功都<b>不会</b>自动索引；按钮只在勾选「索引可能调用
-     * DashScope Embedding 并产生费用」后才会启用；Basic 模式（Embedding 未启用）的 503
-     * 结果是确定的（请求没执行、文档未动），因此不宣称「结果未知」。</p>
+     * <p>页面加载、查询、解析成功都<b>不会</b>自动索引；按钮只在确认费用后才会启用。
+     * 费用确认是一次性授权（FD-0023-E-R1）：索引发起即消耗（勾选框同步清空），
+     * 重新按 ID 查询或切换文档必须重新确认；在途请求不读确认状态，不受勾选变化影响。</p>
+     *
+     * <p>503 只有在 problem.code 明确为 KNOWLEDGE_EMBEDDING_DISABLED（Basic 模式，
+     * Embedding 未启用）时结果才是确定的（请求没执行、文档未动），不宣称「结果未知」；
+     * 其余 503（响应体非 JSON / 缺错误码 / 错误码不同）必须按「结果待确认」锁定。</p>
      */
     @Test
     void theKnowledgeScriptIndexesOnlyAfterExplicitCostConfirmation() {
@@ -677,8 +681,8 @@ class MainServiceWebEntryTests {
                 .contains("result.body.status !== 'INDEXED'")
                 .contains("索引返回 200，但响应头 ETag 与响应体版本不一致，响应不自洽。");
         assertThat(script)
-                .as("400 / 404 / 409 / 412 / 428 / 503 必须分别提示")
-                .contains("result.status === 503")
+                .as("400 / 404 / 409 / 412 / 428 / 503 必须分别提示；503 必须以 problem.code 门控（FD-0023-E-R1）")
+                .contains("result.status === 503 && problemCode(result.body) === 'KNOWLEDGE_EMBEDDING_DISABLED'")
                 .contains("Embedding 服务未启用（Basic 模式）")
                 .contains("result.status === 412")
                 .contains("result.status === 409")
@@ -734,12 +738,50 @@ class MainServiceWebEntryTests {
                 .contains("setDisabled(element('knowledge-index'), true);")
                 .doesNotContain("currentDocument =");
 
-        // 确认闸门：未勾选时 indexDocument 必须拒绝执行；按钮与确认框都要绑定事件。
+        // 确认闸门：未确认时 indexDocument 必须拒绝执行；按钮与确认框都要绑定事件。
+        // FD-0023-E-R1：确认以授权标志（indexArmed）为准，勾选/取消经唯一写入口落标志。
         assertThat(script)
-                .as("indexDocument 必须先检查费用确认勾选")
+                .as("indexDocument 必须先检查费用确认")
                 .contains("if (!isIndexConfirmed()) {")
                 .contains("indexButton.addEventListener('click', indexDocument)")
-                .contains("indexConfirm.addEventListener('change', refreshIndexButton)");
+                .contains("indexConfirm.addEventListener('change', function () {")
+                .contains("setIndexConfirmation(indexConfirm.checked);");
+
+        // FD-0023-E-R1：费用确认是一次性授权，授权标志是唯一事实来源。
+        assertThat(script)
+                .as("确认必须以授权标志承载，勾选框只经唯一写入口同步")
+                .contains("var indexArmed = false;")
+                .contains("function setIndexConfirmation(confirmed)");
+        int confirmedFn = script.indexOf("function isIndexConfirmed()");
+        int confirmedFnEnd = script.indexOf("function setIndexConfirmation(", confirmedFn);
+        assertThat(confirmedFn).as("isIndexConfirmed 必须存在").isGreaterThan(0);
+        assertThat(confirmedFnEnd).isGreaterThan(confirmedFn);
+        assertThat(script.substring(confirmedFn, confirmedFnEnd))
+                .as("isIndexConfirmed 必须读授权标志而不是勾选框（发起即消耗不依赖 DOM 同步时序）")
+                .contains("return indexArmed;")
+                .doesNotContain("box.checked");
+
+        // 发起即消耗：indexDocument 通过守卫后、发预检 GET 前必须消耗确认（并清勾选框）。
+        int indexFn = script.indexOf("function indexDocument()");
+        int indexFnEnd = script.indexOf("function sendIndexRequest(", indexFn);
+        assertThat(indexFn).as("indexDocument 必须存在").isGreaterThan(0);
+        assertThat(indexFnEnd).isGreaterThan(indexFn);
+        String indexBody = script.substring(indexFn, indexFnEnd);
+        assertThat(indexBody)
+                .as("发起索引必须消耗一次性费用确认")
+                .contains("setIndexConfirmation(false);");
+        assertThat(indexBody.indexOf("if (!isIndexConfirmed()) {"))
+                .as("消耗必须发生在确认守卫之后（先核对、再消耗）")
+                .isLessThan(indexBody.indexOf("setIndexConfirmation(false);"));
+
+        // 重新查询或切换文档必须重新确认：lookupDocument 里清掉授权与勾选框。
+        int lookupFn = script.indexOf("function lookupDocument()");
+        int lookupFnEnd = script.indexOf("// ---- 解析", lookupFn);
+        assertThat(lookupFn).as("lookupDocument 必须存在").isGreaterThan(0);
+        assertThat(lookupFnEnd).isGreaterThan(lookupFn);
+        assertThat(script.substring(lookupFn, lookupFnEnd))
+                .as("重新按 ID 查询必须清掉上一次的费用确认授权")
+                .contains("setIndexConfirmation(false);");
 
         // 绝不自动索引：indexDocument 只能有一个定义；标识符引用总数必须是 2
         // （定义 1 次 + 按钮绑定以函数引用形式出现 1 次）。绑定是 addEventListener
