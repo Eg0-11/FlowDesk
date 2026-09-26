@@ -260,6 +260,18 @@ th {
     color: var(--ok);
 }
 
+.knowledge-id {
+    font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+    font-weight: 600;
+    user-select: all;
+}
+
+.knowledge-copy-fallback {
+    flex: 1 1 240px;
+    min-width: 0;
+    font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+}
+
 .page-footer {
     padding-top: 18px;
 }

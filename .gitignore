@@ -34,3 +34,7 @@ application-local.yaml
 
 # ---- 本地运行信息（scripts/start-local.ps1 写入：PID、启动时间、目标 JAR、日志）----
 .local-run/
+
+# ---- 本地运行期落盘的数据（默认 flowdesk.knowledge.storage.root=data/knowledge）----
+# 这是跑起来才会产生的知识文档正文对象，不属于源码；测试与演示都用自己的临时目录。
+data/

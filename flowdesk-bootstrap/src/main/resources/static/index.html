@@ -19,7 +19,8 @@
         <a href="#tickets">工单列表</a>
         <a href="#create">新建工单</a>
         <a href="#detail">工单详情</a>
-        <span class="nav-todo">后续页面：知识库 / AI 研判（尚未实现）</span>
+        <a href="#knowledge">知识文档</a>
+        <span class="nav-todo">后续页面：AI 研判（尚未实现）</span>
     </nav>
 </header>
 
@@ -33,6 +34,7 @@
             <li>当前阶段提供：列表（可翻页）、单条详情、新建工单，以及按真实状态可用的<b>状态变更</b>（分配 / 重新分配 / 开始处理 / 解决 / 关闭）；写请求只有在你点击操作之后才发出，且只使用单条详情的强 ETag 做并发控制。</li>
             <li>切换详情会<b>立刻清空</b>上一条件工单的操作区：新详情取不到（404、网络中断或响应格式异常）时<b>不会</b>对旧工单发出写请求；写请求前的预检如果发现版本与你看到的详情<b>不一致</b>（哪怕状态相同），本次操作会直接取消、一个写请求都不发。</li>
             <li>一旦出现版本漂移、状态变化、响应格式异常，或写请求得到<b>不完整</b>的成功响应，详情仍可阅读，但操作区会被<b>锁住</b>（按钮清空，连点也发不出写请求）；只有点「刷新详情」取得有效的单条详情响应后，才按新状态重建按钮。首次打开详情时若强 ETag 缺失、格式不符合后端规范，或与响应体版本不一致，同样只展示<b>只读详情</b>，不提供操作。</li>
+            <li>知识文档区（上传 / 按 ID 查找 / 解析）同样只在点击后发请求；它<b>不</b>调用列表、索引、检索或 AI 接口，因此也不产生模型费用。</li>
         </ul>
     </section>
 
@@ -127,6 +129,67 @@
             <div id="detail-action-result" class="state" hidden></div>
         </div>
     </section>
+
+    <section id="knowledge">
+        <h2>知识文档</h2>
+        <p class="hint">
+            这里的逻辑由独立的 <code>knowledge.js</code> 负责，与工单脚本互不影响。
+            后端<b>没有</b>文档列表接口，所以本区只能「<b>按 ID 查找</b>」已知的文档，
+            <b>不能</b>列出全部文档；页面也不会伪称它能列出来。
+        </p>
+        <p class="hint">
+            <span id="knowledge-format-hint"></span>
+            <span id="knowledge-size-hint"></span>
+            浏览器端的提示只是方便你少走弯路，<b>服务端始终是最终校验者</b>：格式不符返回 415，超过上限返回 413。
+        </p>
+
+        <h3>上传文档</h3>
+        <p class="hint">上传使用后端既有的 multipart（<code>title</code> + <code>file</code>）。成功时返回 201 与 <code>Location</code>，<b>没有</b> ETag。</p>
+        <form id="knowledge-upload" autocomplete="off">
+            <div class="field">
+                <label for="knowledge-title">标题</label>
+                <input id="knowledge-title" name="title" type="text" maxlength="200" required>
+            </div>
+            <div class="field">
+                <label for="knowledge-file">文件</label>
+                <input id="knowledge-file" name="file" type="file" required>
+            </div>
+            <p class="toolbar">
+                <button id="knowledge-upload-submit" type="submit">上传</button>
+            </p>
+        </form>
+        <div id="knowledge-upload-result" class="panel" hidden></div>
+
+        <h3>按 ID 查找</h3>
+        <p class="hint">文档查询接口<b>没有</b> ETag，因此下面的版本号只是本次查询的快照。</p>
+        <form id="knowledge-lookup-form" autocomplete="off">
+            <div class="field">
+                <label for="knowledge-lookup">文档 ID（36 位 UUID）</label>
+                <input id="knowledge-lookup" name="documentId" type="text" maxlength="64">
+            </div>
+            <p class="toolbar">
+                <button id="knowledge-lookup-submit" type="submit">按 ID 查询</button>
+            </p>
+        </form>
+
+        <div id="knowledge-state" class="state" hidden role="status"></div>
+        <div id="knowledge-error" class="error" hidden></div>
+        <div id="knowledge-doc" class="panel" hidden>
+            <div id="knowledge-doc-body"></div>
+            <div class="toolbar">
+                <button id="knowledge-parse" type="button" disabled>解析</button>
+            </div>
+            <p id="knowledge-parse-note" class="hint"></p>
+            <p class="hint">
+                只有 <code>UPLOADED</code> / <code>PARSE_FAILED</code> 允许解析。点击「解析」时会
+                <b>先重新查询</b>，核对文档 ID、状态和你看到的版本，再由该版本构造带双引号的
+                <code>If-Match</code>（<b>不会</b>写死 <code>"0"</code>）。
+                版本不一致时本次写请求<b>直接取消</b>。解析成功后，响应头 ETag 必须与响应体版本一致，
+                页面按服务端返回的权威版本更新，<b>不假定</b>解析只加 1。
+            </p>
+            <div id="knowledge-parse-result" class="panel" hidden></div>
+        </div>
+    </section>
 </main>
 
 <footer class="page-footer">
@@ -134,5 +197,6 @@
 </footer>
 
 <script src="/app.js"></script>
+<script src="/knowledge.js"></script>
 </body>
 </html>

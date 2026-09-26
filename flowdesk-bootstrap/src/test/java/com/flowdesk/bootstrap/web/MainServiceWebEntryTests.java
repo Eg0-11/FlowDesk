@@ -62,33 +62,51 @@ class MainServiceWebEntryTests {
     void theStaticAssetsOfTheEntryPageAreServed() {
         ResponseEntity<String> page = this.client.getForEntity("/index.html", String.class);
         ResponseEntity<String> script = this.client.getForEntity("/app.js", String.class);
+        ResponseEntity<String> knowledgeScript = this.client.getForEntity("/knowledge.js", String.class);
         ResponseEntity<String> style = this.client.getForEntity("/app.css", String.class);
 
         assertThat(page.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(script.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(knowledgeScript.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(style.getStatusCode()).isEqualTo(HttpStatus.OK);
     }
 
     @Test
     void thePageOnlyUsesRelativePathsAndSafeEndpoints() {
         String page = bodyOf("/");
-        String script = bodyOf("/app.js");
-        String combined = page + "\n" + script;
+        String ticketScript = bodyOf("/app.js");
+        String knowledgeScript = bodyOf("/knowledge.js");
 
-        assertThat(combined)
-                .as("不写死主机名与端口：页面只用相对路径")
+        assertThat(page + "\n" + ticketScript + "\n" + knowledgeScript)
+                .as("不写死主机名与端口：三个资源都只用相对路径")
                 .doesNotContain("http://")
                 .doesNotContain("https://");
-        assertThat(combined)
-                .as("页面不得出现索引 / 检索 / AI 接口 —— 否则加载页面就可能写数据或产生模型费用")
+
+        // FD-0023-D：知识文档区有自己的脚本，因此「哪些端点允许出现」必须按文件分别断言，
+        // 否则「工单脚本不得碰知识接口」这条规则会被新页面悄悄放宽。
+        assertThat(ticketScript)
+                .as("工单脚本不得出现知识 / 索引 / 检索 / AI 接口 —— 否则加载页面就可能写数据或产生模型费用")
                 .doesNotContain("/api/v1/knowledge")
                 .doesNotContain("/api/v1/ai")
                 .doesNotContain("/index")
                 .doesNotContain("/search");
-        assertThat(combined)
-                .as("工单列表入口与健康检查使用相对路径")
+        assertThat(ticketScript)
+                .as("工单脚本只碰工单接口与健康检查")
                 .contains("/api/v1/tickets")
                 .contains("/actuator/health");
+
+        assertThat(knowledgeScript)
+                .as("知识脚本只允许出现文档端点：不得调索引、检索或 AI 接口")
+                .contains("/api/v1/knowledge/documents")
+                .doesNotContain("/api/v1/ai")
+                .doesNotContain("/incident-triage")
+                .doesNotContain("/asset-diagnosis")
+                .doesNotContain("/search")
+                .doesNotContain("/index");
+        assertThat(page)
+                .as("页面本身仍然只引用自己同源的静态资源")
+                .contains("/app.js")
+                .contains("/knowledge.js");
     }
 
     @Test
@@ -231,6 +249,153 @@ class MainServiceWebEntryTests {
                 .as("首次打开详情时强 ETag 不可用要退化为只读详情，不渲染操作区")
                 .contains("renderDetail(result.body, result.eTag, true);")
                 .contains("只读详情：");
+    }
+
+    /**
+     * FD-0023-D：知识文档区的脚本必须自带「只读加载」「点击才写」「按版本构造 If-Match」三类守卫。
+     *
+     * <p>这里只断言脚本源码里存在这些结构；真实请求次数、If-Match 的实际取值、
+     * 以及各类错误的渲染文案由真实 HTTP 用例与浏览器行为测试锁定。</p>
+     */
+    @Test
+    void theKnowledgeScriptNeverWritesAtLoadTimeAndOnlyThroughTwoClicks() {
+        String script = bodyOf("/knowledge.js");
+
+        int posts = 0;
+        Matcher matcher = POST_MARKER.matcher(script);
+        while (matcher.find()) {
+            posts++;
+        }
+        assertThat(posts)
+                .as("知识脚本里只能有两处写请求：上传 + 解析；查询与解析前的核对都是只读 GET")
+                .isEqualTo(2);
+
+        assertThat(script)
+                .as("加载路径不得直接发请求：所有网络调用都在事件处理函数 / 点击触发的函数里")
+                .contains("addEventListener('submit'")
+                .contains("addEventListener('click'");
+        assertThat(script)
+                .as("上传只能由表单提交触发")
+                .contains("function submitUpload(event)");
+        assertThat(script)
+                .as("解析只能由按钮点击触发")
+                .contains("parseButton.addEventListener('click', parseDocument)");
+        assertThat(script)
+                .as("本脚本不注册 DOMContentLoaded 期的网络调用")
+                .doesNotContain("DOMContentLoaded', loadHealth")
+                .doesNotContain("loadHealth(");
+    }
+
+    @Test
+    void theKnowledgeScriptBuildsIfMatchFromTheVerifiedVersionAndNeverHardCodesZero() {
+        String script = bodyOf("/knowledge.js");
+
+        assertThat(script)
+                .as("解析前必须先重新 GET 核对")
+                .contains("正在重新核对文档版本");
+        assertThat(script)
+                .as("If-Match 必须由核对到的版本构造，格式为带双引号的十进制")
+                .contains("versionTagOf(probe.body)")
+                .contains("var requestETag = versionTagOf(probe.body);");
+        assertThat(script)
+                .as("绝不能写死 \"0\" 作为 If-Match")
+                .doesNotContain("'If-Match': '\"0\"'")
+                .doesNotContain("\"If-Match\": \"\\\"0\\\"\"");
+        assertThat(script)
+                .as("核对必须覆盖文档 ID、版本与状态三项")
+                .contains("probe.body.version !== displayedVersion")
+                .contains("probe.body.status !== displayedStatus")
+                .contains("String(probe.body.id).toLowerCase() !== targetId.toLowerCase()");
+        assertThat(script)
+                .as("任何核对失败都必须明确写出「写请求未发送」")
+                .contains("写请求未发送");
+        assertThat(script)
+                .as("只有 UPLOADED / PARSE_FAILED 允许解析")
+                .contains("PARSABLE_STATUSES = ['UPLOADED', 'PARSE_FAILED']")
+                .contains("PARSABLE_STATUSES.indexOf(probe.body.status) < 0");
+    }
+
+    @Test
+    void theKnowledgeScriptTreatsParseSuccessAsAuthoritativeAndNeverAssumesPlusOne() {
+        String script = bodyOf("/knowledge.js");
+
+        assertThat(script)
+                .as("成功响应的 ETag 必须与响应体版本自洽，否则不认这个成功")
+                .contains("result.eTag !== versionTagOf(result.body)")
+                .contains("响应体版本 ");
+        assertThat(script)
+                .as("成功响应的文档 ID 必须与请求目标一致")
+                .contains("result.body.documentId");
+        assertThat(script)
+                .as("版本一律取服务端返回的权威值，脚本里不得出现 +1 / ++ 这类自增推断")
+                .contains("version: result.body.version")
+                .doesNotContain("version + 1")
+                .doesNotContain("body.version++")
+                .doesNotContain("++result.body.version");
+        assertThat(script)
+                .as("失败要用服务端返回的 failureCode，而不是自己猜")
+                .contains("failureCode")
+                .contains("labelOfFailure");
+    }
+
+    @Test
+    void theKnowledgeScriptSeparatesTheFourErrorStatusesAndNeverRetriesAutomatically() {
+        String script = bodyOf("/knowledge.js");
+
+        assertThat(script)
+                .as("412 / 409 / 400 / 404 必须分别提示")
+                .contains("result.status === 412")
+                .contains("result.status === 409")
+                .contains("result.status === 400")
+                .contains("result.status === 404");
+        assertThat(script)
+                .as("网络中断与 5xx 一律给出「结果待确认，请刷新」")
+                .contains("结果待确认，请刷新")
+                .contains("result.transportError")
+                .contains("result.status >= 500");
+        assertThat(script)
+                .as("明确不自动重试：不得出现重试循环或重新调用写请求的兜底")
+                .doesNotContain("setTimeout(parseDocument")
+                .doesNotContain("setTimeout(submitUpload")
+                .doesNotContain("retry(")
+                .doesNotContain("while (");
+        assertThat(script)
+                .as("异常结果后解析区要锁定，且锁定后不再持有可写目标")
+                .contains("function lockParse(message)")
+                .contains("currentDocument = null;");
+        assertThat(script)
+                .as("锁定必须是独立状态：冲突后刷新只读元数据不得把按钮重新点亮")
+                .contains("var parseLocked = false;")
+                .contains("if (parseLocked) {")
+                .contains("parseLocked = true;");
+        assertThat(script)
+                .as("用户显式「按 ID 查询」是唯一解锁入口，写路径入口也受锁约束")
+                .contains("function unlockParseArea()")
+                .contains("unlockParseArea();")
+                .contains("if (parsing || parseLocked || !currentDocument) {");
+    }
+
+    @Test
+    void theKnowledgeScriptRendersTextOnlyAndIsHonestAboutTheMissingListApi() {
+        String script = bodyOf("/knowledge.js");
+        String page = bodyOf("/");
+
+        assertThat(script)
+                .as("服务端字符串只能作为文本渲染")
+                .doesNotContain("innerHTML")
+                .doesNotContain("outerHTML")
+                .doesNotContain("insertAdjacentHTML")
+                .doesNotContain("document.write");
+        assertThat(page)
+                .as("页面必须如实标注「按 ID 查找」，并说明后端没有列表接口")
+                .contains("按 ID 查找")
+                .contains("没有</b>文档列表接口")
+                .contains("不能</b>列出全部文档");
+        assertThat(page)
+                .as("页面要给出格式与体积提示，并声明服务端是最终校验者")
+                .contains("knowledge-format-hint")
+                .contains("knowledge-size-hint")
+                .contains("服务端始终是最终校验者");
     }
 
     @Test
