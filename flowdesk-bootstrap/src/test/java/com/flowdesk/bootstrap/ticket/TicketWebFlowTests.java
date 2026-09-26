@@ -122,6 +122,25 @@ class TicketWebFlowTests {
         }
     }
 
+    @Test
+    void theRealEmptyListContractHasZeroTotalPages() throws Exception {
+        // 用一个不可能命中的过滤条件取得「真实空列表」响应（与库里有几条数据无关）
+        ResponseEntity<String> response = this.client.getForEntity(
+                "/api/v1/tickets?page=0&size=10&requesterId=no-such-requester-fd0023br2", String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        JsonNode empty = this.objectMapper.readTree(response.getBody());
+
+        assertThat(empty.path("items")).as("空列表：items 是空数组").isEmpty();
+        assertThat(empty.path("totalElements").asLong()).isZero();
+        assertThat(empty.path("totalPages").asInt())
+                .as("后端空列表契约：totalPages=0（页面文案与按钮状态据此渲染）")
+                .isZero();
+        assertThat(empty.path("page").asInt()).isZero();
+        assertThat(empty.path("hasNext").asBoolean()).isFalse();
+        assertThat(empty.path("hasPrevious").asBoolean()).isFalse();
+    }
+
     /**
      * @param title       标题（虚构）
      * @param description 描述（虚构）

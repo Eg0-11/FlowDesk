@@ -26,6 +26,8 @@
     var PAGE_SIZE = 10;
 
     var lastPage = null;
+    var lastHasPrev = null;
+    var lastHasNext = null;
     var listLoading = false;
     var listToken = 0;
     var detailToken = 0;
@@ -176,12 +178,29 @@
         setDisabled('next-page', busy);
     }
 
+    /**
+     * 按「最后一次有效分页结果」恢复加载/上一页/下一页：
+     * 加载失败时上一页/下一页必须与最后一次有效结果一致；**没有有效结果时两者都禁用**。
+     */
+    function applyNavigation() {
+        setDisabled('load-tickets', false);
+        setDisabled('prev-page', lastHasPrev !== true);
+        setDisabled('next-page', lastHasNext !== true);
+    }
+
     function renderPageMeta(body) {
-        setText('tickets-meta', '第 ' + (body.page + 1) + ' 页 / 共 ' + body.totalPages + ' 页，共 '
-            + body.totalElements + ' 条（本页 ' + body.items.length + ' 条）');
+        if (body.totalPages === 0) {
+            // 后端空列表契约：page=0、totalPages=0、totalElements=0、hasNext=hasPrevious=false
+            setText('tickets-meta', '共 0 条');
+        }
+        else {
+            setText('tickets-meta', '第 ' + (body.page + 1) + ' 页 / 共 ' + body.totalPages + ' 页，共 '
+                + body.totalElements + ' 条（本页 ' + body.items.length + ' 条）');
+        }
         lastPage = body.page;
-        setDisabled('prev-page', !body.hasPrevious);
-        setDisabled('next-page', !body.hasNext);
+        lastHasPrev = body.hasPrevious;
+        lastHasNext = body.hasNext;
+        applyNavigation();
     }
 
     function renderTicketRows(items) {
@@ -265,6 +284,8 @@
                     return;
                 }
                 setListBusy(false);
+                // 无论成功失败，先把上一页/下一页恢复成「最后一次有效结果」的样子
+                applyNavigation();
                 show('tickets-state', false);
 
                 if (result.transportError) {
@@ -430,6 +451,32 @@
         setDisabled('create-submit', busy);
     }
 
+    /**
+     * 创建结果不确定（网络异常、5xx、201 但响应体异常）：不说是失败，也不说是成功，
+     * 明确提示先去列表确认、不要直接重试；表单内容保留，便于对照。
+     *
+     * @param detail 具体原因（已在调用处描述清楚）
+     */
+    function renderCreateIndeterminate(detail) {
+        show('create-error', true);
+        setText('create-error', '创建结果待确认（' + detail + '）。请先查列表确认是否已创建，勿直接重试。');
+        var box = element('create-result');
+        if (box) {
+            box.replaceChildren();
+            var actions = document.createElement('div');
+            actions.className = 'toolbar';
+            var toList = document.createElement('button');
+            toList.type = 'button';
+            toList.textContent = '去列表查看';
+            toList.addEventListener('click', function () {
+                loadTickets(0);
+            });
+            actions.appendChild(toList);
+            box.appendChild(actions);
+            show('create-result', true);
+        }
+    }
+
     function renderCreated(ticket) {
         var box = element('create-result');
         if (!box) {
@@ -494,29 +541,28 @@
             setText('create-state', '');
 
             if (result.transportError) {
-                show('create-error', true);
-                setText('create-error', '创建失败（服务不可达）：' + result.transportError);
+                // 没有拿到响应：请求可能已经到达服务端并被处理，不能断言失败
+                renderCreateIndeterminate('请求没有拿到响应（' + result.transportError + '）');
                 return;
             }
-            if (result.status === 400) {
+            if (result.status >= 400 && result.status < 500) {
+                // 明确的 4xx：服务端已拒绝，按失败显示（含原有 400 文案）
                 show('create-error', true);
                 setText('create-error', '创建失败：' + describeFailure(result));
                 return;
             }
             if (result.status !== 201) {
-                show('create-error', true);
-                setText('create-error', '创建失败：' + describeFailure(result));
+                // 5xx 等：服务端可能已经处理过，结果不确定
+                renderCreateIndeterminate('服务端返回 ' + describeFailure(result));
                 return;
             }
             if (result.formatProblem) {
-                show('create-error', true);
-                setText('create-error', '创建失败：响应格式异常（' + result.formatProblem + '）');
+                renderCreateIndeterminate('响应体异常（' + result.formatProblem + '）');
                 return;
             }
             var problem = missingField(result.body, ['id', 'title', 'status']);
             if (problem) {
-                show('create-error', true);
-                setText('create-error', '创建失败：响应格式异常（' + problem + '）');
+                renderCreateIndeterminate('响应体异常（' + problem + '）');
                 return;
             }
             renderCreated(result.body);
