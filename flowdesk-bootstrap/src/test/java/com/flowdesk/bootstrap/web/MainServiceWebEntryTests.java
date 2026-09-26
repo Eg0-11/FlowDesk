@@ -152,6 +152,50 @@ class MainServiceWebEntryTests {
         // （用 Playwright 路由注入可控响应）验证，见交付说明。
     }
 
+    /**
+     * FD-0023-C-R1：状态变更的**目标隔离与版本漂移保护**必须在脚本里留下可核对的结构。
+     *
+     * <p>这里只断言「脚本确实带了这些守卫」，具体的渲染与请求计数由浏览器行为测试
+     * （路由注入 + 可控延迟）锁定，见交付说明。</p>
+     */
+    @Test
+    void theScriptIsolatesTheWriteTargetAndProtectsAgainstVersionDrift() {
+        String script = bodyOf("/app.js");
+
+        assertThat(script)
+                .as("切详情要清空目标：必须有专门的清空函数，并在 openDetail 里立刻调用")
+                .contains("function clearCurrentTarget()")
+                .contains("clearCurrentTarget();");
+        assertThat(script)
+                .as("清空函数必须把工单与 ETag 一并置空（否则旧工单仍可被写入）")
+                .contains("currentTicket = null;")
+                .contains("currentETag = null;");
+        assertThat(script)
+                .as("写路径要有自己的目标令牌：A 的迟到响应不得覆盖 B 的详情")
+                .contains("actionToken")
+                .contains("token !== actionToken");
+        assertThat(script)
+                .as("预检必须校验返回的工单编号与请求一致")
+                .contains("probe.body.id !== ticketId");
+        assertThat(script)
+                .as("预检失败与版本漂移都要明确写出「写请求未发送」")
+                .contains("写请求未发送");
+        assertThat(script)
+                .as("版本漂移判定用的是「预检 ETag 与当前显示的 ETag 不同」，与状态无关")
+                .contains("requestETag !== displayedETag");
+        assertThat(script)
+                .as("预检的 ETag 与响应体版本必须自洽")
+                .contains("probe.eTag !== '\"' + probe.body.version + '\"'");
+        assertThat(script)
+                .as("成功判定必须要求版本递增且 ETag 与版本一致，否则只能说「可能已生效」")
+                .contains("versionOfETag")
+                .contains("isStrongETag(result.eTag) || result.eTag !== '\"' + result.body.version + '\"'");
+        assertThat(script)
+                .as("关闭是不可逆操作：一次预检 + 两次确认")
+                .contains("requestCloseConfirmation")
+                .contains("sendActionRequest");
+    }
+
     @Test
     void theHealthEndpointIsUnchanged() {
         ResponseEntity<String> response = this.client.getForEntity("/actuator/health", String.class);

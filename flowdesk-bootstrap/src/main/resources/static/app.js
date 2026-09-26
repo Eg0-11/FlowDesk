@@ -1,17 +1,23 @@
 /*
- * FlowDesk 本机演示入口的脚本（FD-0023-A / FD-0023-B / FD-0023-B-R1）。
+ * FlowDesk 本机演示入口的脚本（FD-0023-A / FD-0023-B / FD-0023-B-R1 / FD-0023-C / FD-0023-C-R1）。
  *
  * 约束：
  *   - 所有请求都用**相对路径**（同源），不写死主机名与端口；
  *   - 页面加载时只请求只读的健康端点，不发写请求，也不请求文档向量化、知识检索或模型调用类接口
  *     （本文件里也不写出它们的路径），因此加载页面不产生任何模型费用；
- *   - 工单列表、详情、新建都在用户点击之后才发请求；新建是唯一的写请求；
+ *   - 工单列表、详情、新建都在用户点击之后才发请求；页面里的写请求只有两处：新建工单与状态变更；
  *   - 用户输入与服务端数据一律只用 textContent 渲染：不把字符串当 HTML 插入，也不使用拼接 HTML 的写法；
  *   - 分类与优先级的取值与后端枚举一致：TicketCategory / TicketPriority（不修改 API 契约）；
  *   - 成功响应必须是「合法 JSON + 页面必需字段齐全」才算成功：空响应、畸形 JSON、缺字段一律报
  *     「响应格式异常」，绝不把 NaN / undefined 渲染出来，也绝不误报创建成功；
- *   - 列表加载期间禁止重复导航（按钮禁用 + 在飞标记）；列表与详情都用自增令牌丢弃**过时响应**，
- *     保证回来的旧响应不能覆盖最新页面。
+ *   - 列表加载期间禁止重复导航（按钮禁用 + 在飞标记）；列表、详情与状态变更都用自增令牌丢弃**过时响应**，
+ *     保证回来的旧响应不能覆盖最新页面；
+ *   - **状态变更的目标隔离与版本漂移保护**（FD-0023-C-R1）：切换详情时立刻清空旧工单的可操作状态并隐藏
+ *     操作区；新详情失败（404 / 网络 / 格式异常）后绝不对旧工单发写请求；写请求前的预检必须校验响应体、
+ *     工单 ID、规范强 ETag 与 version，只要强 ETag 与「用户当前看到的详情」不同就取消这次写入
+ *     （**哪怕状态相同**），且**一个写请求都不发**；预检失败明确说明「写请求未发送」；A 的写请求在途时
+ *     用户切到 B，A 的迟到响应不得覆盖 B 的详情；成功响应缺有效 ETag 或 version 与 ETag 不一致时
+ *     不能宣称完整成功，只提示核查。
  */
 (function () {
     'use strict';
@@ -39,6 +45,15 @@
 
     /** 状态变更进行中：禁用重复提交。 */
     var acting = false;
+
+    /**
+     * 状态变更的目标令牌（FD-0023-C-R1）。
+     *
+     * <p>每次切换详情或重新打开详情都会自增。写请求的两段（预检 GET、写 POST）都只认自己那一次的目标，
+     * 因此「A 的写请求在途时用户打开 B」后，A 迟到的响应会被丢弃，**不会覆盖 B 的详情**，
+     * 也不会把 B 的操作区改成 A 的状态。</p>
+     */
+    var actionToken = 0;
 
     function element(id) {
         return document.getElementById(id);
@@ -353,7 +368,39 @@
         return null;
     }
 
+    /**
+     * 清空「可操作工单」的全部状态并立刻隐藏操作区（FD-0023-C-R1）。
+     *
+     * <p>切换详情的第一件事就是调用它：旧工单的 id / ETag 与 DOM 上的按钮、输入框都在同一时刻消失，
+     * 因此**不存在**「界面已经换到新工单、内部还指向旧工单」的窗口。新详情如果最终失败
+     * （404 / 网络 / 格式异常），这个清空状态会一直保持，写请求也就永远没有目标可发。</p>
+     */
+    function clearCurrentTarget() {
+        currentTicket = null;
+        currentETag = null;
+        var buttons = element('detail-action-buttons');
+        if (buttons) {
+            buttons.replaceChildren();
+        }
+        var fields = element('detail-action-fields');
+        if (fields) {
+            fields.replaceChildren();
+        }
+        var confirmBox = element('detail-action-confirm');
+        if (confirmBox) {
+            confirmBox.replaceChildren();
+        }
+        show('detail-action-error', false);
+        show('detail-action-result', false);
+        show('detail-actions', false);
+    }
+
     function openDetail(ticketId) {
+        // 先作废在途的状态变更，再清空操作区：任何迟到的写响应都不能落到这条新详情上。
+        actionToken = actionToken + 1;
+        setActionsBusy(false);
+        clearCurrentTarget();
+
         var token = detailToken + 1;
         detailToken = token;
 
@@ -372,28 +419,40 @@
 
                 if (result.transportError) {
                     show('detail-error', true);
-                    setText('detail-error', '请求失败（服务不可达）：' + result.transportError);
+                    setText('detail-error', '请求失败（服务不可达）：' + result.transportError
+                        + ' 这条工单的操作区已清空，不会对上一条件工单发出写请求。');
                     return;
                 }
                 if (result.status === 404) {
                     show('detail-error', true);
-                    setText('detail-error', '未找到该工单：' + describeFailure(result));
+                    setText('detail-error', '未找到该工单：' + describeFailure(result)
+                        + ' 这条工单的操作区已清空，不会对上一条件工单发出写请求。');
                     return;
                 }
                 if (result.status !== 200) {
                     show('detail-error', true);
-                    setText('detail-error', '加载详情失败：' + describeFailure(result));
+                    setText('detail-error', '加载详情失败：' + describeFailure(result)
+                        + ' 这条工单的操作区已清空，不会对上一条件工单发出写请求。');
                     return;
                 }
                 if (result.formatProblem) {
                     show('detail-error', true);
-                    setText('detail-error', '加载详情失败：响应格式异常（' + result.formatProblem + '）');
+                    setText('detail-error', '加载详情失败：响应格式异常（' + result.formatProblem
+                        + '） 这条工单的操作区已清空，不会对上一条件工单发出写请求。');
                     return;
                 }
                 var problem = detailProblem(result.body);
                 if (problem) {
                     show('detail-error', true);
-                    setText('detail-error', '加载详情失败：响应格式异常（' + problem + '）');
+                    setText('detail-error', '加载详情失败：响应格式异常（' + problem
+                        + '） 这条工单的操作区已清空，不会对上一条件工单发出写请求。');
+                    return;
+                }
+                if (result.body.id !== ticketId) {
+                    // 请求 A 却拿到 B 的详情：按格式异常处理，绝不把 B 当成 A 的可操作目标
+                    show('detail-error', true);
+                    setText('detail-error', '加载详情失败：响应格式异常（返回的工单编号与请求不一致）'
+                        + ' 这条工单的操作区已清空，不会对上一条件工单发出写请求。');
                     return;
                 }
                 currentTicket = result.body;
@@ -416,7 +475,14 @@
         box.appendChild(row);
     }
 
-    function renderDetail(ticket, eTag) {
+    /**
+     * 渲染详情（15 行字段 + ETag 行，全部用 textContent）。
+     *
+     * @param ticket              详情响应体（已通过字段校验）
+     * @param eTag                该响应的强 ETag（可能为 null）
+     * @param preserveActionPanel true 表示这是「预检回填」，只刷新字段、不动操作区（FD-0023-C-R1）
+     */
+    function renderDetail(ticket, eTag, preserveActionPanel) {
         var box = element('detail-body');
         if (!box) {
             return;
@@ -438,7 +504,11 @@
         appendRow(box, '版本', ticket.version);
         appendRow(box, 'ETag', isStrongETag(eTag) ? eTag : (eTag === null || eTag === undefined ? '（响应未带 ETag）' : eTag));
         show('detail-body', true);
-        renderActions(ticket);
+        // 只有「作为当前可操作目标」渲染时才展示操作区。预检结果回填详情时（preserveActionPanel）
+        // 不得重新打开操作区 —— 否则预检失败后按钮又出现，用户会对着一个已经不成立的目标再点一次。
+        if (!preserveActionPanel) {
+            renderActions(ticket);
+        }
         var section = element('detail');
         if (section && section.scrollIntoView) {
             section.scrollIntoView({ block: 'start' });
@@ -594,6 +664,13 @@
         });
     }
 
+    /**
+     * 用户点了某条操作（FD-0023-C-R1）：
+     * <ul>
+     *   <li>关闭（不可逆）：先问一次「是否确认关闭」，确认后才进入预检 + 写请求；</li>
+     *   <li>其余操作：直接进入预检 + 写请求。</li>
+     * </ul>
+     */
     function requestAction(action) {
         if (acting) {
             return;
@@ -602,7 +679,11 @@
             performAction(action);
             return;
         }
-        // 关闭是不可逆的：先让用户确认
+        var ticketId = currentTicket ? currentTicket.id : null;
+        if (ticketId === null || !isStrongETag(currentETag)) {
+            return;
+        }
+        var token = actionToken;
         var confirmBox = element('detail-action-confirm');
         if (!confirmBox) {
             return;
@@ -618,6 +699,9 @@
         yes.textContent = '确认关闭';
         yes.addEventListener('click', function () {
             show('detail-action-confirm', false);
+            if (token !== actionToken) {
+                return;
+            }
             performAction('close');
         });
         confirmBox.appendChild(yes);
@@ -632,11 +716,114 @@
         show('detail-action-confirm', true);
     }
 
+    /**
+     * 关闭工单的**第二次**确认：预检通过后再问一次，避免「确认期间详情已经切走」时误关。
+     *
+     * @param ticketId    目标工单
+     * @param requestETag 预检得到的强 ETag（本次写请求将要使用的 If-Match）
+     */
+    function requestCloseConfirmation(ticketId, requestETag) {
+        var token = actionToken;
+        setActionsBusy(false);
+        var confirmBox = element('detail-action-confirm');
+        if (!confirmBox) {
+            return;
+        }
+        confirmBox.replaceChildren();
+        var text = document.createElement('span');
+        text.className = 'field-value';
+        text.textContent = '已核对最新版本（' + requestETag
+            + '）。关闭后不能再做状态变更，确认现在关闭这条工单？';
+        confirmBox.appendChild(text);
+        var yes = document.createElement('button');
+        yes.type = 'button';
+        yes.id = 'confirm-close-final';
+        yes.textContent = '确认关闭';
+        yes.addEventListener('click', function () {
+            show('detail-action-confirm', false);
+            if (token !== actionToken) {
+                // 确认期间用户已经切到别的详情：绝不再发这个写请求
+                return;
+            }
+            sendActionRequest('close', ticketId, null, requestETag, null);
+        });
+        confirmBox.appendChild(yes);
+        var no = document.createElement('button');
+        no.type = 'button';
+        no.id = 'cancel-close-final';
+        no.textContent = '取消';
+        no.addEventListener('click', function () {
+            show('detail-action-confirm', false);
+            if (token !== actionToken) {
+                return;
+            }
+            showActionError('已取消关闭：写请求未发送，工单状态未改变。');
+        });
+        confirmBox.appendChild(no);
+        show('detail-action-confirm', true);
+    }
+
+    /**
+     * 发写请求（预检已经通过），并把结果交给 {@link handleActionResult}。
+     *
+     * @param action          操作名
+     * @param ticketId        目标工单（也是预检与写请求必须一致的编号）
+     * @param displayedStatus 发起操作时用户看到的状态（仅用于成功文案之外的判断）
+     * @param requestETag     预检得到的强 ETag，原样放进 If-Match
+     * @param payload         请求体（可为 null）
+     */
+    function sendActionRequest(action, ticketId, displayedStatus, requestETag, payload) {
+        var token = actionToken;
+        setActionsBusy(true);
+        show('detail-action-error', false);
+        show('detail-action-result', false);
+        show('detail-state', true);
+        setText('detail-state', action === 'close' ? '正在关闭…' : '正在提交状态变更…');
+
+        var headers = { 'Accept': 'application/json', 'If-Match': requestETag };
+        var options = { method: 'POST', headers: headers };
+        if (payload) {
+            headers['Content-Type'] = 'application/json';
+            options.body = JSON.stringify(payload);
+        }
+        requestJson('/api/v1/tickets/' + encodeURIComponent(ticketId)
+            + '/' + ACTION_PATHS[action], options)
+            .then(function (result) {
+                if (token !== actionToken) {
+                    // A 的写响应迟到了，而用户已经切到 B：结果只对 A 有意义，
+                    // 绝不能拿它去覆盖 B 的详情或操作区。
+                    return;
+                }
+                show('detail-state', false);
+                handleActionResult(action, ticketId, displayedStatus, requestETag, result);
+            });
+    }
+
+    /**
+     * 状态变更的两段式提交（FD-0023-C-R1 收紧版）。
+     *
+     * <p>第一段：单条 {@code GET /api/v1/tickets/{id}}，**只**从它的响应头取强 ETag。
+     * 第二段：带 {@code If-Match} 的写请求。</p>
+     *
+     * <p>第一段同时充当「目标仍然成立」的证明，逐条校验：</p>
+     * <ul>
+     *   <li>响应体与工单 ID 一致（请求谁就必须拿到谁）；</li>
+     *   <li>强 ETag 存在且规范（{@code "n"} 形式，不是弱校验）；</li>
+     *   <li>{@code version} 必须是有效数字；</li>
+     *   <li>ETag 与 version 必须自洽（{@code ETag == "\"version\""}）；</li>
+     *   <li><b>强 ETag 必须与「用户当前看到的详情」完全相同</b> —— 只要不同，哪怕状态一样，
+     *       也判定为版本漂移：取消本次写入、提示刷新，且**一个写请求都不发**。</li>
+     * </ul>
+     *
+     * @param action 操作名（assign / reassign / start / resolve / close）
+     */
     function performAction(action) {
-        if (acting || !currentTicket) {
+        if (acting || !currentTicket || !isStrongETag(currentETag)) {
             return;
         }
         var ticketId = currentTicket.id;
+        var displayedStatus = currentTicket.status;
+        var displayedETag = currentETag;
         var payload = null;
         if (action === 'assign' || action === 'reassign') {
             var assignee = element('action-assignee');
@@ -647,6 +834,7 @@
             payload = { resolution: resolution ? resolution.value : '' };
         }
 
+        var token = actionToken;
         setActionsBusy(true);
         show('detail-action-error', false);
         show('detail-action-result', false);
@@ -657,53 +845,115 @@
         // 列表接口不返回 ETag，版本也不在请求体里，绝不用列表里的 version 猜造请求头。
         requestJson('/api/v1/tickets/' + encodeURIComponent(ticketId), { headers: { 'Accept': 'application/json' } })
             .then(function (probe) {
+                if (token !== actionToken) {
+                    // 用户已经在这次预检的飞行途中打开了别的工单：这次操作整体作废，不写、不渲染。
+                    return;
+                }
                 show('detail-state', false);
+
                 if (probe.transportError) {
                     setActionsBusy(false);
-                    showActionIndeterminate('取最新详情时网络中断（' + probe.transportError + '）');
+                    showActionError('写请求未发送：取最新详情的预检请求在网络层失败（'
+                        + probe.transportError + '）。无法确认目标是否仍然成立，请刷新详情后重试。');
                     return;
                 }
                 if (probe.status !== 200) {
                     setActionsBusy(false);
-                    showActionError('操作已取消：取最新详情失败（HTTP ' + probe.status + '，'
-                        + actionFailure(probe) + '）。请先刷新详情。');
+                    showActionError('写请求未发送：取最新详情的预检返回 HTTP ' + probe.status + '（'
+                        + actionFailure(probe) + '）。目标工单可能已不存在或不可读，请刷新详情。');
+                    showRefreshHint(ticketId);
+                    return;
+                }
+                if (probe.formatProblem) {
+                    setActionsBusy(false);
+                    showActionError('写请求未发送：取最新详情的预检响应格式异常（' + probe.formatProblem
+                        + '）。无法确认目标是否仍然成立，请刷新详情。');
+                    showRefreshHint(ticketId);
+                    return;
+                }
+                var probeProblem = detailProblem(probe.body);
+                if (probeProblem) {
+                    setActionsBusy(false);
+                    showActionError('写请求未发送：取最新详情的预检响应格式异常（' + probeProblem
+                        + '）。无法确认目标是否仍然成立，请刷新详情。');
+                    showRefreshHint(ticketId);
+                    return;
+                }
+                if (probe.body.id !== ticketId) {
+                    setActionsBusy(false);
+                    showActionError('写请求未发送：预检返回的工单编号（' + probe.body.id
+                        + '）与当前操作目标（' + ticketId + '）不一致。请刷新详情。');
                     showRefreshHint(ticketId);
                     return;
                 }
                 if (!isStrongETag(probe.eTag)) {
                     setActionsBusy(false);
-                    showActionError('操作已取消：单条详情响应没有可用的强 ETag（收到：'
+                    showActionError('写请求未发送：单条详情响应没有可用的强 ETag（收到：'
                         + (probe.eTag === null || probe.eTag === undefined ? '无 ETag 响应头' : probe.eTag)
                         + '）。写请求必须带真实版本，不能用猜造的请求头。');
+                    showRefreshHint(ticketId);
+                    return;
+                }
+                if (probe.eTag !== '"' + probe.body.version + '"') {
+                    setActionsBusy(false);
+                    showActionError('写请求未发送：预检的强 ETag（' + probe.eTag + '）与响应体版本（'
+                        + probe.body.version + '）不一致。请刷新详情。');
+                    showRefreshHint(ticketId);
                     return;
                 }
                 var requestETag = probe.eTag;
 
-                if (probe.body && probe.body.status !== currentTicket.status) {
+                if (requestETag !== displayedETag) {
+                    // 版本漂移：服务端的当前版本和用户看到的不一样了。即使状态相同也取消写入。
+                    // 先把界面刷新成真实的最新详情（字段可见），但**不重新打开操作区** ——
+                    // 用户必须先确认新状态再自己重新发起操作。
                     currentTicket = probe.body;
                     currentETag = requestETag;
-                    renderDetail(probe.body, requestETag);
+                    renderDetail(probe.body, requestETag, true);
                     setActionsBusy(false);
-                    showActionError('这条工单的状态已经变化（现在是 ' + probe.body.status
-                        + '），本次操作已取消；请按新的可用操作重试。');
+                    showActionError('写请求未发送：这条工单的版本已经变化'
+                        + (probe.body.status === displayedStatus ? '（状态仍是 ' + displayedStatus + '）'
+                            : '（状态也从 ' + displayedStatus + ' 变成了 ' + probe.body.status + '）')
+                        + ' —— 你看到的版本是 ' + displayedETag + '，服务端当前是 ' + requestETag
+                        + '。为避免覆盖别人的修改，本次操作已取消；请确认最新详情后重新操作。');
+                    showRefreshHint(ticketId);
                     return;
                 }
 
-                var headers = { 'Accept': 'application/json', 'If-Match': requestETag };
-                var options = { method: 'POST', headers: headers };
-                if (payload) {
-                    headers['Content-Type'] = 'application/json';
-                    options.body = JSON.stringify(payload);
+                if (probe.body.status !== displayedStatus) {
+                    // 正常情况下状态变化必然伴随版本变化（上面的分支已经拦住）；这里只作为
+                    // 「版本没变但状态变了」这种异常响应的兜底。
+                    currentTicket = probe.body;
+                    currentETag = requestETag;
+                    renderDetail(probe.body, requestETag, true);
+                    setActionsBusy(false);
+                    showActionError('写请求未发送：这条工单的状态已经变化（现在是 ' + probe.body.status
+                        + '），本次操作已取消；请按新的可用操作重试。');
+                    showRefreshHint(ticketId);
+                    return;
                 }
-                return requestJson('/api/v1/tickets/' + encodeURIComponent(ticketId)
-                    + '/' + ACTION_PATHS[action], options)
-                    .then(function (result) {
-                        handleActionResult(action, requestETag, result);
-                    });
+
+                if (action === 'close') {
+                    // 关闭是不可逆的：预检已经确认目标成立，最后一次请用户确认。
+                    // 确认期间若用户切走详情，actionToken 会变化，performCloseAction 会自己退出。
+                    requestCloseConfirmation(ticketId, requestETag);
+                    return;
+                }
+
+                sendActionRequest(action, ticketId, displayedStatus, requestETag, payload);
             });
     }
 
-    function handleActionResult(action, requestETag, result) {
+    /**
+     * 处理写请求的响应（只有「目标仍然是当前详情」时才会走到这里）。
+     *
+     * @param action           操作名
+     * @param ticketId         本次操作的工单
+     * @param displayedStatus  发起操作时用户看到的状态
+     * @param requestETag      本次实际使用的 If-Match
+     * @param result           写请求结果
+     */
+    function handleActionResult(action, ticketId, displayedStatus, requestETag, result) {
         setActionsBusy(false);
 
         if (result.transportError) {
@@ -757,6 +1007,34 @@
             showActionIndeterminate('响应体异常（' + problem + '）');
             return;
         }
+        if (result.body.id !== ticketId) {
+            // 200 但回来的不是这条工单：不能把它当成这条工单的成功结果
+            showActionIndeterminate('响应体异常（返回的工单编号与本次操作的目标不一致）');
+            return;
+        }
+        if (result.body.version <= versionOfETag(requestETag)) {
+            // 版本没有前进：服务端说 200，但版本没有递增，说明结果不能按「本次操作已生效」理解
+            showActionIndeterminate('响应体异常（版本没有按预期递增：本次 If-Match 为 ' + requestETag
+                + '，响应版本为 ' + result.body.version + '）');
+            return;
+        }
+        if (!isStrongETag(result.eTag) || result.eTag !== '"' + result.body.version + '"') {
+            // 成功响应缺有效 ETag，或 ETag 与版本不自洽：不能宣称完整成功，只能提示核查。
+            // 注意此时详情区仍然刷新为服务端返回的最新详情（版本已经前进），操作区保持原样，
+            // 让用户可以刷新后重新确认。
+            currentTicket = result.body;
+            currentETag = isStrongETag(result.eTag) ? result.eTag : null;
+            renderDetail(result.body, result.eTag, true);
+            show('detail-action-result', true);
+            setText('detail-action-result', '操作可能已生效（' + ACTION_LABELS[action] + '）：服务端返回 HTTP 200、状态 '
+                + result.body.status + '、版本 ' + result.body.version
+                + '，但' + (isStrongETag(result.eTag)
+                    ? 'ETag（' + result.eTag + '）与版本（' + result.body.version + '）不一致'
+                    : '响应缺少可用的强 ETag（收到：' + (result.eTag === null || result.eTag === undefined
+                        ? '无 ETag 响应头' : result.eTag) + '）')
+                + '。请刷新详情核对最新状态后再继续操作，本次不按「完整成功」处理。');
+            return;
+        }
 
         currentTicket = result.body;
         currentETag = result.eTag;
@@ -765,8 +1043,22 @@
         setText('detail-action-result', '操作成功：' + ACTION_LABELS[action]
             + ' → 状态 ' + result.body.status
             + '，版本 ' + result.body.version
-            + '，新 ETag ' + (isStrongETag(result.eTag) ? result.eTag : '（响应未带强 ETag）')
+            + '，新 ETag ' + result.eTag
             + '（本次请求使用的 If-Match 为 ' + requestETag + '）');
+    }
+
+    /**
+     * 把强 ETag 解析成版本号，供「版本必须递增」这一判断使用。
+     *
+     * @param eTag 形如 {@code "12"} 的强 ETag
+     * @returns {number} 解析出的版本号；不是规范强 ETag 时返回 -1
+     */
+    function versionOfETag(eTag) {
+        if (!isStrongETag(eTag)) {
+            return -1;
+        }
+        var parsed = Number(eTag.slice(1, -1));
+        return isFinite(parsed) ? parsed : -1;
     }
 
     // ---------- 新建工单（唯一的写请求；防重复提交；响应不合法不算成功） ----------

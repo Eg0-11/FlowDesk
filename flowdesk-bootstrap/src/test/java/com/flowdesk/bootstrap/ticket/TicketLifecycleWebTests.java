@@ -150,6 +150,72 @@ class TicketLifecycleWebTests {
     }
 
     /**
+     * FD-0023-C-R1 依赖的后端事实：**同一状态下版本也会漂移**。
+     *
+     * <p>页面在写请求前会拿一次详情做预检，只要预检的强 ETag 与「用户当前看到的详情」不同就取消写入
+     * —— 哪怕状态一模一样。这条用例证明这种「状态相同但版本不同」的局面在真实后端是可出现的
+     * （reassign 换了处理人、状态仍是 IN_PROGRESS），所以按 ETag 而不是按状态判断目标是否漂移是必要的。</p>
+     */
+    @Test
+    void theVersionCanDriftWhileTheStatusStaysTheSame() throws Exception {
+        ResponseEntity<String> created = postJson("/api/v1/tickets", fictionalCreateBody(), null);
+        String id = read(created).path("id").asText();
+
+        ResponseEntity<String> assigned = postJson("/api/v1/tickets/" + id + "/assign",
+                "{\"assigneeId\":\"alice\"}", etagOf(created));
+        ResponseEntity<String> started = postJson("/api/v1/tickets/" + id + "/start", null, etagOf(assigned));
+        assertThat(read(started).path("status").asText()).isEqualTo("IN_PROGRESS");
+
+        // 别人把处理人从 alice 换成 bob：状态仍是 IN_PROGRESS，但版本前进了
+        ResponseEntity<String> reassigned = postJson("/api/v1/tickets/" + id + "/reassign",
+                "{\"assigneeId\":\"bob\"}", etagOf(started));
+
+        assertThat(read(reassigned).path("status").asText())
+                .as("状态没变")
+                .isEqualTo(read(started).path("status").asText());
+        assertThat(etagOf(reassigned))
+                .as("版本前进了：只看状态判断不出漂移，必须看强 ETag")
+                .isNotEqualTo(etagOf(started));
+
+        // 用漂移前的 ETag 写 → 412，且不改数据（页面据此提示版本冲突）
+        ResponseEntity<String> stale = postJson("/api/v1/tickets/" + id + "/resolve",
+                "{\"resolution\":\"虚构：过期版本\"}", etagOf(started));
+        assertThat(stale.getStatusCode()).isEqualTo(HttpStatus.PRECONDITION_FAILED);
+
+        ResponseEntity<String> detail = get("/api/v1/tickets/" + id);
+        assertThat(read(detail).path("status").asText()).isEqualTo("IN_PROGRESS");
+        assertThat(read(detail).path("resolution").isNull()).as("412 不得写入解决说明").isTrue();
+    }
+
+    /**
+     * FD-0023-C-R1 依赖的另一条后端事实：单条详情响应的强 ETag 与响应体版本**始终自洽**
+     * （{@code ETag == "\"version\""}）。页面的预检就按这条不变量判断响应是否可信。
+     */
+    @Test
+    void theSingleTicketAlwaysCarriesAStrongEtagThatMatchesItsVersion() throws Exception {
+        ResponseEntity<String> created = postJson("/api/v1/tickets", fictionalCreateBody(), null);
+        String id = read(created).path("id").asText();
+
+        for (int round = 0; round < 3; round++) {
+            ResponseEntity<String> detail = get("/api/v1/tickets/" + id);
+            String etag = etagOf(detail);
+            assertThat(etag)
+                    .as("强 ETag 形如 \"n\"（不是 W/ 弱校验）")
+                    .matches("^\"[0-9]+\"$");
+            assertThat(etag)
+                    .as("ETag 必须等于响应体版本")
+                    .isEqualTo("\"" + read(detail).path("version").asLong() + "\"");
+
+            if (round == 0) {
+                postJson("/api/v1/tickets/" + id + "/assign", "{\"assigneeId\":\"alice\"}", etag);
+            }
+            else if (round == 1) {
+                postJson("/api/v1/tickets/" + id + "/start", null, etag);
+            }
+        }
+    }
+
+    /**
      * @return 一条虚构工单的创建请求体
      */
     private static String fictionalCreateBody() {
