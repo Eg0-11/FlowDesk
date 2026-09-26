@@ -26,6 +26,11 @@
  * 11. 刷新元数据只更新展示：冲突后重新 GET 拿到的版本可能又已被别人改动，
  *     因此刷新路径不得重建可写目标（currentDocument 保持为空），
  *     避免「刷新一次就又拿旧版本去写」。
+ * 12. 解析失败（422 / 413）后的锁定**必须在发起异步刷新之前**完成：
+ *     刷新窗口内既不能留下可写目标，也不能让解析按钮可点，否则用户连点会再发写请求。
+ *     刷新**成功或失败都不得解锁** —— 只有用户重新「按 ID 查询」才是唯一解锁入口。
+ *     这条不变量用「同步 lockParse 先于 refreshAfterConflict」的实际调用顺序保证，
+ *     而不是靠异步回调的先后。
  */
 (function () {
   'use strict';
@@ -79,6 +84,12 @@
 
   // 每次 GET 递增；用于丢弃迟到的旧响应，避免覆盖用户刚看到的新结果。
   var lookupToken = 0;
+
+  // 在没有任何 GET 在途时，为「即将开始的下一次 GET」预留的序号。
+  // 冲突后的只读刷新只用它做**作废判断**：用户一发起新的「按 ID 查询」，
+  // 这个预留号就被消费掉，任何还在途的刷新结果都会被丢弃 ——
+  // 避免旧刷新在新查询之后才返回、把刚解锁的解析区又改回锁定。
+  var lookupReserved = 0;
 
   // ---- 通用小工具 -----------------------------------------------------------
 
@@ -412,6 +423,9 @@
    * 一旦写进可写目标，就等于用「刚刷新到的版本」重新武装了写路径 ——
    * 而这条刷新本身并不是用户发起的核对。因此这里只做只读展示，
    * 写目标保持为空，用户必须重新「按 ID 查询」才会重新获得可写的目标。</p>
+   *
+   * <p>同理，这里也<b>不解锁</b>：调用点已经在刷新之前把解析区锁死了，
+   * 刷新成功与否都不改变「只有用户重新查询才能恢复操作」这条规则。</p>
    */
   function renderDocumentFromRefresh(documentBody) {
     var box = element('knowledge-doc-body');
@@ -1107,15 +1121,19 @@
 
     if (result.status === 422 || result.status === 413) {
       // 解析/切片失败：响应体是 problem+json（不是 ParsedDocumentResponse），
-      // 文档已进入 PARSE_FAILED 且版本已变化，必须刷新展示。
+      // 文档已进入 PARSE_FAILED 且版本已变化。
       setKnowledgeState('failed', '解析失败');
+      // 先渲染 problem+json 的错误信息（title/detail/code/failureCode），再锁定 ——
+      // 两者互不覆盖，锁定不会把错误码与 failureCode 挤掉。
       if (result.body !== null && result.formatProblem === null) {
         renderParseProblem(result.status, result.body);
       }
-      setKnowledgeError(
+      // 关键顺序：必须在发起**异步**刷新之前就把写路径收掉。
+      // lockParse 是同步的：清空可写目标 + 置锁定标志 + 禁用解析按钮，
+      // 因此刷新在途期间连续点击解析一律被 parseDocument 的守卫拦下（POST 不会再增加）。
+      lockParse('解析被拒绝：' +
         describeProblem(result.status, result.body) +
-          '文档已进入失败状态，页面显示的版本已过期，请重新查询确认。'
-      );
+        '。文档已进入失败状态。');
       refreshAfterConflict(targetId);
       return;
     }
@@ -1185,17 +1203,26 @@
   /**
    * 版本/状态冲突后重新拉取一次展示，让页面与真实状态对齐（只读，不改数据）。
    *
-   * <p>这里**只更新展示**：不写 {@code currentDocument}、不碰解析区按钮。
-   * 刷新前「不得用旧版本再次写入」这条规则，靠的是「锁住时写目标为空」这个显式不变量，
+   * <p>这里**只更新展示**：不写 {@code currentDocument}、不碰解析区按钮、也不解锁。
+   * 「刷新后不得用旧版本再次写入」这条规则，靠的是「锁住时写目标为空」这个显式不变量，
    * 而不是靠「锁定标志恰好还在」这种巧合。</p>
+   *
+   * <p>刷新**只用 {@code lookupReserved} 做作废判断**，绝不递增 {@code lookupToken}：
+   * 用户一旦发起新的「按 ID 查询」，{@code lookupToken} 就被推进并消费掉预留号，
+   * 这次刷新的迟到结果会自动作废。</p>
    */
   function refreshAfterConflict(targetId) {
-    lookupToken += 1;
-    var token = lookupToken;
+    // 作废判断专用：只在没有 GET 在途时占用预留号，避免把真正在途的查询误判为过期。
+    if (lookupReserved <= lookupToken) {
+      lookupReserved = lookupToken + 1;
+    }
+    var token = lookupReserved;
     requestJson(DOCUMENTS_PATH + '/' + encodeURIComponent(targetId), {
       headers: { Accept: 'application/json' }
     }).then(function (result) {
-      if (token !== lookupToken) {
+      // 用户已经发起新的「按 ID 查询」：这次刷新的结果一律丢弃。
+      // 这一步只是「不覆盖」，并不能恢复写路径 —— 写路径只能由用户查询重新武装。
+      if (token <= lookupToken) {
         return;
       }
       // 读 body 失败或任何异常：保留原有错误提示，不覆盖、也不改变可写状态。
@@ -1205,7 +1232,7 @@
       }
       renderDocumentFromRefresh(result.body);
     }, function () {
-      // 刷新失败不影响既有锁定与提示。
+      // 刷新失败不影响既有锁定与提示。这里刻意不做任何锁状态改动。
     });
   }
 

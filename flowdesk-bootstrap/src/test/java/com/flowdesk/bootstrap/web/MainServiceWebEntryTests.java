@@ -537,6 +537,101 @@ class MainServiceWebEntryTests {
                 .contains("result.bodyReadFailed");
     }
 
+    /**
+     * FD-0023-D-R2：解析失败后的锁定窗口不得留下可写目标。
+     *
+     * <p>422 / 413 之后页面会异步刷新元数据；如果锁定发生在刷新回调里，
+     * 那么「刷新在途」这段时间解析按钮仍可点、可写目标仍在，用户连点就会再发写请求。
+     * 因此必须在**发起刷新之前**同步收口，并且刷新成功或失败都不得自动解锁。</p>
+     */
+    @Test
+    void theKnowledgeScriptLocksTheParseWritePathBeforeTheConflictRefresh() {
+        String script = bodyOf("/knowledge.js");
+
+        int branch = script.indexOf("if (result.status === 422 || result.status === 413) {");
+        assertThat(branch).as("422 / 413 分支必须存在").isGreaterThan(0);
+        String branchBody = script.substring(branch, script.indexOf("if (result.status >= 500) {", branch));
+
+        int lockAt = branchBody.indexOf("lockParse(");
+        int refreshAt = branchBody.indexOf("refreshAfterConflict(");
+        assertThat(lockAt)
+                .as("422 / 413 分支必须在发起异步刷新之前就锁住写路径")
+                .isGreaterThan(0);
+        assertThat(refreshAt)
+                .as("422 / 413 分支仍然要刷新展示")
+                .isGreaterThan(0);
+        assertThat(lockAt)
+                .as("锁定必须早于刷新：刷新在途时按钮已禁用、可写目标已为空")
+                .isLessThan(refreshAt);
+
+        // 锁定必须先于刷新 —— 上面的顺序断言就是这条不变量的唯一保证手段，
+        // 因此这里同时确认分支里没有再往刷新回调里塞解锁动作。
+        assertThat(branchBody)
+                .as("解析失败分支不得出现解锁动作")
+                .doesNotContain("unlockParseArea(");
+
+        // lockParse 自身必须是同步收口的：清空可写目标 + 禁用按钮。
+        int lockFn = script.indexOf("function lockParse(message)");
+        int lockFnEnd = script.indexOf("function parseDocument()", lockFn);
+        assertThat(lockFn).as("lockParse 必须存在").isGreaterThan(0);
+        assertThat(lockFnEnd).isGreaterThan(lockFn);
+        String lockBody = script.substring(lockFn, lockFnEnd);
+        assertThat(lockBody)
+                .as("锁定时必须清空可写目标")
+                .contains("currentDocument = null;");
+        assertThat(lockBody)
+                .as("锁定时必须同步禁用解析按钮")
+                .contains("setDisabled(element('knowledge-parse'), true);");
+        assertThat(lockBody)
+                .as("锁定后不得再解析")
+                .contains("parseLocked = true;");
+
+        // 刷新成功后也仍然锁定：只读渲染函数不解锁，且刷新函数不触碰锁定标志。
+        int refresh = script.indexOf("function refreshAfterConflict(targetId)");
+        int refreshEnd = script.indexOf("// ---- 事件绑定", refresh);
+        assertThat(refresh).as("refreshAfterConflict 必须存在").isGreaterThan(0);
+        assertThat(refreshEnd).isGreaterThan(refresh);
+        String refreshBody = script.substring(refresh, refreshEnd);
+        assertThat(refreshBody)
+                .as("刷新成功或失败都不得自动解锁")
+                .doesNotContain("parseLocked =")
+                .doesNotContain("unlockParseArea(")
+                .doesNotContain("currentDocument =");
+
+        int refreshFn = script.indexOf("function renderDocumentFromRefresh(documentBody)");
+        int refreshFnEnd = script.indexOf("// ---- 解析区", refreshFn);
+        assertThat(refreshFn).as("只读刷新渲染函数必须存在").isGreaterThan(0);
+        assertThat(refreshFnEnd).isGreaterThan(refreshFn);
+        assertThat(script.substring(refreshFn, refreshFnEnd))
+                .as("只读刷新渲染函数不得解锁")
+                .doesNotContain("parseLocked =")
+                .doesNotContain("unlockParseArea(");
+
+        // 刷新必须作废判断，而且只能占用预留号，绝不能推进 lookupToken ——
+        // 否则用户在刷新在途时发起的新查询会被旧刷新误当作「已过期」。
+        assertThat(refreshBody)
+                .as("刷新必须做作废判断")
+                .contains("if (token <= lookupToken)")
+                .as("刷新不得递增 lookupToken（那会作废用户刚发起的新查询）")
+                .doesNotContain("lookupToken += 1;");
+        assertThat(script)
+                .as("预留号必须存在，供刷新与下一次查询比较")
+                .contains("var lookupReserved = 0;");
+
+        // 唯一解锁入口仍然是用户显式查询。
+        int lookup = script.indexOf("function lookupDocument()");
+        int lookupEnd = script.indexOf("// ---- 解析", lookup);
+        assertThat(lookup).as("lookupDocument 必须存在").isGreaterThan(0);
+        assertThat(lookupEnd).isGreaterThan(lookup);
+        String lookupBody = script.substring(lookup, lookupEnd);
+        assertThat(lookupBody)
+                .as("解锁只能发生在用户显式按 ID 查询时")
+                .contains("unlockParseArea()");
+        assertThat(lookupBody)
+                .as("显式查询必须先解锁再看这次查询的结果")
+                .contains("用户显式发起查询 = 唯一解锁入口");
+    }
+
     @Test
     void theHealthEndpointIsUnchanged() {
         ResponseEntity<String> response = this.client.getForEntity("/actuator/health", String.class);
