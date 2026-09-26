@@ -16,9 +16,12 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 
 /**
- * 工单状态变更的真实 HTTP 验收（FD-0023-C）：完整生命周期、ETag 递增、陈旧版本 412，
+ * 工单状态变更的真实 HTTP 验收（FD-0023-C / C-R1 / C-R2）：完整生命周期、ETag 递增、陈旧版本 412，
  * 以及 428 / 400 / 409 三种拒绝形态；另外固定「列表接口不返回 ETag」这一事实，
  * 说明写请求的 {@code If-Match} 只能来自单条详情。
+ *
+ * <p>FD-0023-C-R2 追加两条：版本漂移后**详情仍可读且刷新后的 ETag 可用**（页面「刷新解锁」的前提），
+ * 以及**缺少版本前置条件的写入一定被拒绝**（页面锁定期「一个 POST 都不发」的服务端保障）。</p>
  *
  * <p>只使用虚构数据；不触碰任何付费接口。</p>
  */
@@ -213,6 +216,80 @@ class TicketLifecycleWebTests {
                 postJson("/api/v1/tickets/" + id + "/start", null, etag);
             }
         }
+    }
+
+    /**
+     * FD-0023-C-R2 依赖的后端事实：**版本漂移后详情仍然可读**。
+     *
+     * <p>页面在锁定操作区之后，详情区必须还能显示服务端的最新状态（否则用户无法判断发生了什么）。
+     * 这条用例证明「状态不变但版本前进」之后，单条详情依然可读，且**新 ETag 与响应体版本仍自洽**
+     * —— 这正是页面「刷新解锁」路径成立的前提。</p>
+     */
+    @Test
+    void theDetailStaysReadableAfterTheVersionDrifts() throws Exception {
+        ResponseEntity<String> created = postJson("/api/v1/tickets", fictionalCreateBody(), null);
+        String id = read(created).path("id").asText();
+        ResponseEntity<String> assigned = postJson("/api/v1/tickets/" + id + "/assign",
+                "{\"assigneeId\":\"alice\"}", etagOf(created));
+        ResponseEntity<String> started = postJson("/api/v1/tickets/" + id + "/start", null, etagOf(assigned));
+
+        // 漂移：状态不变（IN_PROGRESS）但版本前进
+        postJson("/api/v1/tickets/" + id + "/reassign", "{\"assigneeId\":\"bob\"}", etagOf(started));
+
+        ResponseEntity<String> afterDrift = get("/api/v1/tickets/" + id);
+        assertThat(afterDrift.getStatusCode()).as("漂移后详情仍然可读").isEqualTo(HttpStatus.OK);
+        String refreshedETag = etagOf(afterDrift);
+        assertThat(refreshedETag)
+                .as("刷新拿到的仍是规范强 ETag")
+                .matches("^\"[0-9]+\"$");
+        assertThat(refreshedETag)
+                .as("刷新后的 ETag 与响应体版本自洽 —— 这是页面解锁（重建操作区）的唯一依据")
+                .isEqualTo("\"" + read(afterDrift).path("version").asLong() + "\"");
+        assertThat(refreshedETag)
+                .as("刷新后的版本必须比漂移前更新")
+                .isNotEqualTo(etagOf(started));
+
+        // 刷新拿到的新 ETag 是可用的：以它写入成功
+        ResponseEntity<String> resolved = postJson("/api/v1/tickets/" + id + "/resolve",
+                "{\"resolution\":\"虚构：按刷新后的版本解决\"}", refreshedETag);
+        assertThat(resolved.getStatusCode()).as("刷新后按新版本可以正常写入").isEqualTo(HttpStatus.OK);
+        assertThat(read(resolved).path("status").asText()).isEqualTo("RESOLVED");
+    }
+
+    /**
+     * FD-0023-C-R2 依赖的另一条后端事实：**缺少 If-Match 的写请求一定被拒绝**。
+     *
+     * <p>页面在锁定状态下必须「一个 POST 都不发」；这条用例是它背后的服务端保障：
+     * 即使真发了没带版本前置条件的写请求，服务端也不会执行（428），数据不变。
+     * 同时确认用陈旧 ETag 写入得到 412 —— 两条路径都不会改动工单。</p>
+     */
+    @Test
+    void aWriteWithoutAVersionPreconditionIsAlwaysRejected() throws Exception {
+        ResponseEntity<String> created = postJson("/api/v1/tickets", fictionalCreateBody(), null);
+        String id = read(created).path("id").asText();
+
+        ResponseEntity<String> withoutIfMatch = postJson("/api/v1/tickets/" + id + "/assign",
+                "{\"assigneeId\":\"alice\"}", null);
+        assertThat(withoutIfMatch.getStatusCode())
+                .as("缺前置条件必须被拒绝")
+                .isEqualTo(HttpStatus.PRECONDITION_REQUIRED);
+
+        ResponseEntity<String> after = get("/api/v1/tickets/" + id);
+        assertThat(read(after).path("status").asText())
+                .as("被拒绝的写入不得改变状态")
+                .isEqualTo("NEW");
+        assertThat(read(after).path("assigneeId").isNull())
+                .as("被拒绝的写入不得写入处理人")
+                .isTrue();
+
+        // 陈旧 ETag 同样不得写入
+        ResponseEntity<String> stale = postJson("/api/v1/tickets/" + id + "/assign",
+                "{\"assigneeId\":\"alice\"}", "\"99\"");
+        assertThat(stale.getStatusCode())
+                .as("陈旧版本必须得到 412")
+                .isEqualTo(HttpStatus.PRECONDITION_FAILED);
+        ResponseEntity<String> stillNew = get("/api/v1/tickets/" + id);
+        assertThat(read(stillNew).path("status").asText()).as("412 之后状态不变").isEqualTo("NEW");
     }
 
     /**

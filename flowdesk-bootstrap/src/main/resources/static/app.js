@@ -1,5 +1,5 @@
 /*
- * FlowDesk 本机演示入口的脚本（FD-0023-A / FD-0023-B / FD-0023-B-R1 / FD-0023-C / FD-0023-C-R1）。
+ * FlowDesk 本机演示入口的脚本（FD-0023-A / B / B-R1 / C / C-R1 / C-R2）。
  *
  * 约束：
  *   - 所有请求都用**相对路径**（同源），不写死主机名与端口；
@@ -17,7 +17,14 @@
  *     工单 ID、规范强 ETag 与 version，只要强 ETag 与「用户当前看到的详情」不同就取消这次写入
  *     （**哪怕状态相同**），且**一个写请求都不发**；预检失败明确说明「写请求未发送」；A 的写请求在途时
  *     用户切到 B，A 的迟到响应不得覆盖 B 的详情；成功响应缺有效 ETag 或 version 与 ETag 不一致时
- *     不能宣称完整成功，只提示核查。
+ *     不能宣称完整成功，只提示核查；
+ *   - **异常结果后锁住状态变更操作区**（FD-0023-C-R2）：只要出现「预检发现 ETag 漂移 / 状态变化 /
+ *     响应格式异常」或「写请求得到不完整的成功响应」，最新详情**仍可阅读**，但**旧操作区必须被清空且
+ *     锁定** —— 按钮与输入框整体移除，并由 {@link actionsLocked} 让任何残留调用直接返回，
+ *     使「连点两次旧操作」的 POST 计数恒为 0；**只有用户显式点「刷新详情」并拿到有效的单条详情响应
+ *     （强 ETag 规范且与响应体 version 自洽）之后**，才按新状态重新渲染按钮。首次打开详情时若强 ETag
+ *     缺失、格式不符合后端规范、或与响应体 version 不一致，同样只展示**只读详情**（不渲染操作区、
+ *     不允许写入），并给出刷新入口。
  */
 (function () {
     'use strict';
@@ -54,6 +61,16 @@
      * 也不会把 B 的操作区改成 A 的状态。</p>
      */
     var actionToken = 0;
+
+    /**
+     * 操作区锁定标志（FD-0023-C-R2）。
+     *
+     * <p>出现「预检发现 ETag 漂移 / 状态变化 / 响应格式异常」或「写请求得到不完整的成功响应」时置为
+     * true：详情照常可读，但**旧操作区被清空并锁定**。{@link performAction} / {@link requestAction}
+     * 一看这个标志就直接返回，因此即使 DOM 上还有残留按钮被连点，也**一个 POST 都不会发**。
+     * 只有用户显式刷新并拿到有效的单条详情响应（{@link openDetail} 成功路径）才会复位。</p>
+     */
+    var actionsLocked = false;
 
     function element(id) {
         return document.getElementById(id);
@@ -374,10 +391,14 @@
      * <p>切换详情的第一件事就是调用它：旧工单的 id / ETag 与 DOM 上的按钮、输入框都在同一时刻消失，
      * 因此**不存在**「界面已经换到新工单、内部还指向旧工单」的窗口。新详情如果最终失败
      * （404 / 网络 / 格式异常），这个清空状态会一直保持，写请求也就永远没有目标可发。</p>
+     *
+     * <p>FD-0023-C-R2：清空的同时**默认上锁** —— 切换目标本身就是「旧操作区不再有效」，
+     * 只有随后的有效详情响应才会解锁。</p>
      */
     function clearCurrentTarget() {
         currentTicket = null;
         currentETag = null;
+        actionsLocked = true;
         var buttons = element('detail-action-buttons');
         if (buttons) {
             buttons.replaceChildren();
@@ -393,6 +414,39 @@
         show('detail-action-error', false);
         show('detail-action-result', false);
         show('detail-actions', false);
+    }
+
+    /**
+     * 异常结果后锁住操作区（FD-0023-C-R2）：**保留最新详情供阅读**，但把旧操作区清空并上锁。
+     *
+     * <p>与 {@link clearCurrentTarget} 的区别：本函数**不动详情区**（调用方通常已经用服务端返回的
+     * 最新数据填好了详情），也不把 currentTicket / currentETag 置空 —— 它们仍是「用户当前看到的详情」，
+     * 用于让用户看得见最新版本；但 {@link actionsLocked} 为 true 会让任何写路径直接返回。</p>
+     *
+     * @param message 锁定的原因文案（会显示在操作区错误位）
+     * @param ticketId 仍要保留的刷新目标（点「刷新详情」用它重新取数）
+     */
+    function lockActions(message, ticketId) {
+        actionsLocked = true;
+        currentETag = null;
+        setActionsBusy(false);
+        var buttons = element('detail-action-buttons');
+        if (buttons) {
+            buttons.replaceChildren();
+        }
+        var fields = element('detail-action-fields');
+        if (fields) {
+            fields.replaceChildren();
+        }
+        var confirmBox = element('detail-action-confirm');
+        if (confirmBox) {
+            confirmBox.replaceChildren();
+        }
+        // 操作区保持可见：用户需要看到「为什么不能操作」以及刷新入口。
+        show('detail-action-result', false);
+        show('detail-actions', true);
+        showActionError(message);
+        showRefreshHint(ticketId);
     }
 
     function openDetail(ticketId) {
@@ -457,6 +511,28 @@
                 }
                 currentTicket = result.body;
                 currentETag = result.eTag;
+
+                // FD-0023-C-R2：详情可读，但「能不能操作」取决于强 ETag 是否可用且自洽。
+                // 强 ETag 缺失 / 不符合后端规范（非 "n" 形式、或带了 W/ 弱校验）/ 与响应体 version
+                // 不一致时，只展示只读详情：不渲染操作区，也就没有按钮可点。
+                if (!isStrongETag(result.eTag)) {
+                    currentETag = null;
+                    renderDetail(result.body, result.eTag, true);
+                    lockActions('只读详情：这条工单的响应没有可用的强 ETag（收到：'
+                        + (result.eTag === null || result.eTag === undefined ? '无 ETag 响应头' : result.eTag)
+                        + '）。没有真实版本就无法安全地做状态变更，因此这里不提供操作，仅展示详情。',
+                        result.body.id);
+                    return;
+                }
+                if (result.eTag !== '"' + result.body.version + '"') {
+                    currentETag = null;
+                    renderDetail(result.body, result.eTag, true);
+                    lockActions('只读详情：这条工单的强 ETag（' + result.eTag + '）与响应体版本（'
+                        + result.body.version + '）不一致，无法确认版本。这里不提供操作，仅展示详情。',
+                        result.body.id);
+                    return;
+                }
+                actionsLocked = false;
                 renderDetail(result.body, result.eTag);
             });
     }
@@ -577,12 +653,6 @@
         setText('detail-action-error', message);
     }
 
-    function showActionIndeterminate(detail) {
-        show('detail-action-error', true);
-        setText('detail-action-error',
-            '操作结果待确认（' + detail + '）。请先刷新详情确认最新状态，勿直接重试。');
-    }
-
     function showRefreshHint(ticketId) {
         var box = document.getElementById('detail-action-error');
         if (!box || !ticketId) {
@@ -599,12 +669,19 @@
         box.appendChild(refresh);
     }
 
+    /**
+     * 按工单的真实状态重建操作区（FD-0023-C-R2：这是**唯一**的解锁入口）。
+     *
+     * <p>只有「用户显式刷新并拿到有效的单条详情响应」（{@link openDetail} 的成功路径）才会走到这里，
+     * 因此调用它就意味着解锁；这里显式复位 {@link actionsLocked}，让解锁状态与可见的按钮始终一致。</p>
+     */
     function renderActions(ticket) {
         var buttons = element('detail-action-buttons');
         var fields = element('detail-action-fields');
         if (!buttons || !fields) {
             return;
         }
+        actionsLocked = false;
         show('detail-action-error', false);
         show('detail-action-result', false);
         show('detail-action-confirm', false);
@@ -673,6 +750,10 @@
      */
     function requestAction(action) {
         if (acting) {
+            return;
+        }
+        // FD-0023-C-R2：操作区被锁定后，任何入口（含残留按钮被连点）都不再进入写路径。
+        if (actionsLocked || !currentTicket || !isStrongETag(currentETag)) {
             return;
         }
         if (action !== 'close') {
@@ -818,7 +899,8 @@
      * @param action 操作名（assign / reassign / start / resolve / close）
      */
     function performAction(action) {
-        if (acting || !currentTicket || !isStrongETag(currentETag)) {
+        // FD-0023-C-R2：锁定后 write 路径的第一道闸门 —— 连点旧按钮也在这里被挡住，POST 恒为 0。
+        if (actionsLocked || acting || !currentTicket || !isStrongETag(currentETag)) {
             return;
         }
         var ticketId = currentTicket.id;
@@ -851,85 +933,77 @@
                 }
                 show('detail-state', false);
 
+                // FD-0023-C-R2：预检一旦不成立（网络 / 非 200 / 格式异常 / 编号不符 / ETag 不可用），
+                // 就不再相信任何既有目标 —— 操作区整体锁住，用户只能通过刷新重新取得可操作状态。
                 if (probe.transportError) {
-                    setActionsBusy(false);
-                    showActionError('写请求未发送：取最新详情的预检请求在网络层失败（'
-                        + probe.transportError + '）。无法确认目标是否仍然成立，请刷新详情后重试。');
+                    lockActions('写请求未发送：取最新详情的预检请求在网络层失败（'
+                        + probe.transportError + '）。无法确认目标是否仍然成立，操作区已锁住；'
+                        + '请刷新详情后重试。', ticketId);
                     return;
                 }
                 if (probe.status !== 200) {
-                    setActionsBusy(false);
-                    showActionError('写请求未发送：取最新详情的预检返回 HTTP ' + probe.status + '（'
-                        + actionFailure(probe) + '）。目标工单可能已不存在或不可读，请刷新详情。');
-                    showRefreshHint(ticketId);
+                    lockActions('写请求未发送：取最新详情的预检返回 HTTP ' + probe.status + '（'
+                        + actionFailure(probe) + '）。目标工单可能已不存在或不可读，操作区已锁住；'
+                        + '请刷新详情。', ticketId);
                     return;
                 }
                 if (probe.formatProblem) {
-                    setActionsBusy(false);
-                    showActionError('写请求未发送：取最新详情的预检响应格式异常（' + probe.formatProblem
-                        + '）。无法确认目标是否仍然成立，请刷新详情。');
-                    showRefreshHint(ticketId);
+                    lockActions('写请求未发送：取最新详情的预检响应格式异常（' + probe.formatProblem
+                        + '）。无法确认目标是否仍然成立，操作区已锁住；请刷新详情。', ticketId);
                     return;
                 }
                 var probeProblem = detailProblem(probe.body);
                 if (probeProblem) {
-                    setActionsBusy(false);
-                    showActionError('写请求未发送：取最新详情的预检响应格式异常（' + probeProblem
-                        + '）。无法确认目标是否仍然成立，请刷新详情。');
-                    showRefreshHint(ticketId);
+                    lockActions('写请求未发送：取最新详情的预检响应格式异常（' + probeProblem
+                        + '）。无法确认目标是否仍然成立，操作区已锁住；请刷新详情。', ticketId);
                     return;
                 }
                 if (probe.body.id !== ticketId) {
-                    setActionsBusy(false);
-                    showActionError('写请求未发送：预检返回的工单编号（' + probe.body.id
-                        + '）与当前操作目标（' + ticketId + '）不一致。请刷新详情。');
-                    showRefreshHint(ticketId);
+                    lockActions('写请求未发送：预检返回的工单编号（' + probe.body.id
+                        + '）与当前操作目标（' + ticketId + '）不一致。操作区已锁住，请刷新详情。',
+                        ticketId);
                     return;
                 }
                 if (!isStrongETag(probe.eTag)) {
-                    setActionsBusy(false);
-                    showActionError('写请求未发送：单条详情响应没有可用的强 ETag（收到：'
+                    lockActions('写请求未发送：单条详情响应没有可用的强 ETag（收到：'
                         + (probe.eTag === null || probe.eTag === undefined ? '无 ETag 响应头' : probe.eTag)
-                        + '）。写请求必须带真实版本，不能用猜造的请求头。');
-                    showRefreshHint(ticketId);
+                        + '）。写请求必须带真实版本，不能用猜造的请求头。操作区已锁住，请刷新详情。',
+                        ticketId);
                     return;
                 }
                 if (probe.eTag !== '"' + probe.body.version + '"') {
-                    setActionsBusy(false);
-                    showActionError('写请求未发送：预检的强 ETag（' + probe.eTag + '）与响应体版本（'
-                        + probe.body.version + '）不一致。请刷新详情。');
-                    showRefreshHint(ticketId);
+                    lockActions('写请求未发送：预检的强 ETag（' + probe.eTag + '）与响应体版本（'
+                        + probe.body.version + '）不一致。操作区已锁住，请刷新详情。', ticketId);
                     return;
                 }
                 var requestETag = probe.eTag;
 
                 if (requestETag !== displayedETag) {
                     // 版本漂移：服务端的当前版本和用户看到的不一样了。即使状态相同也取消写入。
-                    // 先把界面刷新成真实的最新详情（字段可见），但**不重新打开操作区** ——
-                    // 用户必须先确认新状态再自己重新发起操作。
+                    // FD-0023-C-R2：先把详情刷新成真实的最新详情（**保留可读**），然后**锁住操作区** ——
+                    // 旧按钮被清空、actionsLocked=true，连点旧操作也发不出任何 POST；
+                    // 用户必须先显式刷新并拿到有效的单条详情响应，才会按新状态重建按钮。
                     currentTicket = probe.body;
                     currentETag = requestETag;
                     renderDetail(probe.body, requestETag, true);
-                    setActionsBusy(false);
-                    showActionError('写请求未发送：这条工单的版本已经变化'
+                    lockActions('写请求未发送：这条工单的版本已经变化'
                         + (probe.body.status === displayedStatus ? '（状态仍是 ' + displayedStatus + '）'
                             : '（状态也从 ' + displayedStatus + ' 变成了 ' + probe.body.status + '）')
                         + ' —— 你看到的版本是 ' + displayedETag + '，服务端当前是 ' + requestETag
-                        + '。为避免覆盖别人的修改，本次操作已取消；请确认最新详情后重新操作。');
-                    showRefreshHint(ticketId);
+                        + '。为避免覆盖别人的修改，本次操作已取消，操作区已锁住；'
+                        + '请先刷新详情，确认最新状态后再重新操作。', ticketId);
                     return;
                 }
 
                 if (probe.body.status !== displayedStatus) {
                     // 正常情况下状态变化必然伴随版本变化（上面的分支已经拦住）；这里只作为
-                    // 「版本没变但状态变了」这种异常响应的兜底。
+                    // 「版本没变但状态变了」这种异常响应的兜底。同样：详情可读、操作区锁住。
                     currentTicket = probe.body;
                     currentETag = requestETag;
                     renderDetail(probe.body, requestETag, true);
-                    setActionsBusy(false);
-                    showActionError('写请求未发送：这条工单的状态已经变化（现在是 ' + probe.body.status
-                        + '），本次操作已取消；请按新的可用操作重试。');
-                    showRefreshHint(ticketId);
+                    lockActions('写请求未发送：这条工单的状态已经变化（现在是 ' + probe.body.status
+                        + '），本次操作已取消，操作区已锁住；请先刷新详情，再按新的可用操作重试。',
+                        ticketId);
                     return;
                 }
 
@@ -956,88 +1030,101 @@
     function handleActionResult(action, ticketId, displayedStatus, requestETag, result) {
         setActionsBusy(false);
 
+        // FD-0023-C-R2：下面这些「结果不确定 / 不完整」的分支，历史版本只是把按钮重新启用，
+        // 于是用户可以直接再点一次同一个操作。现在统一改为**锁住操作区**：
+        // 详情仍可读（能读到的部分照旧），但按钮被清空、actionsLocked=true ——
+        // 任何残留调用都被挡住（POST=0），只能通过显式刷新重新取得可操作状态。
         if (result.transportError) {
-            showActionIndeterminate('请求中断（' + result.transportError + '）');
+            lockActions('操作结果待确认（请求中断：' + result.transportError
+                + '）。请先刷新详情确认最新状态，勿直接重试；操作区已锁住。', ticketId);
             return;
         }
         if (result.status === 412) {
-            showActionError('版本冲突（HTTP 412 · ' + actionFailure(result)
-                + '）：这条工单已被其他操作更新，本次操作没有生效。请刷新详情后重试。');
-            showRefreshHint(currentTicket ? currentTicket.id : null);
+            lockActions('版本冲突（HTTP 412 · ' + actionFailure(result)
+                + '）：这条工单已被其他操作更新，本次操作没有生效。操作区已锁住，请刷新详情后重试。',
+                ticketId);
             return;
         }
         if (result.status === 428) {
-            showActionError('缺少前置条件（HTTP 428 · ' + actionFailure(result)
-                + '）：服务端要求先取得最新版本才能变更状态。请刷新详情。');
-            showRefreshHint(currentTicket ? currentTicket.id : null);
+            lockActions('缺少前置条件（HTTP 428 · ' + actionFailure(result)
+                + '）：服务端要求先取得最新版本才能变更状态。操作区已锁住，请刷新详情。', ticketId);
             return;
         }
         if (result.status === 409) {
-            showActionError('状态冲突（HTTP 409 · ' + actionFailure(result)
-                + '）：当前状态不允许这个操作。请刷新详情后按可用操作重试。');
-            showRefreshHint(currentTicket ? currentTicket.id : null);
+            lockActions('状态冲突（HTTP 409 · ' + actionFailure(result)
+                + '）：当前状态不允许这个操作。操作区已锁住，请刷新详情后按可用操作重试。', ticketId);
             return;
         }
         if (result.status === 400) {
-            showActionError('请求被拒绝（HTTP 400 · ' + actionFailure(result) + '）。');
+            lockActions('请求被拒绝（HTTP 400 · ' + actionFailure(result)
+                + '）。操作区已锁住，请刷新详情后重试。', ticketId);
             return;
         }
         if (result.status === 404) {
-            showActionError('工单不存在（HTTP 404 · ' + actionFailure(result) + '）。');
+            lockActions('工单不存在（HTTP 404 · ' + actionFailure(result)
+                + '）。操作区已锁住，请刷新详情。', ticketId);
             return;
         }
         if (result.status >= 400 && result.status < 500) {
-            showActionError('操作被拒绝（HTTP ' + result.status + ' · ' + actionFailure(result) + '）。');
+            lockActions('操作被拒绝（HTTP ' + result.status + ' · ' + actionFailure(result)
+                + '）。操作区已锁住，请刷新详情后重试。', ticketId);
             return;
         }
         if (result.status >= 500) {
-            showActionIndeterminate('服务端返回 HTTP ' + result.status + '，操作可能已经生效');
+            lockActions('操作结果待确认（服务端返回 HTTP ' + result.status
+                + '，操作可能已经生效）。请先刷新详情确认最新状态，勿直接重试；操作区已锁住。', ticketId);
             return;
         }
         if (result.status !== 200) {
-            showActionIndeterminate('收到意外状态码 HTTP ' + result.status + '，结果不确定');
+            lockActions('操作结果待确认（收到意外状态码 HTTP ' + result.status
+                + '）。请先刷新详情确认最新状态，勿直接重试；操作区已锁住。', ticketId);
             return;
         }
         if (result.formatProblem) {
-            showActionIndeterminate('响应体异常（' + result.formatProblem + '）');
+            lockActions('操作结果待确认（响应体异常：' + result.formatProblem
+                + '）。请先刷新详情确认最新状态，勿直接重试；操作区已锁住。', ticketId);
             return;
         }
         var problem = detailProblem(result.body);
         if (problem) {
-            showActionIndeterminate('响应体异常（' + problem + '）');
+            lockActions('操作结果待确认（响应体异常：' + problem
+                + '）。请先刷新详情确认最新状态，勿直接重试；操作区已锁住。', ticketId);
             return;
         }
         if (result.body.id !== ticketId) {
             // 200 但回来的不是这条工单：不能把它当成这条工单的成功结果
-            showActionIndeterminate('响应体异常（返回的工单编号与本次操作的目标不一致）');
+            lockActions('操作结果待确认（响应体异常：返回的工单编号与本次操作的目标不一致）'
+                + '。请先刷新详情确认最新状态，勿直接重试；操作区已锁住。', ticketId);
             return;
         }
         if (result.body.version <= versionOfETag(requestETag)) {
             // 版本没有前进：服务端说 200，但版本没有递增，说明结果不能按「本次操作已生效」理解
-            showActionIndeterminate('响应体异常（版本没有按预期递增：本次 If-Match 为 ' + requestETag
-                + '，响应版本为 ' + result.body.version + '）');
+            lockActions('操作结果待确认（响应体异常：版本没有按预期递增 —— 本次 If-Match 为 ' + requestETag
+                + '，响应版本为 ' + result.body.version
+                + '）。请先刷新详情确认最新状态，勿直接重试；操作区已锁住。', ticketId);
             return;
         }
         if (!isStrongETag(result.eTag) || result.eTag !== '"' + result.body.version + '"') {
             // 成功响应缺有效 ETag，或 ETag 与版本不自洽：不能宣称完整成功，只能提示核查。
-            // 注意此时详情区仍然刷新为服务端返回的最新详情（版本已经前进），操作区保持原样，
-            // 让用户可以刷新后重新确认。
+            // FD-0023-C-R2：详情刷新为服务端返回的最新详情（版本已经前进，**可读**），
+            // 但操作区必须**锁住** —— 否则用户会对着一个拿不到可靠版本的目标再提交一次。
             currentTicket = result.body;
-            currentETag = isStrongETag(result.eTag) ? result.eTag : null;
+            currentETag = null;
             renderDetail(result.body, result.eTag, true);
-            show('detail-action-result', true);
-            setText('detail-action-result', '操作可能已生效（' + ACTION_LABELS[action] + '）：服务端返回 HTTP 200、状态 '
+            lockActions('操作可能已生效（' + ACTION_LABELS[action] + '）：服务端返回 HTTP 200、状态 '
                 + result.body.status + '、版本 ' + result.body.version
                 + '，但' + (isStrongETag(result.eTag)
                     ? 'ETag（' + result.eTag + '）与版本（' + result.body.version + '）不一致'
                     : '响应缺少可用的强 ETag（收到：' + (result.eTag === null || result.eTag === undefined
                         ? '无 ETag 响应头' : result.eTag) + '）')
-                + '。请刷新详情核对最新状态后再继续操作，本次不按「完整成功」处理。');
+                + '。本次不按「完整成功」处理，操作区已锁住：请刷新详情核对最新状态后再继续操作。',
+                ticketId);
             return;
         }
 
         currentTicket = result.body;
         currentETag = result.eTag;
+        actionsLocked = false;
         renderDetail(result.body, result.eTag);
         show('detail-action-result', true);
         setText('detail-action-result', '操作成功：' + ACTION_LABELS[action]

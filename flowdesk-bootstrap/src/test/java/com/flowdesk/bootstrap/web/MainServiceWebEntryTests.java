@@ -197,6 +197,43 @@ class MainServiceWebEntryTests {
     }
 
     @Test
+    void theScriptLocksTheActionAreaAfterAnAbnormalResult() {
+        String script = bodyOf("/app.js");
+
+        assertThat(script)
+                .as("必须有独立的锁定标志与专门的锁定函数（锁定的语义要和「清空目标」分开）")
+                .contains("var actionsLocked = false;")
+                .contains("function lockActions(message, ticketId)");
+        assertThat(script)
+                .as("锁定函数必须清空按钮、输入框与确认区，并让旧 ETag 失效")
+                .contains("actionsLocked = true;")
+                .contains("currentETag = null;");
+        assertThat(script)
+                .as("两条写路径入口都要受锁定标志约束：连点旧按钮也必须一个 POST 都不发")
+                .contains("if (actionsLocked || !currentTicket || !isStrongETag(currentETag)) {")
+                .contains("if (actionsLocked || acting || !currentTicket || !isStrongETag(currentETag)) {");
+        assertThat(script)
+                .as("切换详情时立刻上锁（clearCurrentTarget 承担默认锁定）")
+                .contains("actionsLocked = true;");
+        assertThat(script)
+                .as("解锁只发生在「用户显式刷新并取得有效单条详情响应」之后：renderActions 是唯一解锁入口")
+                .contains("actionsLocked = false;")
+                .contains("function renderActions(ticket)")
+                .contains("这是**唯一**的解锁入口");
+        assertThat(script)
+                .as("版本漂移与状态变化两条分支都必须调用锁定函数，而不是只提示刷新")
+                .contains("为避免覆盖别人的修改，本次操作已取消，操作区已锁住");
+        assertThat(script)
+                .as("出异常的判据分支（预检失败、结果不确定、不完整成功）都要走锁定函数")
+                .contains("操作区已锁住")
+                .contains("本次不按「完整成功」处理，操作区已锁住");
+        assertThat(script)
+                .as("首次打开详情时强 ETag 不可用要退化为只读详情，不渲染操作区")
+                .contains("renderDetail(result.body, result.eTag, true);")
+                .contains("只读详情：");
+    }
+
+    @Test
     void theHealthEndpointIsUnchanged() {
         ResponseEntity<String> response = this.client.getForEntity("/actuator/health", String.class);
 
