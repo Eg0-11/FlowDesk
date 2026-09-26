@@ -96,13 +96,13 @@ class MainServiceWebEntryTests {
                 .contains("/actuator/health");
 
         assertThat(knowledgeScript)
-                .as("知识脚本只允许出现文档端点：不得调索引、检索或 AI 接口")
+                .as("知识脚本只允许文档端点：不得调检索或 AI 接口；索引端点是 FD-0023-E 显式放开的唯一新增")
                 .contains("/api/v1/knowledge/documents")
+                .contains("+ '/index'")
                 .doesNotContain("/api/v1/ai")
                 .doesNotContain("/incident-triage")
                 .doesNotContain("/asset-diagnosis")
-                .doesNotContain("/search")
-                .doesNotContain("/index");
+                .doesNotContain("/search");
         assertThat(page)
                 .as("页面本身仍然只引用自己同源的静态资源")
                 .contains("/app.js")
@@ -258,7 +258,7 @@ class MainServiceWebEntryTests {
      * 以及各类错误的渲染文案由真实 HTTP 用例与浏览器行为测试锁定。</p>
      */
     @Test
-    void theKnowledgeScriptNeverWritesAtLoadTimeAndOnlyThroughTwoClicks() {
+    void theKnowledgeScriptNeverWritesAtLoadTimeAndOnlyThroughExplicitClicks() {
         String script = bodyOf("/knowledge.js");
 
         int posts = 0;
@@ -267,8 +267,8 @@ class MainServiceWebEntryTests {
             posts++;
         }
         assertThat(posts)
-                .as("知识脚本里只能有两处写请求：上传 + 解析；查询与解析前的核对都是只读 GET")
-                .isEqualTo(2);
+                .as("知识脚本里只能有三处写请求：上传 + 解析 + 索引（FD-0023-E）；查询与核对都是只读 GET")
+                .isEqualTo(3);
 
         assertThat(script)
                 .as("加载路径不得直接发请求：所有网络调用都在事件处理函数 / 点击触发的函数里")
@@ -423,11 +423,12 @@ class MainServiceWebEntryTests {
                 .contains("永不拒绝");
 
         assertThat(script)
-                .as("四条调用路径都必须挂上收尾兜底：三条写/核对路径各一次 guard，查询路径用自己的失败回调")
+                .as("写/核对路径都必须挂上收尾兜底：上传、解析核对、解析写、索引核对、索引写各一次 guard，查询路径用自己的失败回调")
                 .contains("function guard(promise, onFinish, onCrash)")
                 .contains("guard(requestJson(DOCUMENTS_PATH, {")
                 .contains("guard(requestJson(DOCUMENTS_PATH + '/' + encodeURIComponent(targetId), {")
                 .contains("guard(requestJson(DOCUMENTS_PATH + '/' + encodeURIComponent(targetId) + '/parse', {")
+                .contains("guard(requestJson(DOCUMENTS_PATH + '/' + encodeURIComponent(targetId) + '/index', {")
                 .contains("查询在页面内异常终止，未能取得文档状态。请稍后重试。");
 
         // guard 必须在使用者之前复位 busy：断言 onFinish 被调用一次且与 onCrash 并存。
@@ -630,6 +631,125 @@ class MainServiceWebEntryTests {
         assertThat(lookupBody)
                 .as("显式查询必须先解锁再看这次查询的结果")
                 .contains("用户显式发起查询 = 唯一解锁入口");
+    }
+
+    /**
+     * FD-0023-E：手动索引必须在用户显式确认费用后、经版本核对才能发生。
+     *
+     * <p>页面加载、查询、解析成功都<b>不会</b>自动索引；按钮只在勾选「索引可能调用
+     * DashScope Embedding 并产生费用」后才会启用；Basic 模式（Embedding 未启用）的 503
+     * 结果是确定的（请求没执行、文档未动），因此不宣称「结果未知」。</p>
+     */
+    @Test
+    void theKnowledgeScriptIndexesOnlyAfterExplicitCostConfirmation() {
+        String script = bodyOf("/knowledge.js");
+        String page = bodyOf("/");
+
+        // 页面必须明确费用提示与确认闸门，并写明不会自动索引。
+        assertThat(page)
+                .as("页面必须明确提示索引可能产生 DashScope Embedding 费用")
+                .contains("索引可能调用 DashScope Embedding 并产生费用")
+                .as("页面必须写明不会自动索引")
+                .contains("绝不会自动索引")
+                .contains("knowledge-index-confirm")
+                .contains("knowledge-index-note")
+                .contains("knowledge-index-result")
+                .contains("PARSED</code> / <code>INDEX_FAILED")
+                .contains("最多发送一次");
+
+        // 结构：索引流程与解析流程同一套不变量。
+        assertThat(script)
+                .as("只有 PARSED / INDEX_FAILED 允许索引")
+                .contains("var INDEXABLE_STATUSES = ['PARSED', 'INDEX_FAILED'];")
+                .contains("INDEXABLE_STATUSES.indexOf(probe.body.status) < 0");
+        assertThat(script)
+                .as("索引写请求必须由核对到的版本构造 If-Match，且 URL 由路径拼接而来")
+                .contains("guard(requestJson(DOCUMENTS_PATH + '/' + encodeURIComponent(targetId) + '/index', {")
+                .contains("'If-Match': requestETag");
+        assertThat(script)
+                .as("索引前必须有完整的重新核对（ID / 版本 / 状态），任一不符都不发写请求")
+                .contains("String(probe.body.id).toLowerCase() !== targetId.toLowerCase()")
+                .contains("probe.body.version !== displayedVersion")
+                .contains("probe.body.status !== displayedStatus")
+                .contains("写请求未发送");
+        assertThat(script)
+                .as("索引成功也必须自洽：状态是 INDEXED 且 ETag 与响应体版本一致，否则锁定")
+                .contains("result.body.status !== 'INDEXED'")
+                .contains("索引返回 200，但响应头 ETag 与响应体版本不一致，响应不自洽。");
+        assertThat(script)
+                .as("400 / 404 / 409 / 412 / 428 / 503 必须分别提示")
+                .contains("result.status === 503")
+                .contains("Embedding 服务未启用（Basic 模式）")
+                .contains("result.status === 412")
+                .contains("result.status === 409")
+                .contains("result.status === 400")
+                .contains("result.status === 404")
+                .contains("result.status === 428");
+        assertThat(script)
+                .as("索引失败必须锁定索引区：清空可写目标并置锁定标志")
+                .contains("function lockIndex(message, outcomeUncertain)")
+                .contains("function indexDocument()")
+                .contains("function renderIndexArea(documentBody)")
+                .contains("function renderIndexResult(indexed)")
+                .contains("function clearIndexResult()");
+        int lockFn = script.indexOf("function lockIndex(message, outcomeUncertain)");
+        int lockFnEnd = script.indexOf("function indexDocument()", lockFn);
+        assertThat(lockFn).as("lockIndex 必须存在").isGreaterThan(0);
+        assertThat(lockFnEnd).isGreaterThan(lockFn);
+        String lockBody = script.substring(lockFn, lockFnEnd);
+        assertThat(lockBody)
+                .as("锁定时必须清空可写目标并禁用索引按钮")
+                .contains("indexLocked = true;")
+                .contains("currentDocument = null;")
+                .contains("setDisabled(element('knowledge-index'), true);");
+
+        // FD-0023-E 浏览器验收抓到并已修复的缺陷：预检 GET 的收尾回调会把忙标志复位，
+        // 因此发送写请求的入口必须重新置位，否则 POST 在途期间连点能发出重复写请求。
+        int sendFn = script.indexOf("function sendIndexRequest(targetId, displayedStatus, requestETag)");
+        assertThat(sendFn).as("sendIndexRequest 必须存在").isGreaterThan(0);
+        int sendFnEnd = script.indexOf("function handleIndexResult(", sendFn);
+        assertThat(sendFnEnd).as("handleIndexResult 必须紧跟 sendIndexRequest").isGreaterThan(sendFn);
+        assertThat(script.substring(sendFn, sendFnEnd))
+                .as("POST 在途期间忙标志必须为真：sendIndexRequest 入口要重新置位忙标志")
+                .contains("setIndexBusy(true);");
+
+        // 网络中断 / 读体失败 / 5xx / 成功响应不自洽的提示必须包含任务规定的固定短语。
+        assertThat(script)
+                .as("不确定结果的提示必须包含「结果待确认，请重新查询」")
+                .contains("结果待确认，请重新查询");
+
+        // 唯一解锁入口必须同时解锁解析区与索引区。
+        int unlockFn = script.indexOf("function unlockParseArea()");
+        int unlockFnEnd = script.indexOf("function appendRow(", unlockFn);
+        assertThat(script.substring(unlockFn, unlockFnEnd))
+                .as("显式查询必须同时解锁两个写区")
+                .contains("parseLocked = false;")
+                .contains("indexLocked = false;");
+
+        // 只读刷新不得给索引按钮可写语义。
+        int refreshFn = script.indexOf("function renderDocumentFromRefresh(documentBody)");
+        int refreshFnEnd = script.indexOf("// ---- 解析区", refreshFn);
+        assertThat(script.substring(refreshFn, refreshFnEnd))
+                .as("只读刷新必须禁用索引按钮，且不得重建可写目标")
+                .contains("setDisabled(element('knowledge-index'), true);")
+                .doesNotContain("currentDocument =");
+
+        // 确认闸门：未勾选时 indexDocument 必须拒绝执行；按钮与确认框都要绑定事件。
+        assertThat(script)
+                .as("indexDocument 必须先检查费用确认勾选")
+                .contains("if (!isIndexConfirmed()) {")
+                .contains("indexButton.addEventListener('click', indexDocument)")
+                .contains("indexConfirm.addEventListener('change', refreshIndexButton)");
+
+        // 绝不自动索引：indexDocument 只能有一个定义；标识符引用总数必须是 2
+        // （定义 1 次 + 按钮绑定以函数引用形式出现 1 次）。绑定是 addEventListener
+        // 传引用而不是调用，因此若任何加载/查询/解析路径触发索引，总数会大于 2。
+        int definitionCount = script.split("function indexDocument\\(", -1).length - 1;
+        assertThat(definitionCount).as("indexDocument 只能定义一次").isEqualTo(1);
+        int referenceCount = script.split("indexDocument", -1).length - 1;
+        assertThat(referenceCount)
+                .as("indexDocument 只允许出现在定义与按钮点击绑定各一次 —— 加载、查询、解析路径都不得触发索引")
+                .isEqualTo(2);
     }
 
     @Test

@@ -423,6 +423,105 @@ class KnowledgeWebFlowHttpContractTests {
                 .isEqualTo(0L);
     }
 
+    // ---------- FD-0023-E：手动索引的真实 HTTP 契约（Basic 模式） ----------
+
+    /**
+     * FD-0023-E：Basic 模式（Embedding 未启用）下，页面发出的真实索引请求
+     * 会得到 503，且文档不被读取、不修改 —— 这就是「不得对已启用的真实 Embedding
+     * 服务发送索引请求」在测试环境的对应事实：本类全程运行在 Embedding 关闭的配置上。
+     */
+    @Test
+    void indexingAParsedDocumentInBasicModeReturns503AndLeavesTheDocumentUntouched() throws Exception {
+        JsonNode uploaded = uploadFictionalReport();
+        String documentId = uploaded.path("id").asText();
+
+        // 页面动作：查询 → 解析（版本 0 → 2）→ 勾选费用确认后再索引。
+        lookup(documentId);
+        this.mockMvc.perform(post(BASE_PATH + "/{id}/parse", documentId)
+                        .header(HttpHeaders.IF_MATCH, "\"0\""))
+                .andExpect(status().isOk());
+
+        MvcResult result = this.mockMvc.perform(post(BASE_PATH + "/{id}/index", documentId)
+                        .header(HttpHeaders.IF_MATCH, "\"2\""))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.code").value("KNOWLEDGE_EMBEDDING_DISABLED"))
+                .andExpect(jsonPath("$.type").value("urn:flowdesk:problem:knowledge-embedding-disabled"))
+                .andExpect(jsonPath("$.status").value(503))
+                .andReturn();
+
+        assertThat(result.getResponse().getContentAsString(StandardCharsets.UTF_8))
+                .as("错误响应不得泄漏内部细节")
+                .doesNotContain("contentKey")
+                .doesNotContain("Exception");
+
+        // 503 是确定结果：文档必须原样（PARSED / v2），页面据此提示「请求没有执行」。
+        assertThat(statusOf(documentId)).as("Basic 模式 503 不得改动文档状态").isEqualTo("PARSED");
+        assertThat(versionOf(documentId)).as("Basic 模式 503 不得改动版本").isEqualTo(2L);
+    }
+
+    /** 缺 If-Match → 428；格式非法 → 400。这两类请求根本到不了向量化服务。 */
+    @Test
+    void indexPreconditionViolationsAre428And400BeforeAnythingElse() throws Exception {
+        JsonNode uploaded = uploadFictionalReport();
+        String documentId = uploaded.path("id").asText();
+
+        this.mockMvc.perform(post(BASE_PATH + "/{id}/index", documentId))
+                .andExpect(status().isPreconditionRequired())
+                .andExpect(jsonPath("$.code").value("PRECONDITION_REQUIRED"));
+
+        this.mockMvc.perform(post(BASE_PATH + "/{id}/index", documentId)
+                        .header(HttpHeaders.IF_MATCH, "0"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_IF_MATCH"));
+
+        assertThat(statusOf(documentId)).isEqualTo("UPLOADED");
+        assertThat(versionOf(documentId)).isEqualTo(0L);
+    }
+
+    /**
+     * 不规范 ID → 400（控制器层在进入应用服务前就拒绝，Basic 模式也一样）。
+     *
+     * <p>Basic 模式下「未启用向量化」的 503 检查先于仓储查询（见
+     * {@code KnowledgeDocumentIndexingService.index}：不读仓储、不改状态），
+     * 因此未知 UUID 得到 <b>503</b> 而不是 404。404 分支由应用层单测与
+     * 浏览器合成响应（FD-0023-E）覆盖。</p>
+     */
+    @Test
+    void indexMalformedIdIs400AndUnknownIdIsShadowedBy503InBasicMode() throws Exception {
+        this.mockMvc.perform(post(BASE_PATH + "/{id}/index", java.util.UUID.randomUUID())
+                        .header(HttpHeaders.IF_MATCH, "\"0\""))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.code").value("KNOWLEDGE_EMBEDDING_DISABLED"))
+                .andExpect(jsonPath("$.type").value("urn:flowdesk:problem:knowledge-embedding-disabled"));
+
+        this.mockMvc.perform(post(BASE_PATH + "/{id}/index", "1-1-1-1-1")
+                        .header(HttpHeaders.IF_MATCH, "\"0\""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
+    }
+
+    /**
+     * Basic 模式下 503 的检查先于状态校验，因此 UPLOADED 文档同样得到 503 而不是
+     * 409 NOT_INDEXABLE（409 由应用层单测 {@code rejectsDocumentsThatAreNotParsedOrIndexFailed…}
+     * 与浏览器合成响应覆盖）。这里同时核实 503 不会读取或修改文档：状态与版本原样。
+     */
+    @Test
+    void indexOnAnUploadedDocumentInBasicModeIs503AndChangesNothing() throws Exception {
+        JsonNode uploaded = uploadFictionalReport();
+        String documentId = uploaded.path("id").asText();
+
+        this.mockMvc.perform(post(BASE_PATH + "/{id}/index", documentId)
+                        .header(HttpHeaders.IF_MATCH, "\"0\""))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.code").value("KNOWLEDGE_EMBEDDING_DISABLED"))
+                .andExpect(jsonPath("$.type").value("urn:flowdesk:problem:knowledge-embedding-disabled"))
+                .andExpect(jsonPath("$.status").value(503));
+
+        assertThat(statusOf(documentId)).isEqualTo("UPLOADED");
+        assertThat(versionOf(documentId)).isEqualTo(0L);
+    }
+
     // ---------- 辅助 ----------
 
     private JsonNode uploadFictionalReport() throws Exception {

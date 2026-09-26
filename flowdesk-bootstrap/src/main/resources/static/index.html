@@ -188,6 +188,23 @@
                 页面按服务端返回的权威版本更新，<b>不假定</b>解析只加 1。
             </p>
             <div id="knowledge-parse-result" class="panel" hidden></div>
+            <div class="toolbar">
+                <label for="knowledge-index-confirm">
+                    <input id="knowledge-index-confirm" type="checkbox">
+                    我已确认：索引可能调用 DashScope Embedding 并产生费用
+                </label>
+                <button id="knowledge-index" type="button" disabled>索引</button>
+            </div>
+            <p id="knowledge-index-note" class="hint"></p>
+            <p class="hint">
+                只有 <code>PARSED</code> / <code>INDEX_FAILED</code> 允许索引，且必须先勾选上面的费用确认。
+                页面加载、查询或解析成功时<b>绝不会自动索引</b>；确认后点击「索引」会<b>先重新查询</b>核对
+                文档 ID、状态与你看到的版本，再由当前版本构造带双引号的 <code>If-Match</code>，
+                <b>最多发送一次</b>索引写请求。版本不一致时本次写请求<b>直接取消</b>。
+                未启用 Embedding（Basic 模式）时索引会返回 <b>503</b>，此时文档不会被读取或修改。
+                网络中断、响应读不出来或服务端错误时结果无法确认，索引区会锁定并要求重新查询，<b>不自动重试</b>。
+            </p>
+            <div id="knowledge-index-result" class="panel" hidden></div>
         </div>
     </section>
 </main>

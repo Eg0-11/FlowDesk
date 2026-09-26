@@ -31,6 +31,13 @@
  *     刷新**成功或失败都不得解锁** —— 只有用户重新「按 ID 查询」才是唯一解锁入口。
  *     这条不变量用「同步 lockParse 先于 refreshAfterConflict」的实际调用顺序保证，
  *     而不是靠异步回调的先后。
+ * 13. 索引（FD-0023-E）只由用户显式确认触发：按钮必须在勾选「索引可能调用 DashScope
+ *     Embedding 并产生费用」之后才会启用；页面加载、查询或解析成功都**不会**自动索引。
+ *     确认后索引前同样重新 GET 核对 ID / 状态 / 版本，再由当前版本构造 If-Match，
+ *     最多发送一次索引写请求。200 必须自洽（文档 ID 一致、状态是 INDEXED、
+ *     ETag 与响应体版本一致）才承认成功；400 / 404 / 409 / 412 / 428 与 Basic 模式的
+ *     503 分别提示；网络中断 / 读体失败 / 其它 5xx / 成功响应不自洽 → 锁定索引区并
+ *     提示「结果待确认，请重新查询」，不自动重试。
  */
 (function () {
   'use strict';
@@ -46,6 +53,9 @@
 
   // 只有这两个状态允许用户手动触发解析（其余状态的解析请求会被服务端以 409 拒绝）。
   var PARSABLE_STATUSES = ['UPLOADED', 'PARSE_FAILED'];
+
+  // 与后端索引用例一致：只有这两种状态允许推进到 INDEXING → INDEXED。
+  var INDEXABLE_STATUSES = ['PARSED', 'INDEX_FAILED'];
 
   var STATUS_LABELS = {
     UPLOADED: 'UPLOADED（已上传，未解析）',
@@ -71,6 +81,7 @@
   // ---- 本区状态 -------------------------------------------------------------
   var uploading = false;      // 上传请求在途
   var parsing = false;        // 解析请求在途
+  var indexing = false;       // 索引请求在途（FD-0023-E）
   var copyTimer = null;       // 复制反馈的定时器
 
   // 用户当前"看到的"文档：只有在 GET 成功且校验通过后才会被赋值。
@@ -81,6 +92,10 @@
   // 就锁住写路径；此时刷新的只读展示不得把按钮重新点亮。
   // 只有用户重新「按 ID 查询」才能解锁（那是唯一重置该标志的入口）。
   var parseLocked = false;
+
+  // 索引区锁定标志（FD-0023-E）：语义与解析区一致 —— 异常后锁住写路径，
+  // 只有用户重新「按 ID 查询」才解锁。
+  var indexLocked = false;
 
   // 每次 GET 递增；用于丢弃迟到的旧响应，避免覆盖用户刚看到的新结果。
   var lookupToken = 0;
@@ -351,10 +366,11 @@
 
   /**
    * 用户显式「按 ID 查询」是**唯一**的解锁入口：只有用户重新发起一次完整的查询，
-   * 才允许解析区重新变得可写。
+   * 才允许解析区与索引区重新变得可写。
    */
   function unlockParseArea() {
     parseLocked = false;
+    indexLocked = false;
   }
 
   function appendRow(box, label, value) {
@@ -414,6 +430,7 @@
 
     show(element('knowledge-doc'), true);
     renderParseArea(documentBody);
+    renderIndexArea(documentBody);
   }
 
   /**
@@ -458,9 +475,10 @@
     box.appendChild(note);
 
     show(element('knowledge-doc'), true);
-    // 不调用 renderParseArea：解析区的可写性由锁定状态与显式查询决定，
-    // 刷新只读快照不得改变按钮的可写语义。
+    // 不调用 renderParseArea / renderIndexArea：解析区与索引区的可写性
+    // 由锁定状态与显式查询决定，刷新只读快照不得改变按钮的可写语义。
     setDisabled(element('knowledge-parse'), true);
+    setDisabled(element('knowledge-index'), true);
   }
 
   // ---- 解析区 ---------------------------------------------------------------
@@ -492,6 +510,90 @@
         '当前状态 ' + documentBody.status + '：该状态下不允许解析，按钮已禁用。' +
           '（服务端对不允许的解析会返回 409。）'
       );
+    }
+  }
+
+  // ---- 索引区（FD-0023-E）---------------------------------------------------
+
+  /**
+   * 用户是否勾选了费用确认。索引按钮只有在勾选后才可能启用 ——
+   * 页面加载、查询或解析成功都不会（也不允许）自动索引。
+   */
+  function isIndexConfirmed() {
+    var box = element('knowledge-index-confirm');
+    return !!(box && box.checked);
+  }
+
+  /**
+   * 渲染索引区。与解析区同一条不变量：锁定时不重新点亮按钮；
+   * 且按钮只有在「状态允许索引」与「用户已勾选费用确认」同时成立时才可点。
+   */
+  function renderIndexArea(documentBody) {
+    var button = element('knowledge-index');
+    var note = element('knowledge-index-note');
+
+    if (indexLocked) {
+      setDisabled(button, true);
+      return;
+    }
+
+    var indexable = INDEXABLE_STATUSES.indexOf(documentBody.status) >= 0;
+    setDisabled(button, !indexable || indexing || !isIndexConfirmed());
+    if (!indexable) {
+      setText(
+        note,
+        '当前状态 ' + documentBody.status + '：只有 PARSED / INDEX_FAILED 允许索引，按钮已禁用。'
+      );
+      return;
+    }
+    if (!isIndexConfirmed()) {
+      setText(
+        note,
+        '当前状态 ' + documentBody.status + '：可以索引。请先勾选费用确认' +
+          '（索引可能调用 DashScope Embedding 并产生费用），再点击「索引」。'
+      );
+      return;
+    }
+    setText(
+      note,
+      '当前状态 ' + documentBody.status + '：已勾选费用确认，可以点击「索引」。' +
+        '索引前会重新查询核对版本，最多发送一次索引写请求。'
+    );
+  }
+
+  /** 确认框变化后按当前状态重新评估索引按钮的可点性。 */
+  function refreshIndexButton() {
+    if (!currentDocument || indexLocked) {
+      setDisabled(element('knowledge-index'), true);
+      return;
+    }
+    renderIndexArea(currentDocument);
+  }
+
+  function renderIndexResult(indexed) {
+    var box = element('knowledge-index-result');
+    if (!box) {
+      return;
+    }
+    box.replaceChildren();
+
+    appendRow(box, '文档 ID', indexed.documentId);
+    appendRow(box, '标题', indexed.title);
+    appendRow(box, '状态', labelOfStatus(indexed.status));
+    appendRow(box, '版本', isFiniteNumber(indexed.version) ? String(indexed.version) : null);
+    appendRow(box, '切片数', isFiniteNumber(indexed.chunkCount) ? String(indexed.chunkCount) : null);
+    appendRow(box, '嵌入服务提供方', indexed.embeddingProvider);
+    appendRow(box, '嵌入模型', indexed.embeddingModel);
+    appendRow(box, '向量维度', isFiniteNumber(indexed.embeddingDimensions) ? String(indexed.embeddingDimensions) : null);
+    appendRow(box, '索引完成时间', indexed.indexedAt);
+    show(box, true);
+  }
+
+  function clearIndexResult() {
+    var box = element('knowledge-index-result');
+    if (box) {
+      box.replaceChildren();
+      show(box, false);
     }
   }
 
@@ -820,6 +922,7 @@
     unlockParseArea();
     clearDocumentView();
     clearParseResult();
+    clearIndexResult();
     clearKnowledgeState();
 
     if (id.length === 0) {
@@ -932,6 +1035,16 @@
     setDisabled(element('knowledge-lookup-submit'), busy);
   }
 
+  function setIndexBusy(busy) {
+    indexing = busy;
+    setDisabled(element('knowledge-lookup-submit'), busy);
+    if (busy) {
+      setDisabled(element('knowledge-index'), true);
+      return;
+    }
+    refreshIndexButton();
+  }
+
   /**
    * 解析失败后的统一收口：锁定解析区，要求用户重新查询。
    * 不提供任何自动重试。锁定的清除只发生在用户重新「按 ID 查询」时。
@@ -943,6 +1056,24 @@
     setDisabled(element('knowledge-parse'), true);
     setText(element('knowledge-parse-note'), '解析区已锁定：' + message + '请重新按 ID 查询后再决定下一步。');
     setKnowledgeError(message + '（写请求的结果未知或未生效，页面不会自动重试。）');
+  }
+
+  /**
+   * 索引失败后的统一收口：锁定索引区，要求用户重新查询。不提供任何自动重试。
+   *
+   * <p>{@code outcomeUncertain} 为 {@code false} 时（例如 Basic 模式的 503：
+   * 服务端保证请求没有执行、文档未被读取或修改），结果其实是<b>确定的</b>，
+   * 因此不宣称「结果未知」，只提示不自动重试。</p>
+   */
+  function lockIndex(message, outcomeUncertain) {
+    indexing = false;
+    indexLocked = true;
+    currentDocument = null;
+    setDisabled(element('knowledge-index'), true);
+    setText(element('knowledge-index-note'), '索引区已锁定：' + message + '请重新按 ID 查询后再决定下一步。');
+    setKnowledgeError(message + (outcomeUncertain === false
+      ? '（页面不会自动重试。）'
+      : '（写请求的结果未知或未生效，页面不会自动重试。）'));
   }
 
   function parseDocument() {
@@ -1200,6 +1331,269 @@
     }
   }
 
+  // ---- 索引（FD-0023-E）-----------------------------------------------------
+  //
+  // 索引只由用户勾选费用确认后点击按钮触发：页面加载、查询、解析成功都不会自动索引。
+  // 写前核对、If-Match 构造、一次写请求、异常锁定，全部与解析流程同一套不变量。
+
+  function indexDocument() {
+    if (indexing || indexLocked || !currentDocument) {
+      return;
+    }
+    if (!isIndexConfirmed()) {
+      // 按钮在未勾选时本应禁用；这里再拦一次，保证不存在「没确认就发请求」的路径。
+      setKnowledgeError('索引尚未确认：请先勾选「索引可能调用 DashScope Embedding 并产生费用」。');
+      return;
+    }
+    var targetId = currentDocument.id;
+    var displayedVersion = currentDocument.version;
+    var displayedStatus = currentDocument.status;
+
+    clearIndexResult();
+    setKnowledgeError('');
+    setIndexBusy(true);
+    setKnowledgeState('pending', '正在重新核对文档版本…');
+
+    // 第一步：重新 GET。文档 GET 不返回 ETag，因此版本只来自响应体。
+    guard(requestJson(DOCUMENTS_PATH + '/' + encodeURIComponent(targetId), {
+      headers: { Accept: 'application/json' }
+    }), function () {
+      setIndexBusy(false);
+    }, function () {
+      lockIndex('写请求未发送：索引前的版本核对在页面内异常终止，无法确认文档当前状态。', false);
+    }).then(function (probe) {
+      if (probe === null) {
+        return; // 已由 onCrash 收尾并锁定
+      }
+
+      if (probe.bodyReadFailed) {
+        // 读不到版本就无法安全构造 If-Match —— 此时**不发**写请求。
+        lockIndex(
+          '写请求未发送：索引前核对返回 HTTP ' + probe.status +
+            ' 但读取响应体失败，无法取得当前版本，因此没有发送索引请求。',
+          false
+        );
+        return;
+      }
+      if (probe.transportError) {
+        lockIndex('写请求未发送：索引前的版本核对请求网络中断，无法确认文档当前状态。', false);
+        return;
+      }
+      if (probe.status === 404) {
+        lockIndex('写请求未发送：索引前核对时该文档已不存在（HTTP 404）。', false);
+        return;
+      }
+      if (probe.status !== 200) {
+        lockIndex('写请求未发送：索引前核对返回 HTTP ' + probe.status + '，无法确认文档当前状态。', false);
+        return;
+      }
+      if (probe.formatProblem !== null || probe.body === null) {
+        lockIndex('写请求未发送：索引前核对的响应体无法解析（' + probe.formatProblem + '）。', false);
+        return;
+      }
+      if (missingField(probe.body, 'id') || missingField(probe.body, 'version') || missingField(probe.body, 'status')) {
+        lockIndex('写请求未发送：索引前核对的响应体缺少 id / version / status。', false);
+        return;
+      }
+      if (String(probe.body.id).toLowerCase() !== targetId.toLowerCase()) {
+        lockIndex('写请求未发送：索引前核对返回的文档 ID 与目标不一致。', false);
+        return;
+      }
+
+      // 漂移检查与解析一致：版本或状态与所见不符就取消写请求、刷新展示并锁定。
+      if (probe.body.version !== displayedVersion) {
+        renderDocumentFromRefresh(probe.body);
+        lockIndex(
+          '写请求未发送：文档版本已从 ' + displayedVersion + ' 变为 ' + probe.body.version +
+            '（页面已刷新为最新版本）。',
+          false
+        );
+        return;
+      }
+      if (probe.body.status !== displayedStatus) {
+        renderDocumentFromRefresh(probe.body);
+        lockIndex(
+          '写请求未发送：文档状态已从 ' + displayedStatus + ' 变为 ' + probe.body.status +
+            '（页面已刷新为最新状态）。',
+          false
+        );
+        return;
+      }
+      if (INDEXABLE_STATUSES.indexOf(probe.body.status) < 0) {
+        renderDocumentFromRefresh(probe.body);
+        lockIndex('写请求未发送：当前状态 ' + probe.body.status + ' 不允许索引。', false);
+        return;
+      }
+
+      // 版本核对通过：由它构造带双引号的 If-Match，绝不写死 "0"。
+      var requestETag = versionTagOf(probe.body);
+      if (!isStrongETag(requestETag)) {
+        lockIndex('写请求未发送：无法由版本号构造合法的强 ETag。', false);
+        return;
+      }
+
+      setKnowledgeState('pending',
+        '正在索引（If-Match: ' + requestETag + '）……索引会调用向量化服务，可能产生 DashScope Embedding 费用。');
+      sendIndexRequest(targetId, displayedStatus, requestETag);
+    });
+  }
+
+  function sendIndexRequest(targetId, displayedStatus, requestETag) {
+    // 预检 GET 完成时 onFinish 已把忙标志复位；发写请求前必须重新置位，
+    // 否则 POST 在途期间索引按钮会被重新点亮、连点能发出重复写请求。
+    setIndexBusy(true);
+    guard(requestJson(DOCUMENTS_PATH + '/' + encodeURIComponent(targetId) + '/index', {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'If-Match': requestETag
+      }
+    }), function () {
+      setIndexBusy(false);
+    }, function () {
+      // 写请求在页面内异常终止：属于「结果待确认」，必须锁住写路径。
+      setKnowledgeState('failed', '结果待确认，请重新查询');
+      lockIndex('索引请求在页面内异常终止，无法确认服务端是否已经改变了文档状态。结果待确认，请重新查询。');
+    }).then(function (result) {
+      if (result === null) {
+        return; // 已由 onCrash 收尾并锁定
+      }
+      handleIndexResult(targetId, displayedStatus, requestETag, result);
+    });
+  }
+
+  function handleIndexResult(targetId, displayedStatus, requestETag, result) {
+    // 拿到了响应头但读不到 body：服务端可能已经完成或失败，客户端拿不到权威版本。
+    if (result.bodyReadFailed) {
+      setKnowledgeState('failed', '结果待确认，请重新查询');
+      lockIndex(
+        '索引返回 HTTP ' + result.status +
+          ' 但读取响应体失败，无法确认文档是否已索引成功或已进入失败状态。结果待确认，请重新查询。'
+      );
+      return;
+    }
+
+    if (result.transportError) {
+      setKnowledgeState('failed', '结果待确认，请重新查询');
+      lockIndex('索引请求网络中断，无法确认服务端是否已经执行了索引。结果待确认，请重新查询。');
+      return;
+    }
+
+    // 412：版本冲突。刷新展示并锁定。
+    if (result.status === 412) {
+      setKnowledgeState('failed', '版本冲突');
+      lockIndex('索引被拒绝（HTTP 412 版本冲突）：文档在核对之后又被改动过，If-Match ' + requestETag + ' 已失效。');
+      refreshAfterConflict(targetId);
+      return;
+    }
+
+    // 428：请求没带 If-Match。本页不会出现这种请求，如实提示而不是掩盖。
+    if (result.status === 428) {
+      setKnowledgeState('failed', '缺少前置条件');
+      lockIndex('索引被拒绝（HTTP 428）：服务端认为请求缺少 If-Match 头。这属于本页异常，请重新查询后再试。');
+      return;
+    }
+
+    // 409：状态不允许索引（例如已被别处索引成 INDEXED）。
+    if (result.status === 409) {
+      setKnowledgeState('failed', '状态不允许');
+      lockIndex(
+        '索引被拒绝（HTTP 409）：文档当前状态不允许索引，页面记录的 ' + displayedStatus +
+          ' 已经过期。请重新查询查看最新状态。'
+      );
+      refreshAfterConflict(targetId);
+      return;
+    }
+
+    if (result.status === 400) {
+      setKnowledgeState('failed', '请求被拒绝');
+      setKnowledgeError(
+        describeProblem(result.status, result.body) +
+          '（HTTP 400：可能是 If-Match 格式非法或文档 ID 不规范。页面不会自动重试。）'
+      );
+      return;
+    }
+
+    if (result.status === 404) {
+      setKnowledgeState('failed', '未找到');
+      lockIndex('索引返回 HTTP 404：该文档已不存在。');
+      return;
+    }
+
+    // 503（Basic 模式）：Embedding 未启用。服务端保证此时不读取、不修改文档、
+    // 请求也没有执行 —— 结果是确定的，不宣称「结果未知」。
+    if (result.status === 503) {
+      setKnowledgeState('failed', '索引被拒绝');
+      lockIndex(
+        '索引被拒绝（HTTP 503）：Embedding 服务未启用（Basic 模式），索引请求没有执行，' +
+          '文档未被读取或修改。如需索引，请先启用 Embedding 再重新按 ID 查询。',
+        false
+      );
+      return;
+    }
+
+    if (result.status >= 500) {
+      setKnowledgeState('failed', '结果待确认，请重新查询');
+      lockIndex(
+        '索引返回 HTTP ' + result.status + '（服务端错误），无法确认文档是否已改变。' +
+          '结果待确认，请重新查询。服务端提示：' + describeProblem(result.status, result.body)
+      );
+      return;
+    }
+
+    if (result.status !== 200) {
+      setKnowledgeState('failed', '索引失败');
+      setKnowledgeError(describeProblem(result.status, result.body));
+      return;
+    }
+
+    // 200 也必须自洽才承认成功：文档 ID 一致、状态是 INDEXED、ETag 与版本一致。
+    if (result.formatProblem !== null || result.body === null) {
+      setKnowledgeState('failed', '结果待确认，请重新查询');
+      lockIndex('索引返回 200，但响应体无法解析（' + result.formatProblem + '）。结果待确认，请重新查询。');
+      return;
+    }
+    if (missingField(result.body, 'documentId') || missingField(result.body, 'version') || missingField(result.body, 'status')) {
+      setKnowledgeState('failed', '结果待确认，请重新查询');
+      lockIndex('索引返回 200，但响应体缺少 documentId / version / status 中的必要字段。结果待确认，请重新查询。');
+      return;
+    }
+    if (String(result.body.documentId).toLowerCase() !== targetId.toLowerCase()) {
+      setKnowledgeState('failed', '结果待确认，请重新查询');
+      lockIndex('索引返回 200，但响应体里的文档 ID 与请求的不一致。结果待确认，请重新查询。');
+      return;
+    }
+    if (result.body.status !== 'INDEXED') {
+      setKnowledgeState('failed', '结果待确认，请重新查询');
+      lockIndex('索引返回 200，但状态是 ' + result.body.status + ' 而不是 INDEXED，响应不自洽。结果待确认，请重新查询。');
+      return;
+    }
+    if (result.eTag !== versionTagOf(result.body)) {
+      setKnowledgeState('failed', '结果待确认，请重新查询');
+      lockIndex('索引返回 200，但响应头 ETag 与响应体版本不一致，响应不自洽。结果待确认，请重新查询。');
+      return;
+    }
+
+    clearKnowledgeState();
+    renderIndexResult(result.body);
+
+    // 用权威结果更新页面上的版本，不假定索引只加 1。
+    currentDocument = {
+      id: result.body.documentId,
+      version: result.body.version,
+      status: result.body.status
+    };
+    setIndexBusy(false);
+    renderIndexArea(result.body);
+
+    var hint = element('knowledge-index-note');
+    if (hint) {
+      hint.textContent =
+        '索引完成：版本已由服务端从 ' + requestETag + ' 推进到 ' + result.eTag +
+        '（响应头 ETag 与响应体版本一致）。当前状态 ' + result.body.status + '。';
+    }
+  }
+
   /**
    * 版本/状态冲突后重新拉取一次展示，让页面与真实状态对齐（只读，不改数据）。
    *
@@ -1250,6 +1644,14 @@
     var parseButton = element('knowledge-parse');
     if (parseButton) {
       parseButton.addEventListener('click', parseDocument);
+    }
+    var indexButton = element('knowledge-index');
+    if (indexButton) {
+      indexButton.addEventListener('click', indexDocument);
+    }
+    var indexConfirm = element('knowledge-index-confirm');
+    if (indexConfirm) {
+      indexConfirm.addEventListener('change', refreshIndexButton);
     }
     renderStaticHints();
   }
