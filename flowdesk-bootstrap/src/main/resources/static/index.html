@@ -30,7 +30,7 @@
         <ul>
             <li>页面加载时<b>只</b>请求服务自身的健康端点；<b>不</b>发送任何写请求，也<b>不</b>调用知识检索或 AI 接口，因此不产生任何模型费用。</li>
             <li>工单列表、工单详情、新建工单都在你点击之后才发请求。</li>
-            <li>当前阶段提供：列表（可翻页）、单条详情、新建工单；<b>不含</b>分配、开始处理、解决、关闭等状态变更（留给下一小阶段）。</li>
+            <li>当前阶段提供：列表（可翻页）、单条详情、新建工单，以及按真实状态可用的<b>状态变更</b>（分配 / 重新分配 / 开始处理 / 解决 / 关闭）；写请求只有在你点击操作之后才发出，且只使用单条详情的强 ETag 做并发控制。</li>
         </ul>
     </section>
 
@@ -110,6 +110,17 @@
         <div id="detail-state" class="state" hidden role="status"></div>
         <div id="detail-error" class="error" hidden></div>
         <div id="detail-body" class="panel" hidden></div>
+        <div id="detail-actions" class="panel" hidden>
+            <p class="hint">
+                下面是按<b>当前状态</b>可用的操作（调用后端既有端点）。写请求的 <code>If-Match</code>
+                <b>If-Match</b> 只使用单条详情响应头里的强 ETag，不使用列表里的版本号。
+            </p>
+            <div id="detail-action-fields"></div>
+            <div id="detail-action-buttons" class="toolbar"></div>
+            <div id="detail-action-confirm" class="confirm" hidden></div>
+            <div id="detail-action-error" class="error" hidden></div>
+            <div id="detail-action-result" class="state" hidden></div>
+        </div>
     </section>
 </main>
 

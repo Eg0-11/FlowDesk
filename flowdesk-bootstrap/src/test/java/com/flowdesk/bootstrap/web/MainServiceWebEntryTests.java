@@ -101,8 +101,8 @@ class MainServiceWebEntryTests {
             posts++;
         }
         assertThat(posts)
-                .as("脚本里只能有一处写请求：新建工单（POST）；列表与详情都是只读 GET")
-                .isEqualTo(1);
+                .as("脚本里只能有两处写请求：新建工单 + 状态变更（都在用户点击之后）；列表与详情都是只读 GET")
+                .isEqualTo(2);
 
         int domReady = script.indexOf("DOMContentLoaded");
         assertThat(domReady).as("脚本要有 DOMContentLoaded 处理器").isGreaterThan(0);
