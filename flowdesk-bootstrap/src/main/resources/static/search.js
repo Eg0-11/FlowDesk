@@ -18,8 +18,12 @@
  *     Basic 模式 503 KNOWLEDGE_EMBEDDING_DISABLED（未启用向量化，检索未执行，未产生费用）
  *     是<b>确定结果</b>；502 / 其它 5xx / 网络中断 / 读体失败时请求已经发出，
  *     <b>可能已产生 Query Embedding（或重排）费用但结果未取得</b> —— 提示用户不要盲目重试。</li>
- * <li><b>200 也必须自洽才展示</b>：校验响应结构与必要字段，缺字段或结构不对时不渲染、
- *     提示结果不完整；200 + 空 citations 是正常的「无命中」，不是失败。</li>
+ * <li><b>200 也必须自洽才展示</b>：渲染前校验<b>实际展示字段</b>的类型与取值（FD-0023-F-R1）——
+ *     生效参数必须合法（provider / model 非空字符串、dimensions 与 topK 正整数、minScore 有限数字）、
+ *     {@code rankingMode} 只能是既有的两种模式（VECTOR_SIMILARITY / RERANK）、引用必须按返回顺序
+ *     对应<b>连续</b>的 K1… 与 rank=1…、分数必须是有限数字；RERANK 必须带 rerankModel 且每条引用
+ *     都有重排分，VECTOR_SIMILARITY 不得带这两类重排字段。任何错配都显示「结果不完整」，
+ *     不渲染为成功、不本地重排或猜测修正；200 + 空 citations 是正常的「无命中」，不是失败。</li>
  * <li><b>渲染只走 textContent / replaceChildren</b>：服务端返回的任何字符串（标题、正文…）
  *     都不会作为 HTML 解析。相似度（score）与重排分（rerankScore）是两个不同的分数，
  *     分开展示且不互相换算。</li>
@@ -64,8 +68,14 @@
     return typeof value === 'number' && isFinite(value);
   }
 
-  function missingField(body, field) {
-    return body === null || typeof body !== 'object' || body[field] === undefined || body[field] === null;
+  /** 非空字符串（展示字段的最小类型要求）。 */
+  function isNonEmptyString(value) {
+    return typeof value === 'string' && value.length > 0;
+  }
+
+  /** 有限整数且不小于给定下限（版本、切片序号、条数上限等取值校验用）。 */
+  function isIntegerAtLeast(value, min) {
+    return isFiniteNumber(value) && value === Math.floor(value) && value >= min;
   }
 
   /** problem+json 的 code；body 为 null / 非 JSON / 缺 code 时返回空串。 */
@@ -318,26 +328,81 @@
   // ---- 结果处理 ---------------------------------------------------------------
 
   /**
-   * 200 也必须自洽：顶层必要字段、citations 数组、每条引用的必要字段。
-   * 任何缺失都不渲染，并如实说明「结果不完整」（检索可能已产生费用，结果未取得）。
+   * 200 也必须自洽（FD-0023-F-R1 收紧）：渲染前校验**实际展示字段**的类型与取值。
+   *
+   * <p>返回一个问题描述字符串（结果不完整、不渲染），或 null（可以渲染）：</p>
+   * <ul>
+   *   <li>生效参数合法：provider / model 非空字符串，dimensions / topK 正整数，
+   *       minScore 有限数字；</li>
+   *   <li>rankingMode 只能是既有的两种模式：VECTOR_SIMILARITY / RERANK；</li>
+   *   <li>重排字段必须配对出现：RERANK 必须带非空 rerankModel 且每条引用都有
+   *       有限数字的重排分；VECTOR_SIMILARITY 不得带 rerankModel 或任何重排分；</li>
+   *   <li>引用按返回顺序对应连续的 K1… 与 rank=1…（页面不做本地重排，
+   *       服务端顺序就是展示顺序，编号对不上说明响应不自洽）；</li>
+   *   <li>分数必须是有限数字：score 恒必需，rerankScore 只按上述配对规则要求。</li>
+   * </ul>
+   *
+   * <p>任何错配都按「结果不完整」处理：不渲染为成功，也不猜测修正（例如按 rank
+   * 重新编号或把字符串分数强行转数字）—— 检索可能已产生费用，但结果未取得。</p>
    */
   function searchResponseProblem(body) {
-    if (missingField(body, 'provider') || missingField(body, 'model') || missingField(body, 'dimensions') ||
-        missingField(body, 'topK') || missingField(body, 'minScore') || missingField(body, 'rankingMode') ||
-        missingField(body, 'citations')) {
-      return '缺少 provider / model / dimensions / topK / minScore / rankingMode / citations 中的必要字段';
+    if (!isNonEmptyString(body.provider) || !isNonEmptyString(body.model)) {
+      return 'provider / model 缺失或不是非空字符串';
+    }
+    if (!isIntegerAtLeast(body.dimensions, 1)) {
+      return 'dimensions 不是正整数';
+    }
+    if (!isIntegerAtLeast(body.topK, 1)) {
+      return 'topK 不是正整数';
+    }
+    if (!isFiniteNumber(body.minScore)) {
+      return 'minScore 不是有限数字';
+    }
+    if (body.rankingMode !== 'VECTOR_SIMILARITY' && body.rankingMode !== 'RERANK') {
+      return 'rankingMode 不是既有的两种模式之一（VECTOR_SIMILARITY / RERANK）';
     }
     if (!Array.isArray(body.citations)) {
       return 'citations 不是数组';
     }
+    if (body.rankingMode === 'RERANK') {
+      if (!isNonEmptyString(body.rerankModel)) {
+        return 'rankingMode 为 RERANK 但缺少非空字符串的重排模型 rerankModel';
+      }
+    } else if (body.rerankModel !== undefined) {
+      return 'rankingMode 为 VECTOR_SIMILARITY 但出现了重排模型 rerankModel';
+    }
     for (var i = 0; i < body.citations.length; i++) {
       var citation = body.citations[i];
-      if (missingField(citation, 'citationId') || missingField(citation, 'rank') ||
-          missingField(citation, 'documentId') || missingField(citation, 'documentVersion') ||
-          missingField(citation, 'documentTitle') || missingField(citation, 'chunkIndex') ||
-          missingField(citation, 'content') || missingField(citation, 'score')) {
-        return '第 ' + (i + 1) + ' 条引用缺少 citationId / rank / documentId / documentVersion / ' +
-          'documentTitle / chunkIndex / content / score 中的必要字段';
+      var at = '第 ' + (i + 1) + ' 条引用';
+      if (!isNonEmptyString(citation.citationId) || citation.citationId !== 'K' + (i + 1)) {
+        return at + '的编号不是按返回顺序连续的 K' + (i + 1);
+      }
+      if (!isIntegerAtLeast(citation.rank, 1) || citation.rank !== i + 1) {
+        return at + '的 rank 不是连续的 ' + (i + 1);
+      }
+      if (!isNonEmptyString(citation.documentId)) {
+        return at + '的 documentId 缺失或不是非空字符串';
+      }
+      if (!isIntegerAtLeast(citation.documentVersion, 0)) {
+        return at + '的 documentVersion 不是非负整数';
+      }
+      if (!isNonEmptyString(citation.documentTitle)) {
+        return at + '的 documentTitle 缺失或不是非空字符串';
+      }
+      if (!isIntegerAtLeast(citation.chunkIndex, 0)) {
+        return at + '的 chunkIndex 不是非负整数';
+      }
+      if (!isNonEmptyString(citation.content)) {
+        return at + '的 content 缺失或不是非空字符串';
+      }
+      if (!isFiniteNumber(citation.score)) {
+        return at + '的相似度 score 不是有限数字';
+      }
+      if (body.rankingMode === 'RERANK' && !isFiniteNumber(citation.rerankScore)) {
+        return at + '在 RERANK 模式下缺少有限数字的重排分 rerankScore';
+      }
+      if (body.rankingMode !== 'RERANK' && citation.rerankScore !== undefined) {
+        return at + '在非重排模式下出现了重排分 rerankScore';
       }
     }
     return null;

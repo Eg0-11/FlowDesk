@@ -818,7 +818,10 @@ class MainServiceWebEntryTests {
      * 由服务端套用默认值。错误分类：400 确定拒绝（校验先于向量调用）、503 以
      * {@code KNOWLEDGE_EMBEDDING_DISABLED} 门控、502 / 其它 5xx / 网络中断 / 读体失败
      * 提示「可能已产生费用、结果未取得、不要盲目重试」。200 + 空 citations 是正常
-     * 「无命中」；200 结构不完整不渲染。渲染只走 textContent / replaceChildren。</p>
+     * 「无命中」；FD-0023-F-R1：200 响应在渲染前校验实际展示字段的类型与取值
+     * （生效参数合法、rankingMode 只能是两种既有模式、引用按返回顺序对应连续 K1… 与
+     * rank=1…、分数必须有限数字、重排字段与模式配对），任何错配都按「结果不完整」
+     * 处理，不渲染为成功、不本地重排或猜测修正。渲染只走 textContent / replaceChildren。</p>
      */
     @Test
     void theSearchScriptSearchesOnlyAfterExplicitCostConfirmation() {
@@ -882,12 +885,20 @@ class MainServiceWebEntryTests {
                 .contains("可能已产生 Query Embedding 或重排费用，但结果未取得")
                 .contains("页面不会自动重试");
 
-        // 200 + 空 citations 是正常无命中；结构校验缺字段不渲染；渲染只走 textContent。
+        // 200 + 空 citations 是正常无命中；FD-0023-F-R1：渲染前校验实际展示字段的类型与取值，
+        // 任何错配都按「结果不完整」处理，不本地重排或猜测修正；渲染只走 textContent。
         assertThat(script)
-                .as("空 citations 是正常无命中；200 必须校验结构；渲染安全")
+                .as("空 citations 是正常无命中；200 校验收紧到类型与取值；渲染安全")
                 .contains("这是正常结果，不是失败")
                 .contains("Array.isArray(body.citations)")
-                .contains("missingField(body, 'rankingMode')")
+                .contains("body.rankingMode !== 'VECTOR_SIMILARITY' && body.rankingMode !== 'RERANK'")
+                .contains("rankingMode 为 RERANK 但缺少非空字符串的重排模型 rerankModel")
+                .contains("rankingMode 为 VECTOR_SIMILARITY 但出现了重排模型 rerankModel")
+                .contains("的编号不是按返回顺序连续的 K' + (i + 1)")
+                .contains("的 rank 不是连续的 ' + (i + 1)")
+                .contains("的相似度 score 不是有限数字")
+                .contains("在 RERANK 模式下缺少有限数字的重排分 rerankScore")
+                .contains("在非重排模式下出现了重排分 rerankScore")
                 .doesNotContain("innerHTML")
                 .doesNotContain("outerHTML")
                 .doesNotContain("insertAdjacentHTML")
