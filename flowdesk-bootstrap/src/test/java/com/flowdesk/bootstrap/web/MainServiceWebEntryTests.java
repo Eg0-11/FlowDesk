@@ -886,9 +886,12 @@ class MainServiceWebEntryTests {
                 .contains("页面不会自动重试");
 
         // 200 + 空 citations 是正常无命中；FD-0023-F-R1：渲染前校验实际展示字段的类型与取值，
-        // 任何错配都按「结果不完整」处理，不本地重排或猜测修正；渲染只走 textContent。
+        // 任何错配都按「结果不完整」处理，不本地重排或猜测修正；FD-0023-F-R2：citations 的
+        // null / 数组 / 非对象元素按「结果不完整」处理（绝不抛页面异常），并按后端既有契约
+        // 校验取值范围（topK 1..20、minScore 0..1、条数不超过 topK、相似度 [minScore,1]）；
+        // 重排分保持相对分语义、不做范围校验；渲染只走 textContent。
         assertThat(script)
-                .as("空 citations 是正常无命中；200 校验收紧到类型与取值；渲染安全")
+                .as("空 citations 是正常无命中；200 校验收紧到类型与取值与后端范围契约；渲染安全")
                 .contains("这是正常结果，不是失败")
                 .contains("Array.isArray(body.citations)")
                 .contains("body.rankingMode !== 'VECTOR_SIMILARITY' && body.rankingMode !== 'RERANK'")
@@ -899,6 +902,11 @@ class MainServiceWebEntryTests {
                 .contains("的相似度 score 不是有限数字")
                 .contains("在 RERANK 模式下缺少有限数字的重排分 rerankScore")
                 .contains("在非重排模式下出现了重排分 rerankScore")
+                .contains("topK 不是 1..20 之间的正整数")
+                .contains("minScore 不是 0..1 之间的有限数值")
+                .contains("超过生效 topK")
+                .contains("不是 JSON 对象（可能是 null、数组或其他原始值）")
+                .contains("的相似度 score 不在 [minScore, 1] 范围内")
                 .doesNotContain("innerHTML")
                 .doesNotContain("outerHTML")
                 .doesNotContain("insertAdjacentHTML")

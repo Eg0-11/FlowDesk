@@ -23,7 +23,11 @@
  *     {@code rankingMode} 只能是既有的两种模式（VECTOR_SIMILARITY / RERANK）、引用必须按返回顺序
  *     对应<b>连续</b>的 K1… 与 rank=1…、分数必须是有限数字；RERANK 必须带 rerankModel 且每条引用
  *     都有重排分，VECTOR_SIMILARITY 不得带这两类重排字段。任何错配都显示「结果不完整」，
- *     不渲染为成功、不本地重排或猜测修正；200 + 空 citations 是正常的「无命中」，不是失败。</li>
+ *     不渲染为成功、不本地重排或猜测修正；200 + 空 citations 是正常的「无命中」，不是失败。
+ *     畸形数据边界（FD-0023-F-R2）：citations 里的 null / 数组 / 非对象元素同样按「结果不完整」
+ *     处理，绝不抛页面异常或把状态留在「正在检索」；并按后端既有契约校验取值范围 ——
+ *     topK ∈ 1..20、minScore ∈ 0..1、引用条数不超过生效 topK、相似度 ∈ [minScore, 1]
+ *     （重排分是当前请求内的相对分，保持既有语义、不做范围校验）。</li>
  * <li><b>渲染只走 textContent / replaceChildren</b>：服务端返回的任何字符串（标题、正文…）
  *     都不会作为 HTML 解析。相似度（score）与重排分（rerankScore）是两个不同的分数，
  *     分开展示且不互相换算。</li>
@@ -328,18 +332,25 @@
   // ---- 结果处理 ---------------------------------------------------------------
 
   /**
-   * 200 也必须自洽（FD-0023-F-R1 收紧）：渲染前校验**实际展示字段**的类型与取值。
+   * 200 也必须自洽（FD-0023-F-R1 收紧类型与取值，FD-0023-F-R2 补畸形数据边界）：
+   * 渲染前校验**实际展示字段**。
    *
    * <p>返回一个问题描述字符串（结果不完整、不渲染），或 null（可以渲染）：</p>
    * <ul>
-   *   <li>生效参数合法：provider / model 非空字符串，dimensions / topK 正整数，
-   *       minScore 有限数字；</li>
+   *   <li>生效参数合法：provider / model 非空字符串，dimensions 正整数，
+   *       topK 是 1..20 之间的正整数（后端 {@code MAX_TOP_K_LIMIT}），
+   *       minScore 是 0..1 之间的有限数值（后端 {@code MIN_MIN_SCORE}..{@code MAX_MIN_SCORE}）；</li>
    *   <li>rankingMode 只能是既有的两种模式：VECTOR_SIMILARITY / RERANK；</li>
    *   <li>重排字段必须配对出现：RERANK 必须带非空 rerankModel 且每条引用都有
-   *       有限数字的重排分；VECTOR_SIMILARITY 不得带 rerankModel 或任何重排分；</li>
+   *       有限数字的重排分；VECTOR_SIMILARITY 不得带 rerankModel 或任何重排分；
+   *       重排分是当前请求内的相对分，<b>不做范围校验</b>（保持既有语义）；</li>
    *   <li>引用按返回顺序对应连续的 K1… 与 rank=1…（页面不做本地重排，
-   *       服务端顺序就是展示顺序，编号对不上说明响应不自洽）；</li>
-   *   <li>分数必须是有限数字：score 恒必需，rerankScore 只按上述配对规则要求。</li>
+   *       服务端顺序就是展示顺序，编号对不上说明响应不自洽）；
+   *       条数不得超过生效 topK；相似度必须落在 [minScore, 1]
+   *       （后端契约：分数有限、0..1 且不低于阈值）；</li>
+   *   <li>citations 的每个元素都必须是 JSON 对象 —— null、数组、字符串、数字
+   *       一律按「结果不完整」处理，绝不抛页面异常（null 元素读属性会抛
+   *       TypeError，把状态留在「正在检索」—— R2 显式防住）。</li>
    * </ul>
    *
    * <p>任何错配都按「结果不完整」处理：不渲染为成功，也不猜测修正（例如按 rank
@@ -352,17 +363,20 @@
     if (!isIntegerAtLeast(body.dimensions, 1)) {
       return 'dimensions 不是正整数';
     }
-    if (!isIntegerAtLeast(body.topK, 1)) {
-      return 'topK 不是正整数';
+    if (!isIntegerAtLeast(body.topK, 1) || body.topK > 20) {
+      return 'topK 不是 1..20 之间的正整数';
     }
-    if (!isFiniteNumber(body.minScore)) {
-      return 'minScore 不是有限数字';
+    if (!isFiniteNumber(body.minScore) || body.minScore < 0 || body.minScore > 1) {
+      return 'minScore 不是 0..1 之间的有限数值';
     }
     if (body.rankingMode !== 'VECTOR_SIMILARITY' && body.rankingMode !== 'RERANK') {
       return 'rankingMode 不是既有的两种模式之一（VECTOR_SIMILARITY / RERANK）';
     }
     if (!Array.isArray(body.citations)) {
       return 'citations 不是数组';
+    }
+    if (body.citations.length > body.topK) {
+      return '引用条数 ' + body.citations.length + ' 超过生效 topK ' + body.topK;
     }
     if (body.rankingMode === 'RERANK') {
       if (!isNonEmptyString(body.rerankModel)) {
@@ -374,6 +388,9 @@
     for (var i = 0; i < body.citations.length; i++) {
       var citation = body.citations[i];
       var at = '第 ' + (i + 1) + ' 条引用';
+      if (citation === null || typeof citation !== 'object' || Array.isArray(citation)) {
+        return at + '不是 JSON 对象（可能是 null、数组或其他原始值）';
+      }
       if (!isNonEmptyString(citation.citationId) || citation.citationId !== 'K' + (i + 1)) {
         return at + '的编号不是按返回顺序连续的 K' + (i + 1);
       }
@@ -397,6 +414,9 @@
       }
       if (!isFiniteNumber(citation.score)) {
         return at + '的相似度 score 不是有限数字';
+      }
+      if (citation.score < body.minScore || citation.score > 1) {
+        return at + '的相似度 score 不在 [minScore, 1] 范围内';
       }
       if (body.rankingMode === 'RERANK' && !isFiniteNumber(citation.rerankScore)) {
         return at + '在 RERANK 模式下缺少有限数字的重排分 rerankScore';
