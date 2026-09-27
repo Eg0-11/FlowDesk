@@ -522,6 +522,64 @@ class KnowledgeWebFlowHttpContractTests {
         assertThat(versionOf(documentId)).isEqualTo(0L);
     }
 
+    // ---------- FD-0023-F：知识检索的真实 HTTP 契约（Basic 模式） ----------
+
+    /** 检索端点（KnowledgeSearchController.BASE_PATH + "/search"）——注意不是 documents 前缀。 */
+    private static final String SEARCH_PATH = "/api/v1/knowledge/search";
+
+    /**
+     * FD-0023-F：Basic 模式（Embedding 未启用）下，页面发出的真实检索请求得到
+     * 503 {@code KNOWLEDGE_EMBEDDING_DISABLED} —— 这就是「不得调用真实 DashScope /
+     * 重排服务」在测试环境的对应事实：本类全程运行在 Embedding 关闭的配置上。
+     * 503 时检索没有执行：没有调用查询向量端口，也没有访问向量检索端口（未产生费用）。
+     */
+    @Test
+    void searchingInBasicModeReturns503WithTheEmbeddingDisabledContract() throws Exception {
+        MvcResult result = this.mockMvc.perform(post(SEARCH_PATH)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"query\":\"FlowDesk 的工单如何创建\"}"))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.code").value("KNOWLEDGE_EMBEDDING_DISABLED"))
+                .andExpect(jsonPath("$.type").value("urn:flowdesk:problem:knowledge-embedding-disabled"))
+                .andExpect(jsonPath("$.status").value(503))
+                .andExpect(jsonPath("$.title").value("向量化未启用"))
+                .andExpect(jsonPath("$.detail").value("当前环境未启用文档向量化"))
+                .andReturn();
+
+        assertThat(result.getResponse().getContentAsString(StandardCharsets.UTF_8))
+                .as("错误响应不得泄漏内部细节")
+                .doesNotContain("Exception")
+                .doesNotContain("contentKey");
+    }
+
+    /**
+     * 缺 query（含空请求体）→ 400 {@code INVALID_REQUEST} + 固定 detail「检索请求不合法」，
+     * 在校验阶段就拒绝：不调用查询向量端口。空 body 与「缺 query」契约完全一致（FD-0011-R1）；
+     * 坏 JSON 保留全局的「请求体不是合法 JSON」契约（同样 400）。
+     */
+    @Test
+    void searchingWithoutAQueryIs400BeforeAnythingElse() throws Exception {
+        this.mockMvc.perform(post(SEARCH_PATH)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_REQUEST"))
+                .andExpect(jsonPath("$.detail").value("检索请求不合法"));
+
+        this.mockMvc.perform(post(SEARCH_PATH)
+                        .contentType(MediaType.APPLICATION_JSON))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_REQUEST"))
+                .andExpect(jsonPath("$.detail").value("检索请求不合法"));
+
+        this.mockMvc.perform(post(SEARCH_PATH)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"query\":\"   \"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
+    }
+
     // ---------- 辅助 ----------
 
     private JsonNode uploadFictionalReport() throws Exception {

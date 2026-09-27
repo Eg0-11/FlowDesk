@@ -206,6 +206,41 @@
             </p>
             <div id="knowledge-index-result" class="panel" hidden></div>
         </div>
+
+        <h3>知识检索</h3>
+        <p class="hint">
+            检索只把问题放在 <b>JSON 请求体</b>里发给服务端，<b>不会</b>写入 URL，
+            也<b>不会</b>在浏览器里持久保存（无 localStorage / sessionStorage）。
+            <code>topK</code> 与 <code>minScore</code> 留空时交给<b>服务端默认值</b>，页面不硬编码任何默认参数。
+            每次检索都要<b>单独勾选</b>费用确认，点击「检索」提交后该确认<b>立即消耗</b>；
+            页面加载、上传、解析或索引完成都<b>绝不会自动检索</b>，页面也<b>不会自动重试</b>。
+            返回 200 且没有引用是正常的「无命中」，不是失败。相似度与重排分是<b>两个不同的分数</b>，页面分开展示。
+        </p>
+        <form id="knowledge-search-form" autocomplete="off">
+            <div class="field">
+                <label for="knowledge-search-query">问题</label>
+                <textarea id="knowledge-search-query" name="query" rows="3" required></textarea>
+            </div>
+            <div class="field">
+                <label for="knowledge-search-topk">topK（可选）</label>
+                <input id="knowledge-search-topk" type="number" step="1">
+            </div>
+            <div class="field">
+                <label for="knowledge-search-minscore">minScore（可选）</label>
+                <input id="knowledge-search-minscore" type="number" step="any">
+            </div>
+            <div id="knowledge-search-state" class="state" hidden role="status"></div>
+            <div id="knowledge-search-error" class="error" hidden></div>
+            <p class="toolbar">
+                <label for="knowledge-search-confirm">
+                    <input id="knowledge-search-confirm" type="checkbox">
+                    我已确认：检索可能调用 Query Embedding 并产生费用；开启重排时还可能产生重排费用
+                </label>
+                <button id="knowledge-search-submit" type="submit" disabled>检索</button>
+            </p>
+            <p id="knowledge-search-note" class="hint"></p>
+        </form>
+        <div id="knowledge-search-result" class="panel" hidden></div>
     </section>
 </main>
 
@@ -215,5 +250,6 @@
 
 <script src="/app.js"></script>
 <script src="/knowledge.js"></script>
+<script src="/search.js"></script>
 </body>
 </html>

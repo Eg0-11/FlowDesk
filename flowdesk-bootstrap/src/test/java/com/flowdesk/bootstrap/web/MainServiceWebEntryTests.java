@@ -63,11 +63,13 @@ class MainServiceWebEntryTests {
         ResponseEntity<String> page = this.client.getForEntity("/index.html", String.class);
         ResponseEntity<String> script = this.client.getForEntity("/app.js", String.class);
         ResponseEntity<String> knowledgeScript = this.client.getForEntity("/knowledge.js", String.class);
+        ResponseEntity<String> searchScript = this.client.getForEntity("/search.js", String.class);
         ResponseEntity<String> style = this.client.getForEntity("/app.css", String.class);
 
         assertThat(page.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(script.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(knowledgeScript.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(searchScript.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(style.getStatusCode()).isEqualTo(HttpStatus.OK);
     }
 
@@ -76,9 +78,10 @@ class MainServiceWebEntryTests {
         String page = bodyOf("/");
         String ticketScript = bodyOf("/app.js");
         String knowledgeScript = bodyOf("/knowledge.js");
+        String searchScript = bodyOf("/search.js");
 
-        assertThat(page + "\n" + ticketScript + "\n" + knowledgeScript)
-                .as("不写死主机名与端口：三个资源都只用相对路径")
+        assertThat(page + "\n" + ticketScript + "\n" + knowledgeScript + "\n" + searchScript)
+                .as("不写死主机名与端口：四个资源都只用相对路径")
                 .doesNotContain("http://")
                 .doesNotContain("https://");
 
@@ -103,10 +106,23 @@ class MainServiceWebEntryTests {
                 .doesNotContain("/incident-triage")
                 .doesNotContain("/asset-diagnosis")
                 .doesNotContain("/search");
+
+        // FD-0023-F：检索有自己的脚本，只允许检索端点；文档、AI 接口与浏览器持久存储都不得出现。
+        assertThat(searchScript)
+                .as("检索脚本只允许检索端点：不得调文档或 AI 接口，问题不进浏览器持久存储")
+                .contains("/api/v1/knowledge/search")
+                .doesNotContain("/api/v1/knowledge/documents")
+                .doesNotContain("/api/v1/ai")
+                .doesNotContain("/incident-triage")
+                .doesNotContain("/asset-diagnosis")
+                .doesNotContain("localStorage")
+                .doesNotContain("sessionStorage");
+
         assertThat(page)
                 .as("页面本身仍然只引用自己同源的静态资源")
                 .contains("/app.js")
-                .contains("/knowledge.js");
+                .contains("/knowledge.js")
+                .contains("/search.js");
     }
 
     @Test
@@ -791,6 +807,98 @@ class MainServiceWebEntryTests {
         int referenceCount = script.split("indexDocument", -1).length - 1;
         assertThat(referenceCount)
                 .as("indexDocument 只允许出现在定义与按钮点击绑定各一次 —— 加载、查询、解析路径都不得触发索引")
+                .isEqualTo(2);
+    }
+
+    /**
+     * FD-0023-F：知识检索必须在用户显式确认费用后才能发生，且请求只走 JSON body。
+     *
+     * <p>页面加载、上传、解析或索引成功都<b>不会</b>自动检索；每次检索都要单独确认，
+     * 提交即消耗确认（FD-0023-E-R1 同款不变量）；topK / minScore 留空时不下发字段，
+     * 由服务端套用默认值。错误分类：400 确定拒绝（校验先于向量调用）、503 以
+     * {@code KNOWLEDGE_EMBEDDING_DISABLED} 门控、502 / 其它 5xx / 网络中断 / 读体失败
+     * 提示「可能已产生费用、结果未取得、不要盲目重试」。200 + 空 citations 是正常
+     * 「无命中」；200 结构不完整不渲染。渲染只走 textContent / replaceChildren。</p>
+     */
+    @Test
+    void theSearchScriptSearchesOnlyAfterExplicitCostConfirmation() {
+        String script = bodyOf("/search.js");
+        String page = bodyOf("/");
+
+        // 页面必须明确费用提示（Query Embedding + 重排）与一次性确认语义。
+        assertThat(page)
+                .as("页面必须明确提示检索可能产生 Query Embedding 与重排费用，且绝不自动检索")
+                .contains("检索可能调用 Query Embedding 并产生费用")
+                .contains("开启重排时还可能产生重排费用")
+                .contains("绝不会自动检索")
+                .contains("knowledge-search-confirm")
+                .contains("knowledge-search-submit")
+                .contains("knowledge-search-result");
+
+        // 确认以授权标志承载；isSearchConfirmed 读标志而不是勾选框（提交即消耗不依赖 DOM 时序）。
+        assertThat(script)
+                .as("确认以授权标志承载，勾选框只经唯一写入口同步")
+                .contains("var searchArmed = false;")
+                .contains("function setSearchConfirmation(confirmed)");
+        int confirmedFn = script.indexOf("function isSearchConfirmed()");
+        int confirmedFnEnd = script.indexOf("function setSearchConfirmation(", confirmedFn);
+        assertThat(confirmedFn).as("isSearchConfirmed 必须存在").isGreaterThan(0);
+        assertThat(confirmedFnEnd).isGreaterThan(confirmedFn);
+        assertThat(script.substring(confirmedFn, confirmedFnEnd))
+                .as("isSearchConfirmed 必须读授权标志而不是勾选框")
+                .contains("return searchArmed;")
+                .doesNotContain("box.checked");
+
+        // 提交流程：先输入校验、再确认守卫、后消耗确认，最后发出唯一的 POST。
+        int submitFn = script.indexOf("function submitSearch(event)");
+        int bindFn = script.indexOf("function bindSearch()", submitFn);
+        assertThat(submitFn).as("submitSearch 必须存在").isGreaterThan(0);
+        assertThat(bindFn).isGreaterThan(submitFn);
+        String submitBody = script.substring(submitFn, bindFn);
+        assertThat(submitBody)
+                .as("提交必须先校验、后消耗确认，再发唯一的写请求")
+                .contains("if (searching) {")
+                .contains("if (!isSearchConfirmed()) {")
+                .contains("setSearchConfirmation(false);")
+                .contains("method: 'POST'")
+                .contains("'Content-Type': 'application/json'");
+        assertThat(submitBody.indexOf("if (!isSearchConfirmed()) {"))
+                .as("消耗必须发生在确认守卫之后（先核对、再消耗）")
+                .isLessThan(submitBody.indexOf("setSearchConfirmation(false);"));
+
+        // 请求只走 JSON body：topK / minScore 留空时不下发字段（交给服务端默认值）。
+        assertThat(script)
+                .as("检索请求必须是 JSON body 的 POST，端点由常量承载")
+                .contains("guard(requestJson(SEARCH_PATH, {")
+                .contains("if (topK !== undefined) {")
+                .contains("if (minScore !== undefined) {");
+
+        // 错误分类：400 确定拒绝；503 以 problem.code 门控；502/5xx/网络/读体提示结果未取得。
+        assertThat(script)
+                .as("错误分类必须区分费用语义")
+                .contains("result.status === 503 && problemCode(result.body) === 'KNOWLEDGE_EMBEDDING_DISABLED'")
+                .contains("服务端在调用向量化服务之前就拒绝了请求")
+                .contains("未产生费用，知识库也没有被修改")
+                .contains("可能已产生 Query Embedding 或重排费用，但结果未取得")
+                .contains("页面不会自动重试");
+
+        // 200 + 空 citations 是正常无命中；结构校验缺字段不渲染；渲染只走 textContent。
+        assertThat(script)
+                .as("空 citations 是正常无命中；200 必须校验结构；渲染安全")
+                .contains("这是正常结果，不是失败")
+                .contains("Array.isArray(body.citations)")
+                .contains("missingField(body, 'rankingMode')")
+                .doesNotContain("innerHTML")
+                .doesNotContain("outerHTML")
+                .doesNotContain("insertAdjacentHTML")
+                .doesNotContain("document.write");
+
+        // 绝不自动检索：submitSearch 只有一个定义，只被表单提交绑定引用一次。
+        int definitionCount = script.split("function submitSearch\\(", -1).length - 1;
+        assertThat(definitionCount).as("submitSearch 只能定义一次").isEqualTo(1);
+        int referenceCount = script.split("submitSearch", -1).length - 1;
+        assertThat(referenceCount)
+                .as("submitSearch 只允许出现在定义与表单提交绑定各一次 —— 加载、上传、解析、索引路径都不得触发检索")
                 .isEqualTo(2);
     }
 
